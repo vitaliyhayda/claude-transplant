@@ -30,6 +30,14 @@ To    you@home.com · Personal
 
 Two questions, nothing else. Run it again and it finds nothing to move.
 
+## Menubar
+
+```
+npx claude-transplant menubar
+```
+
+The same two choices from the menubar, no terminal. It starts at login, shows progress in the icon, and posts a notification when done. Compiled once from a single Swift file with the Xcode command line tools. `menubar --remove` takes it out.
+
 ## Commands
 
 | | |
@@ -38,6 +46,7 @@ Two questions, nothing else. Run it again and it finds nothing to move.
 | `claude-transplant --dry-run` | plan only, write nothing |
 | `claude-transplant undo` | quarantine the last move, refused if a moved session gained messages |
 | `claude-transplant accounts` | list accounts |
+| `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`; match on email, org name, or uuid prefix |
 | `--json` | machine-readable output |
 

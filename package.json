@@ -3,11 +3,29 @@
   "version": "0.1.0",
   "description": "Move Claude Code history between accounts. Sources untouched, provenance verified, undo included.",
   "type": "module",
-  "bin": { "claude-transplant": "transplant.js" },
-  "files": ["transplant.js"],
-  "engines": { "node": ">=22" },
-  "scripts": { "test": "node --test" },
+  "bin": {
+    "claude-transplant": "transplant.js"
+  },
+  "files": [
+    "transplant.js",
+    "menubar.swift"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
   "repository": "github:vitaliyhayda/claude-transplant",
-  "keywords": ["claude", "claude-code", "claude-desktop", "sessions", "history", "accounts", "migrate", "transfer"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "claude-desktop",
+    "sessions",
+    "history",
+    "accounts",
+    "migrate",
+    "transfer"
+  ],
   "license": "MIT"
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+import { spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, realpathSync } from 'node:fs'
-import { copyFile, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -10,12 +11,15 @@ import { fileURLToPath } from 'node:url'
 const TYPES = new Set(['user', 'assistant', 'attachment', 'system', 'progress'])
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SEPARATORS = new RegExp(`[${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g')
+const NOTE = 'restart Claude Code to see them'
+const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const HELP = `claude-transplant   move Claude Code history between accounts, sources untouched
 
   claude-transplant             pick from → to, move, print receipt
   claude-transplant --dry-run   plan only, write nothing
   claude-transplant undo        quarantine the last move
   claude-transplant accounts    list accounts
+  claude-transplant menubar     install the menubar app, starts at login, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
   --json                        machine-readable output
@@ -542,11 +546,48 @@ async function pick(title, rows, multi) {
 }
 
 function reporter(json) {
-  if (json) return (stage, text, extra = {}) => { if (!extra.live) process.stdout.write(`${JSON.stringify({ stage, text })}\n`) }
+  if (json) return (stage, text, extra = {}) => process.stdout.write(`${JSON.stringify({ stage, text, ...(extra.live ? { live: true } : {}) })}\n`)
   return (stage, text, extra = {}) => {
     if (extra.live && !process.stdout.isTTY) return
     process.stdout.write(`${process.stdout.isTTY ? '\r\x1b[K' : ''}  ${stage.padEnd(11)} ${text}${extra.live ? '' : '\n'}`)
   }
+}
+
+const plist = (dict) => `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>${Object.entries(dict).map(([k, v]) => `<key>${k}</key>${v === true ? '<true/>' : Array.isArray(v) ? `<array>${v.map((s) => `<string>${s}</string>`).join('')}</array>` : `<string>${v}</string>`}`).join('')}</dict></plist>\n`
+
+async function menubar(paths, remove) {
+  const app = path.join(paths.state, 'Claude Transplant.app')
+  const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
+  const agent = path.join(paths.home, 'Library/LaunchAgents', `${LABEL}.plist`)
+  const domain = `gui/${process.getuid()}`
+  spawnSync('launchctl', ['bootout', `${domain}/${LABEL}`])
+  spawnSync('pkill', ['-x', 'Claude Transplant'])
+  if (remove) {
+    await rm(app, { recursive: true, force: true })
+    await rm(agent, { force: true })
+    return 'menubar removed'
+  }
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const source = path.join(here, 'menubar.swift')
+  const swift = await readFile(source, 'utf8')
+  const built = path.join(app, 'Contents/Resources/source.sha256')
+  if ((await readFile(built, 'utf8').catch(() => '')) !== sha(swift)) {
+    await rm(app, { recursive: true, force: true })
+    await mkdir(path.dirname(binary), { recursive: true })
+    await mkdir(path.dirname(built), { recursive: true })
+    const { version } = await readJson(path.join(here, 'package.json'))
+    await writeFile(path.join(app, 'Contents/Info.plist'), plist({ CFBundleIdentifier: LABEL, CFBundleName: 'Claude Transplant', CFBundleExecutable: 'Claude Transplant', CFBundlePackageType: 'APPL', CFBundleShortVersionString: version, LSMinimumSystemVersion: '13.0', LSUIElement: true, NSHighResolutionCapable: true }))
+    const build = spawnSync('swiftc', ['-O', '-parse-as-library', '-o', binary, source], { encoding: 'utf8' })
+    if (build.error) throw new Error('swiftc not found, run xcode-select --install')
+    if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
+    await writeFile(built, sha(swift))
+  }
+  await writeFile(path.join(paths.state, 'menubar.json'), `${JSON.stringify({ node: process.execPath, script: fileURLToPath(import.meta.url) })}\n`)
+  await mkdir(path.dirname(agent), { recursive: true })
+  await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary], RunAtLoad: true }))
+  const load = spawnSync('launchctl', ['bootstrap', domain, agent], { encoding: 'utf8' })
+  if (load.status !== 0) throw new Error(`launchctl failed: ${(load.stderr || '').trim()}`)
+  return `menubar installed | starts at login | ${app}`
 }
 
 function parse(argv) {
@@ -557,6 +598,7 @@ function parse(argv) {
     else if (a === '--to') args.to = argv[++i]
     else if (a === '--dry-run') args.dry = true
     else if (a === '--json') args.json = true
+    else if (a === '--remove') args.remove = true
     else if (a === '--help' || a === '-h') args.help = true
     else if (!a.startsWith('-') && !args.cmd) args.cmd = a
     else throw new Error(`unknown argument ${a}`)
@@ -573,19 +615,20 @@ async function main(argv) {
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
-    if (args.json) return emit(all.map(({ account, org, email, orgName, label, sessions, activeAt }) => ({ account, org, email, orgName, label, sessions: sessions.length, activeAt })))
+    if (args.json) return emit(all.map(({ account, org, email, orgName, label, stats, sessions, activeAt }) => ({ account, org, email, orgName, label, stats, sessions: sessions.length, activeAt })))
     const width = Math.max(...all.map((a) => a.label.length))
     return out.write(`${all.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
   }
+  if (args.cmd === 'menubar') return out.write(`${await menubar(paths, args.remove)}\n`)
   if (args.cmd === 'undo') {
     const result = await undo(paths)
-    if (args.json) return emit(result.nothing ? { nothing: true } : result.changed ? { refused: result.changed, at: result.receipt.at } : { undone: result.receipt.at, quarantine: result.dest, sessions: result.receipt.sessions.length })
+    if (args.json) return emit(result.nothing ? { nothing: true } : result.changed ? { refused: result.changed, at: result.receipt.at } : { undone: result.receipt.at, quarantine: result.dest, sessions: result.receipt.sessions.length, note: NOTE })
     if (result.nothing) return out.write('nothing to undo\n')
     const { receipt } = result
     out.write(`Undo  ${receipt.at} | ${receipt.from.join(' + ')} → ${receipt.to}\n`)
     if (result.changed) return out.write(`  refused | ${result.changed.length} sessions gained messages since the move | nothing changed\n${result.changed.map((t) => `    ${t}`).join('\n')}\n`)
     const files = receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0)
-    return out.write(`  ${count(receipt.sessions.length)} transcripts | ${count(files)} sidecar files | ${count(receipt.sessions.length)} desktop records → quarantine\n  sources unchanged ✓\n  quarantine  ${result.dest}\n`)
+    return out.write(`  ${count(receipt.sessions.length)} transcripts | ${count(files)} sidecar files | ${count(receipt.sessions.length)} desktop records → quarantine\n  sources unchanged ✓\n  quarantine  ${result.dest}\n  then        ${NOTE}\n`)
   }
   if (args.cmd) throw new Error(`unknown command ${args.cmd}`)
   let from
@@ -606,9 +649,10 @@ async function main(argv) {
   if (!inv.move.length) return args.json ? emit({ done: true, moved: 0 }) : out.write('  nothing to move\n')
   if (args.dry) return args.json ? emit({ done: true, dry: true, moved: 0 }) : out.write('  dry run     nothing written\n')
   const { file, receipt, checks } = await move(inv, to, paths, report)
-  if (args.json) return emit({ done: true, receipt: file, moved: receipt.sessions.length, failed: receipt.failed, checks })
+  const note = receipt.sessions.length ? NOTE : null
+  if (args.json) return emit({ done: true, receipt: file, moved: receipt.sessions.length, failed: receipt.failed, checks, note })
   if (receipt.failed.length) out.write(`  failed      ${receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`).join('\n              ')}\n`)
-  out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n`)
+  out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
