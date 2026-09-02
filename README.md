@@ -10,13 +10,13 @@ Claude Desktop keeps Claude Code sessions inside the account that created them. 
 
 ## Menubar or CLI
 
-Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Without npm, `npx github:vitaliyhayda/claude-transplant` runs the same thing straight from this repository.
+Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Straight from this repository instead of the npm registry: `npx github:vitaliyhayda/claude-transplant`.
 
 ```
 npx claude-transplant menubar
 ```
 
-The menubar app asks the same two questions and nothing else. It starts at login, shows progress in the icon, posts a notification when done, and marks the account Claude Desktop is signed into as active. When one account is left unpicked it becomes the destination on its own. It is a single Swift file, compiled once, that keeps its own copy of the CLI inside the app bundle and reads its JSON, so after upgrading the package run the menubar command again. `menubar --remove` takes it out. The animation above is rendered by the app itself: `Claude Transplant --demo <dir>` writes the frames and their durations.
+The menubar app asks the same two questions and nothing else. It starts at login, shows progress in the icon, posts a notification when done, and marks the account Claude Desktop is signed into as active. When one account is left unpicked it becomes the destination on its own. It is a single Swift file, compiled once, that keeps its own copy of the CLI inside the app bundle and reads its JSON, so after upgrading the package run the menubar command again. `menubar --remove` takes it out. The animation above is rendered by the app itself: the binary inside the bundle, run with `--demo <dir>`, writes the frames and their durations.
 
 ```
 npx claude-transplant
@@ -35,9 +35,9 @@ To    ↑↓ move · enter confirm
   fork        154 ✓ | 73,783 events | 12 replay duplicates collapsed
   sidecars    890 files | sha256 ✓
   desktop     154 records | 126 archived | 28 active
-  verify      provenance ✓ | lineage ✓ | sidecars ✓ | sources unchanged ✓ | 41s
+  verify      provenance ✓ | lineage ✓ | sidecars ✓ | desktop ✓ | sources unchanged ✓ | 41s
 
-  receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11.json
+  receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11-208.json
   undo        npx claude-transplant undo
   then        restart Claude Code to see them
 ```
@@ -59,13 +59,13 @@ The inventory line, decoded:
 
 - without history: a Desktop record whose transcript no longer exists on disk
 - same lineage twice: the same history present in more than one source account, moved once
-- already there: the target already holds every message, through any number of earlier copies
+- already there: the target already holds every message, followed through earlier copies whose transcripts are still on disk
 
 Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profile directory, and Desktop's agent-mode records. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, then its session count, last activity, and most common project folder.
 
 ## How it works
 
-A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes, and that the sources did not change underneath it. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. Run again once the session is quiet. A receipt records every path and hash, and that receipt is what `undo` reads.
+A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, the target Desktop records, and that the sources did not change underneath it. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. Run again once the session is quiet. A receipt records every path and hash, and that receipt is what `undo` reads.
 
 ## Why it is built this way
 
@@ -109,4 +109,4 @@ Each of these was tried. Each looked like it worked until the layer below was ch
 - Moving history out of a Team organization is your organization's call, not this tool's.
 - Unofficial. Not affiliated with Anthropic.
 
-Receipts and quarantine live in `~/Library/Application Support/claude-transplant`. MIT.
+Receipts and quarantine live in `~/Library/Application Support/claude-transplant`. Quarantine holds undone and failed copies, sources are intact, so recovery is a rerun, and the folder can be deleted once its receipts are no longer wanted. A lock file there names the running process and is cleared automatically when that process is gone. MIT.

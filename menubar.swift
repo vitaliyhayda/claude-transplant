@@ -22,6 +22,11 @@ struct Failure: Decodable {
     let error: String
 }
 
+struct Problem: Decodable {
+    let title: String
+    let check: String
+}
+
 struct Event: Decodable {
     let stage: String?
     let text: String?
@@ -30,6 +35,7 @@ struct Event: Decodable {
     let ok: Bool?
     let moved: Int?
     let failed: [Failure]?
+    let problems: [Problem]?
     let note: String?
     let undone: String?
     let sessions: Int?
@@ -127,9 +133,11 @@ final class Model: ObservableObject {
             if !failed.isEmpty {
                 lines.append(("failed", failed.map { ($0.title ?? "?") + " | " + $0.error }.joined(separator: "\n")))
             }
-            let summary = moved == 0 ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed") : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")
-            note = event.note ?? summary
-            notify(summary, event.note ?? "")
+            let good = event.ok ?? true
+            for problem in event.problems ?? [] { lines.append(("check", problem.title + " | " + problem.check + " failed")) }
+            let summary = (moved == 0 ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed") : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")) + (good ? "" : ", verification failed")
+            note = good ? (event.note ?? summary) : summary
+            notify(summary, good ? (event.note ?? "") : "Check the receipt before trusting the copies")
         } else if event.undone != nil {
             note = event.note ?? ""
             notify("\(event.sessions ?? 0) sessions undone", note)
@@ -446,7 +454,7 @@ enum Demo {
         snap(350)
         model.lines.append(("desktop", "305 records | 240 archived | 65 active"))
         snap(350)
-        model.lines.append(("verify", "provenance ✓ | lineage ✓ | sidecars ✓ | sources unchanged ✓ | 38s"))
+        model.lines.append(("verify", "provenance ✓ | lineage ✓ | sidecars ✓ | desktop ✓ | sources unchanged ✓ | 38s"))
         snap(500)
         model.running = false
         model.symbol = "checkmark"

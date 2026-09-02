@@ -105,7 +105,15 @@ async function quarantine(items, dest) {
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
-  const lock = await open(lockFile, 'wx').catch(() => { throw new Error('another run holds the lock') })
+  const alive = (pid) => { try { return pid > 0 && process.kill(pid, 0) } catch { return false } }
+  let lock = await open(lockFile, 'wx').catch(() => null)
+  if (!lock) {
+    const pid = Number(await readFile(lockFile, 'utf8').catch(() => 0))
+    if (alive(pid)) throw new Error(`another run holds the lock, pid ${pid}`)
+    await unlink(lockFile).catch(() => {})
+    lock = await open(lockFile, 'wx').catch(() => { throw new Error('another run holds the lock') })
+  }
+  await lock.writeFile(String(process.pid))
   try {
     return await work()
   } finally {
@@ -207,16 +215,17 @@ export async function scan(file) {
   const raw = await readFile(file, 'utf8')
   const ids = []
   const forked = new Map()
+  let invalid = 0
   for (const line of raw.split('\n')) {
     const text = line.trim()
     if (!text) continue
     let e
-    try { e = JSON.parse(text) } catch { continue }
+    try { e = JSON.parse(text) } catch { invalid++; continue }
     if (!e || typeof e !== 'object' || !TYPES.has(e.type) || typeof e.uuid !== 'string' || e.isSidechain || e.type === 'progress') continue
     ids.push(e.uuid)
     if (typeof e.forkedFrom?.messageUuid === 'string') forked.set(e.uuid, e.forkedFrom)
   }
-  return { file, sha: sha(raw), ids, forked }
+  return { file, sha: sha(raw), ids, forked, invalid }
 }
 
 async function load(file) {
@@ -246,9 +255,19 @@ const canonical = (e) => {
 
 const richness = (e) => ['stdout', 'stderr'].reduce((n, k) => n + (typeof e.toolUseResult?.[k] === 'string' ? Buffer.byteLength(e.toolUseResult[k]) : 0), 0)
 
-function survivor(rows, ids) {
+function survivor(rows, ids, parentOf) {
   if (new Set(rows.map((r) => canonical(r.entry))).size !== 1) return null
-  if (rows.some((r) => r.entry.parentUuid && !ids.has(r.entry.parentUuid))) return null
+  const parents = [...new Set(rows.map((r) => r.entry.parentUuid ?? null))]
+  if (parents.some((p) => p && !ids.has(p))) return null
+  const above = (a, b) => {
+    const seen = new Set()
+    for (let cur = b; cur && !seen.has(cur); cur = parentOf.get(cur) ?? null) {
+      if (cur === a) return true
+      seen.add(cur)
+    }
+    return a === null
+  }
+  if (!parents.every((a) => parents.every((b) => a === b || above(a, b) || above(b, a)))) return null
   const keep = {}
   for (const k of ['stdout', 'stderr']) {
     const values = new Set(rows.map((r) => r.entry.toolUseResult?.[k]).filter((v) => typeof v === 'string' && v.length))
@@ -263,12 +282,13 @@ export function normalize(entries) {
   const rows = entries.map((entry, line) => ({ entry, line })).filter(({ entry }) => TYPES.has(entry.type) && typeof entry.uuid === 'string' && !entry.isSidechain)
   const groups = Map.groupBy(rows, (r) => r.entry.uuid)
   const ids = new Set(groups.keys())
+  const parentOf = new Map(rows.map((r) => [r.entry.uuid, r.entry.parentUuid ?? null]))
   const drop = new Set()
   let replays = 0
   let conflicts = 0
   for (const group of groups.values()) {
     if (group.length < 2) continue
-    const line = survivor(group, ids)
+    const line = survivor(group, ids, parentOf)
     if (line === null) { conflicts++; continue }
     replays++
     for (const r of group) if (r.line !== line) drop.add(r.line)
@@ -386,11 +406,12 @@ export async function inventory(from, to, paths) {
       if (seen.has(s.id)) continue
       seen.add(s.id)
       const rootSet = await roots(s.id, ctx)
-      if (!rootSet.size) { missing.push(s); continue }
-      found.push({ ...s, account, transcript: ctx.index.get(s.id), roots: rootSet, forks: ctx.scans.get(s.id).forked.size })
+      const invalid = ctx.scans.get(s.id)?.invalid ?? 0
+      if (!rootSet.size && !invalid) { missing.push(s); continue }
+      found.push({ ...s, account, transcript: ctx.index.get(s.id), roots: rootSet, invalid, forks: ctx.scans.get(s.id).forked.size })
     }
   }
-  const groups = Map.groupBy(found, (s) => sha([...s.roots].sort().join('\n')))
+  const groups = Map.groupBy(found, (s) => sha(s.roots.size && !s.invalid ? [...s.roots].sort().join('\n') : s.id))
   const reps = [...groups.values()].map((g) => g.toSorted((a, b) => a.forks - b.forks || a.createdAt - b.createdAt)[0])
   const targets = []
   for (const s of to.sessions) {
@@ -401,7 +422,7 @@ export async function inventory(from, to, paths) {
   const covering = (rootSet) => (rootSet.size ? targets.find((t) => [...rootSet].every((id) => t.roots.has(id)))?.record ?? null : null)
   const there = []
   const move = []
-  for (const s of reps) (covering(s.roots) ? there : move).push(s)
+  for (const s of reps) (!s.invalid && covering(s.roots) ? there : move).push(s)
   const parent = async (recordId) => {
     const s = from.flatMap((a) => a.sessions).find((x) => x.record.sessionId === recordId)
     return s?.id ? covering(await roots(s.id, ctx)) : null
@@ -456,15 +477,20 @@ async function link(rows, inv) {
 }
 
 async function verify(rows) {
-  const bad = { provenance: 0, lineage: 0, sidecars: 0, sources: 0 }
+  const bad = { provenance: 0, lineage: 0, sidecars: 0, desktop: 0, sources: 0 }
+  const problems = []
+  const flag = (check, r) => { bad[check]++; problems.push({ title: r.title, check }) }
   for (const r of rows) {
-    if (!(await exists(r.targetTranscript)) || sha(await readFile(r.targetTranscript)) !== r.targetSha) bad.provenance++
-    if (r.linkedTo && (await readJson(r.record).catch(() => ({}))).forkedFromSessionId !== r.linkedTo) bad.lineage++
-    if (r.targetDir && (await digest(r.targetDir)).sha !== r.sidecars.sha) bad.sidecars++
-    if (!(await exists(r.transcript)) || sha(await readFile(r.transcript)) !== r.sourceSha) bad.sources++
+    if (!(await exists(r.targetTranscript)) || sha(await readFile(r.targetTranscript)) !== r.targetSha) flag('provenance', r)
+    const record = await readJson(r.record).catch(() => null)
+    if (r.linkedTo && record?.forkedFromSessionId !== r.linkedTo) flag('lineage', r)
+    const sourceDir = path.join(path.dirname(r.transcript), r.id)
+    if (r.targetDir ? (await digest(r.targetDir)).sha !== r.sidecars.sha || (await digest(sourceDir)).sha !== r.sidecars.sha : await exists(sourceDir)) flag('sidecars', r)
+    if (record?.cliSessionId !== r.targetId || record?.sessionId !== `local_${r.targetId}`) flag('desktop', r)
+    if (!(await exists(r.transcript)) || sha(await readFile(r.transcript)) !== r.sourceSha) flag('sources', r)
   }
   const mark = (v) => (v ? `✗ ${v}` : '✓')
-  return { ok: Object.values(bad).every((v) => v === 0), lines: [`provenance ${mark(bad.provenance)}`, `lineage ${mark(bad.lineage)}`, `sidecars ${mark(bad.sidecars)}`, `sources unchanged ${mark(bad.sources)}`] }
+  return { ok: problems.length === 0, problems, lines: [`provenance ${mark(bad.provenance)}`, `lineage ${mark(bad.lineage)}`, `sidecars ${mark(bad.sidecars)}`, `desktop ${mark(bad.desktop)}`, `sources unchanged ${mark(bad.sources)}`] }
 }
 
 export function move(inv, to, paths, report = () => {}) {
@@ -497,9 +523,11 @@ export function move(inv, to, paths, report = () => {}) {
     report('sidecars', `${count(receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0))} files | sha256 ✓`)
     const archived = receipt.sessions.filter((r) => r.archived).length
     report('desktop', `${count(done)} records | ${count(archived)} archived | ${count(done - archived)} active`)
-    const { ok, lines } = await verify(receipt.sessions)
+    const { ok, lines, problems } = await verify(receipt.sessions)
+    receipt.verification = { ok, problems }
+    await save()
     report('verify', [...lines, `${Math.round((Date.now() - started) / 1000)}s`].join(' | '))
-    return { file, receipt, checks: lines, ok: ok && receipt.failed.length === 0 }
+    return { file, receipt, checks: lines, problems, ok: ok && receipt.failed.length === 0 }
   })
 }
 
@@ -669,12 +697,12 @@ async function main(argv) {
   if (args.cmd === 'menubar') return out.write(`${await menubar(paths, args.remove)}\n`)
   if (args.cmd === 'undo') {
     const result = await undo(paths)
+    if (result.changed) process.exitCode = 1
     if (args.json) return emit(result.nothing ? { nothing: true } : result.changed ? { refused: result.changed, at: result.receipt.at } : { undone: result.receipt.at, quarantine: result.dest, sessions: result.receipt.sessions.length, note: NOTE })
     if (result.nothing) return out.write('nothing to undo\n')
     const { receipt } = result
     out.write(`Undo  ${receipt.at} | ${receipt.from.join(' + ')} → ${receipt.to}\n`)
     if (result.changed) {
-      process.exitCode = 1
       return out.write(`  refused | ${result.changed.length} sessions changed since the move | nothing changed\n${result.changed.map((t) => `    ${t}`).join('\n')}\n`)
     }
     const files = receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0)
@@ -698,11 +726,12 @@ async function main(argv) {
   report('inventory', [`${count(inv.total)} records`, inv.missing.length ? `${count(inv.missing.length)} without history` : null, inv.twice ? `${count(inv.twice)} same lineage twice` : null, inv.there.length ? `${count(inv.there.length)} already there` : null, `${count(inv.move.length)} to move`].filter(Boolean).join(' | '))
   if (!inv.move.length) return args.json ? emit({ done: true, ok: true, moved: 0 }) : out.write('  nothing to move\n')
   if (args.dry) return args.json ? emit({ done: true, ok: true, dry: true, moved: 0 }) : out.write('  dry run     nothing written\n')
-  const { file, receipt, checks, ok } = await move(inv, to, paths, report)
+  const { file, receipt, checks, problems, ok } = await move(inv, to, paths, report)
   if (!ok) process.exitCode = 1
   const note = receipt.sessions.length ? NOTE : null
-  if (args.json) return emit({ done: true, ok, receipt: file, moved: receipt.sessions.length, failed: receipt.failed, checks, note })
-  if (receipt.failed.length) out.write(`  failed      ${receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`).join('\n              ')}\n`)
+  if (args.json) return emit({ done: true, ok, receipt: file, moved: receipt.sessions.length, failed: receipt.failed, problems, checks, note })
+  const trouble = [...receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`), ...problems.map((p) => `${p.title} | ${p.check} check failed`)]
+  if (trouble.length) out.write(`  failed      ${trouble.join('\n              ')}\n`)
   out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
 }
 

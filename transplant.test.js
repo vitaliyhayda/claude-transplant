@@ -4,10 +4,11 @@ import { appendFile, mkdir, mkdtemp, readdir, readFile, realpath, writeFile } fr
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { accounts, fork, inventory, layout, move, normalize, step, undo } from './transplant.js'
 
-const here = path.dirname(new URL(import.meta.url).pathname)
+const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
 const MESSAGES = new Set(['user', 'assistant', 'attachment', 'system'])
 const id = (k) => `00000000-0000-4000-8000-${String(k).padStart(12, '0')}`
@@ -61,6 +62,34 @@ test('normalize collapses replays and reports conflicts', () => {
   const conflict = normalize([a, b, { ...b, message: { role: 'user', content: 'other' } }])
   assert.equal(conflict.conflicts, 1)
   assert.equal(conflict.entries.length, 3)
+  const c = entry('assistant', 3, 2, id(0))
+  const d = entry('user', 4, 3, id(0))
+  const x = entry('assistant', 5, 1, id(0))
+  assert.equal(normalize([a, b, c, d, { ...d, parentUuid: id(2) }]).replays, 1)
+  assert.equal(normalize([a, b, c, d, x, { ...d, parentUuid: id(5) }]).conflicts, 1)
+})
+
+test('cli exits nonzero on partial failure and undoes over json', async () => {
+  const h = await home()
+  await writeFile(path.join(h.project, `${SOURCE}.jsonl`), await readFile(path.join(here, 'fixtures', 'source.jsonl')))
+  await h.record('P', SOURCE)
+  await h.write(id(700), [entry('user', 700, null, id(700))])
+  await appendFile(path.join(h.project, `${id(700)}.jsonl`), 'not json\n')
+  await h.record('P', id(700))
+  const run = (args) => promisify(execFile)(process.execPath, [path.join(here, 'transplant.js'), ...args], { env: { ...process.env, HOME: h.root } }).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, code: e.code }))
+  const list = JSON.parse((await run(['accounts', '--json'])).stdout)
+  assert.equal(list.find((a) => a.account === h.acct.P).active, true)
+  const moved = await run(['--from', 'p@example.com', '--to', 'z@example.com', '--json'])
+  assert.equal(moved.code, 1)
+  const done = JSON.parse(moved.stdout.trim().split('\n').at(-1))
+  assert.equal(done.ok, false)
+  assert.equal(done.moved, 1)
+  assert.deepEqual(done.failed.map((f) => f.error), ['1 unparseable lines'])
+  assert.deepEqual(done.problems, [])
+  const undone = await run(['undo', '--json'])
+  assert.equal(undone.code, 0)
+  assert.equal(JSON.parse(undone.stdout).sessions, 1)
+  assert.equal((await run(['undo', '--json'])).stdout.trim(), '{"nothing":true}')
 })
 
 test('picker reducer', () => {
@@ -150,7 +179,8 @@ test('move, rerun, undo across accounts', async () => {
   assert.equal(result.receipt.failed.length, 2)
   assert.equal(result.ok, false)
   assert.deepEqual(result.receipt.failed.map((f) => f.error).sort(), ['1 conflicting duplicate uuids', '1 unparseable lines'])
-  assert.deepEqual(result.checks, ['provenance ✓', 'lineage ✓', 'sidecars ✓', 'sources unchanged ✓'])
+  assert.deepEqual(result.checks, ['provenance ✓', 'lineage ✓', 'sidecars ✓', 'desktop ✓', 'sources unchanged ✓'])
+  assert.deepEqual(result.problems, [])
   assert.match(stages[0], /^fork 2 ✓ \| \d+ events \| 1 replay duplicates collapsed \| 2 failed$/)
   assert.equal(stages[1], 'sidecars 2 files | sha256 ✓')
   assert.equal(stages[2], 'desktop 2 records | 0 archived | 2 active')
