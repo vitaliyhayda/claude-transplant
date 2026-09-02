@@ -1,8 +1,22 @@
 # claude-transplant
 
-Move Claude Code history between accounts. Two picks, verified copies, sources untouched, one-step undo.
+Move Claude Code history between accounts. Either via menubar or CLI - macOS only.
 
-![Claude Transplant menubar: pick from, pick to, move](https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif)
+![Claude Transplant: pick from, pick to, move](https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif)
+
+## What it is
+
+Claude Desktop keeps Claude Code sessions inside the account that created them. Switch accounts and your history stays behind. claude-transplant rebuilds it in the account you are switching to. Pick the accounts to take from, pick the one to land in, done. Every copied message records the message it came from, the sources are never touched, and the last move undoes with one command. Run it twice and the second run finds nothing to move.
+
+## Menubar or CLI
+
+Same engine, two doors.
+
+```
+npx claude-transplant menubar
+```
+
+The menubar app asks the same two questions and nothing else. It starts at login, shows progress in the icon, posts a notification when done, and marks the account Claude Desktop is signed into as active. When one account is left unpicked it becomes the destination on its own. It is a single Swift file, compiled once with the Xcode command line tools, that runs the CLI and reads its JSON. `menubar --remove` takes it out.
 
 ```
 npx claude-transplant
@@ -12,13 +26,10 @@ npx claude-transplant
 From  ↑↓ move · space select · enter next
   ❯ ◉ you@work.com · Acme Inc.    161 | 2h ago | acme-api
     ◉ you@work.com · Personal     157 | 1d ago | acme-api
-    ○ you@home.com · Personal       3 | 5d ago | notes
+    ○ you@home.com · Personal       3 | 5d ago | notes | active
 
 To    ↑↓ move · enter confirm
-  ❯ ● you@home.com · Personal       3 | 5d ago | notes
-
-From  you@work.com · Acme Inc. + Personal
-To    you@home.com · Personal
+  ❯ ● you@home.com · Personal       3 | 5d ago | notes | active
 
   inventory   318 records | 6 without history | 155 same lineage twice | 3 already there | 154 to move
   fork        154 ✓ | 73,783 events | 12 replay duplicates collapsed
@@ -28,45 +39,54 @@ To    you@home.com · Personal
 
   receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11.json
   undo        npx claude-transplant undo
+  then        restart Claude Code to see them
 ```
 
-Two questions, nothing else. Run it again and it finds nothing to move.
+## Options
 
-## Menubar
-
-```
-npx claude-transplant menubar
-```
-
-The same two choices from the menubar, no terminal. It starts at login, shows progress in the icon, and posts a notification when done. Compiled once from a single Swift file with the Xcode command line tools. `menubar --remove` takes it out.
-
-## Commands
-
-| | |
+| Command | What it does |
 |---|---|
-| `claude-transplant` | pick from and to, move, print a receipt |
+| `claude-transplant` | pick From and To, move, print a receipt |
 | `claude-transplant --dry-run` | plan only, write nothing |
 | `claude-transplant undo` | quarantine the last move, refused if a moved session gained messages |
 | `claude-transplant accounts` | list accounts |
 | `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
-| `--from <match> --to <match>` | skip the picker, repeat `--from`; match on email, org name, or uuid prefix |
-| `--json` | machine-readable output |
-
-Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profile directory, and Desktop's agent-mode records. Personal-plan organizations show as Personal, and the account Claude Desktop is signed into is marked active. An account with no known email shows a uuid prefix, then its session count, last activity, and most common project folder.
-
-## How it works
-
-A Claude Code session is several records that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it, and the account-scoped Desktop record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction: a new session id, a forked transcript in which every message records the source message it came from, a byte-identical copy of the sidecar tree, and a fresh Desktop record in the target account. The source is never modified. It is the rollback.
-
-The fork is a port of the official Agent SDK's `forkSession`. A golden fixture pins its output, and CI runs the real SDK against the same input to keep the port honest.
+| `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
+| `--json` | machine-readable output, one event per line |
 
 The inventory line, decoded:
 
-- **without history**: a Desktop record whose transcript no longer exists on disk
-- **same lineage twice**: the same history present in more than one source account, moved once
-- **already there**: the target already holds every message, through any number of earlier copies
+- without history: a Desktop record whose transcript no longer exists on disk
+- same lineage twice: the same history present in more than one source account, moved once
+- already there: the target already holds every message, through any number of earlier copies
+
+Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profile directory, and Desktop's agent-mode records. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, then its session count, last activity, and most common project folder.
+
+## How it works
+
+A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes, and that the sources did not change underneath it. A receipt records every path and hash, and that receipt is what `undo` reads.
+
+## Why it is built this way
+
+- Reconstruction, not reassignment. No supported operation changes a session's owner, so new ids with per-message provenance are the honest equivalent.
+- The source is the rollback. Nothing in a source account is renamed, archived, or rewritten. A bad copy is disposable, a changed source would destroy the only trustworthy baseline.
+- No confirmation prompt. Safety lives in properties, not dialogs: runs are idempotent, copies get fresh ids, and undo refuses only when a copy has gained messages.
+- Lineage over bookkeeping. "Already there" follows `forkedFrom` pointers to the root, so copies made through earlier hops, or by other tools, are recognized without a shared database.
+- The official fork, ported. The TypeScript Agent SDK's `forkSession` is the reference implementation. Both official SDKs bundle the entire CLI for what is one screen of logic, so the routine is ported, pinned by a golden fixture, and checked in CI against the real SDK on every push.
+- One file, no dependencies. Plain JavaScript on Node 22, no build step, nothing to audit but a file you can read in one sitting. The menubar is one Swift file for the same reason.
+- Local only. No tokens, cookies, or network. The tool never reads Desktop's credential caches.
+
+## The long view
+
+Every green light in this system proves one layer. A transcript that parses says nothing about the sidebar. A record in the sidebar says nothing about whether its transcript still exists. An active remote bridge says nothing about whether a local process is alive to serve it. Most history-loss stories start with trusting one layer's signal for another layer's claim.
+
+Tools that share one transcript store across accounts solve a different problem: who pays for the next turn. They do not make history belong to an account, and they cannot make it appear in Claude Desktop under that account. If you live in a terminal and rotate logins for rate limits, use one of those. If Claude Desktop is your home and you switch accounts deliberately, move the history, sign in on your phone to the same account, and accept a few minutes of login tax for behavior that is supported end to end.
+
+The cost of this design is a copy that lives beside its source rather than replacing it, and an occasional second copy when a source kept growing after it was moved. The benefit is that nothing can be lost, and every number on screen has a witness on disk.
 
 ## Dead ends
+
+Each of these was tried. Each looked like it worked until the layer below was checked.
 
 | Tempting | Why it fails | Here |
 |---|---|---|
@@ -81,7 +101,7 @@ The inventory line, decoded:
 
 ## Boundaries
 
-- macOS with Claude Desktop. Everything is local: no tokens, no cookies, no network.
+- macOS with Claude Desktop. Everything is local.
 - Remote Control bridges, scheduled tasks, and cloud ownership do not move. They belong to the account that created them.
 - The transcript and record layouts are undocumented and may change. Verified with Claude Code 2.1.257 and Agent SDK 0.3.258.
 - Moving history out of a Team organization is your organization's call, not this tool's.
