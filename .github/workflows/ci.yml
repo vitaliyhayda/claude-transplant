@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  release:
+    types: [published]
 permissions:
   contents: read
 jobs:
@@ -16,3 +18,15 @@ jobs:
       - run: npm test
       - run: swiftc -parse-as-library -typecheck menubar.swift
       - run: npm pack && npm i -g ./claude-transplant-*.tgz && claude-transplant --version && claude-transplant --help
+  publish:
+    if: github.event_name == 'release'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, registry-url: https://registry.npmjs.org }
+      - run: npm i -g npm@latest && npm publish
