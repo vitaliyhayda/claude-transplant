@@ -47,6 +47,8 @@ extension String {
     var sentence: String { prefix(1).uppercased() + dropFirst() }
 }
 
+let restartNote = "restart Claude Code to see them"
+
 @MainActor
 final class Model: ObservableObject {
     @Published var accounts: [Account] = []
@@ -150,9 +152,34 @@ final class Model: ObservableObject {
         }
     }
 
+    func restartDesktop() {
+        let quit = Process()
+        quit.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        quit.arguments = ["-e", "quit app \"Claude\""]
+        try? quit.run()
+        quit.waitUntilExit()
+        for _ in 0..<40 {
+            let probe = Process()
+            probe.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            probe.arguments = ["-x", "Claude"]
+            probe.standardOutput = FileHandle.nullDevice
+            try? probe.run()
+            probe.waitUntilExit()
+            if probe.terminationStatus != 0 { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = ["-a", "Claude"]
+        try? open.run()
+        note = ""
+    }
+
     private func finish(_ status: Int32) {
         running = false
         badge = ""
+        from = []
+        to = nil
         symbol = status == 0 ? "checkmark" : "exclamationmark.triangle"
         if status != 0, note.isEmpty { note = "Failed, run npx claude-transplant in a terminal" }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.symbol = "arrow.left.arrow.right" }
@@ -303,7 +330,11 @@ struct Panel: View {
                 .font(.system(.caption, design: .monospaced))
             }
             if let progress = model.progress { Bar(value: progress) }
-            if !model.note.isEmpty { Text(model.note.sentence).font(.callout.weight(.medium)) }
+            if model.note == restartNote {
+                Button(action: { model.restartDesktop() }) { Text(model.note.sentence).font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
+            } else if !model.note.isEmpty {
+                Text(model.note.sentence).font(.callout.weight(.medium))
+            }
             HStack(spacing: 10) {
                 Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
                 Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
@@ -439,7 +470,7 @@ enum Demo {
         }
         glide(to: CGPoint(x: 282, y: 238), frames: 8)
         model.begin()
-        model.lines = [("inventory", "333 records | 4 without history | 21 same lineage twice | 3 already there | 305 to move")]
+        model.lines = [("inventory", "333 records | 4 without history | 21 older versions skipped | 3 already there | 305 to move")]
         snap(250)
         glide(to: CGPoint(x: 150, y: 420), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
