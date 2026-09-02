@@ -10,7 +10,7 @@ Claude Desktop keeps Claude Code sessions inside the account that created them. 
 
 ## Menubar or CLI
 
-Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Straight from this repository instead of the npm registry: `npx github:vitaliyhayda/claude-transplant`, with `#v1.0.2` appended to pin a release.
+Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Straight from this repository instead of the npm registry: `npx github:vitaliyhayda/claude-transplant`, append a hash and a release tag to pin one.
 
 ```
 npx claude-transplant menubar
@@ -58,14 +58,14 @@ To    ↑↓ move · enter confirm
 The inventory line, decoded:
 
 - without history: a Desktop record whose transcript no longer exists on disk
-- same lineage twice: the same history present in more than one source account, moved once
+- same lineage twice: the same history present in more than one source account, or in several versions where one contains the others, moved once as the fullest version
 - already there: the target already holds every message, followed through earlier copies whose transcripts are still on disk
 
 Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profile directory, and Desktop's agent-mode records. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, then its session count, last activity, and most common project folder.
 
 ## How it works
 
-A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, every target Desktop record byte for byte, and that the sources did not change underneath it. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. Run again once the session is quiet. A receipt records every path and hash, and that receipt is what `undo` reads.
+A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, every target Desktop record byte for byte, and that the source transcripts and sidecars did not change underneath it. Source records are re-read at copy time. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. A duplicate message id counts as a sync replay only when the copies differ in runtime metadata alone, parent pointer, folder, slug, prompt id, version, git branch, tool output verbosity, and every parent exists. Anything else is a conflict and the session is refused. Run again once the session is quiet. A receipt records every path and hash, and that receipt is what `undo` reads.
 
 ## Why it is built this way
 

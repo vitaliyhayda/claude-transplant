@@ -19,7 +19,7 @@ jobs:
       - run: swiftc -parse-as-library -typecheck menubar.swift
       - run: npm pack && npm i -g ./claude-transplant-*.tgz && claude-transplant --version && claude-transplant --help
   publish:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && !github.event.release.prerelease
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -29,4 +29,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22, registry-url: https://registry.npmjs.org }
-      - run: npm i -g npm@latest && npm publish
+      - run: test "v$(node -p "require('./package.json').version")" = "${{ github.event.release.tag_name }}"
+      - run: npm i -g npm@11 && npm publish

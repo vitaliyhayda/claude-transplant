@@ -210,10 +210,15 @@ async function index(pool) {
     const full = path.join(pool, dir)
     for (const name of await readdir(full).catch(() => [])) {
       const id = name.slice(0, -6)
-      if (name.endsWith('.jsonl') && UUID.test(id)) map.set(id, path.join(full, name))
+      if (name.endsWith('.jsonl') && UUID.test(id)) map.set(id, [...(map.get(id) ?? []), path.join(full, name)])
     }
   }
   return map
+}
+
+const locate = (index, id, cwd = '') => {
+  const paths = index.get(id) ?? []
+  return paths.length === 1 ? paths[0] : paths.find((p) => path.basename(path.dirname(p)) === cwd.replace(/[^A-Za-z0-9]/g, '-')) ?? null
 }
 
 export async function scan(file) {
@@ -250,7 +255,7 @@ async function load(file) {
 
 const canonical = (e) => {
   const c = structuredClone(e)
-  for (const k of ['slug', 'promptId', 'parentUuid', 'version', 'cwd']) delete c[k]
+  for (const k of ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']) delete c[k]
   if (c.toolUseResult && typeof c.toolUseResult === 'object' && !Array.isArray(c.toolUseResult)) {
     delete c.toolUseResult.stdout
     delete c.toolUseResult.stderr
@@ -260,22 +265,9 @@ const canonical = (e) => {
 
 const richness = (e) => ['stdout', 'stderr'].reduce((n, k) => n + (typeof e.toolUseResult?.[k] === 'string' ? Buffer.byteLength(e.toolUseResult[k]) : 0), 0)
 
-function survivor(rows, ids, parentOf) {
+function survivor(rows, ids) {
   if (new Set(rows.map((r) => canonical(r.entry))).size !== 1) return null
-  const parents = [...new Set(rows.map((r) => r.entry.parentUuid ?? null))]
-  if (parents.some((p) => p && !ids.has(p))) return null
-  const above = (a, b) => {
-    const seen = new Set()
-    for (let cur = b; cur && !seen.has(cur); cur = parentOf.get(cur) ?? null) {
-      if (cur === a) return true
-      seen.add(cur)
-    }
-    return a === null
-  }
-  if (!parents.every((a) => parents.every((b) => a === b || above(a, b) || above(b, a)))) return null
-  const depth = (p) => { const seen = new Set(); for (let cur = p; cur && !seen.has(cur); cur = parentOf.get(cur) ?? null) seen.add(cur); return seen.size }
-  const depths = rows.toSorted((a, b) => a.line - b.line).map((r) => depth(r.entry.parentUuid ?? null))
-  if (depths.some((d, i) => i && d > depths[i - 1])) return null
+  if (rows.some((r) => r.entry.parentUuid && !ids.has(r.entry.parentUuid))) return null
   const keep = {}
   for (const k of ['stdout', 'stderr']) {
     const values = new Set(rows.map((r) => r.entry.toolUseResult?.[k]).filter((v) => typeof v === 'string' && v.length))
@@ -290,13 +282,12 @@ export function normalize(entries) {
   const rows = entries.map((entry, line) => ({ entry, line })).filter(({ entry }) => TYPES.has(entry.type) && typeof entry.uuid === 'string' && !entry.isSidechain)
   const groups = Map.groupBy(rows, (r) => r.entry.uuid)
   const ids = new Set(groups.keys())
-  const parentOf = new Map(rows.map((r) => [r.entry.uuid, r.entry.parentUuid ?? null]))
   const drop = new Set()
   let replays = 0
   let conflicts = 0
   for (const group of groups.values()) {
     if (group.length < 2) continue
-    const line = survivor(group, ids, parentOf)
+    const line = survivor(group, ids)
     if (line === null) { conflicts++; continue }
     replays++
     for (const r of group) if (r.line !== line) drop.add(r.line)
@@ -377,14 +368,17 @@ function clone(source, targetId, title, now) {
   return { ...r, sessionId: `local_${targetId}`, cliSessionId: targetId, createdAt: now, lastActivityAt: now, lastFocusedAt: now, title, titleSource: 'user', bridgeSessionIds: [], sessionPermissionUpdates: [], spawnSeed: {} }
 }
 
-async function scanned(id, ctx) {
-  if (!ctx.scans.has(id)) ctx.scans.set(id, ctx.index.has(id) ? await scan(ctx.index.get(id)) : null)
+async function scanned(id, ctx, cwd = '') {
+  if (!ctx.scans.has(id)) {
+    const file = locate(ctx.index, id, cwd)
+    ctx.scans.set(id, file ? await scan(file) : null)
+  }
   return ctx.scans.get(id)
 }
 
-async function roots(id, ctx) {
+async function roots(id, ctx, cwd = '') {
   const out = new Set()
-  const own = await scanned(id, ctx)
+  const own = await scanned(id, ctx, cwd)
   for (const uuid of own?.ids ?? []) {
     let cursor = uuid
     let session = own
@@ -413,29 +407,29 @@ export async function inventory(from, to, paths) {
       if (!s.id) { missing.push(s); continue }
       if (seen.has(s.id)) continue
       seen.add(s.id)
-      const rootSet = await roots(s.id, ctx)
+      const transcript = locate(ctx.index, s.id, s.cwd)
+      const rootSet = transcript ? await roots(s.id, ctx, s.cwd) : new Set()
       const invalid = ctx.scans.get(s.id)?.invalid ?? 0
-      if (!rootSet.size && !invalid) { missing.push(s); continue }
-      found.push({ ...s, account, transcript: ctx.index.get(s.id), roots: rootSet, invalid, forks: ctx.scans.get(s.id).forked.size })
+      if (!transcript || (!rootSet.size && !invalid)) { missing.push(s); continue }
+      found.push({ ...s, account, transcript, roots: rootSet, invalid, forks: ctx.scans.get(s.id).forked.size })
     }
   }
-  const groups = [...Map.groupBy(found, (s) => sha(s.roots.size && !s.invalid ? [...s.roots].sort().join('\n') : s.id)).values()]
+  const groups = Map.groupBy(found, (s) => sha(s.roots.size ? [...s.roots].sort().join('\n') : s.id))
+  const picked = [...groups.values()].map((g) => [g.toSorted((a, b) => a.forks - b.forks || a.createdAt - b.createdAt)[0], g])
+  const within = (a, b) => a.roots.size < b.roots.size && [...a.roots].every((id) => b.roots.has(id))
+  const reps = picked.map(([rep]) => rep).filter((rep, _, all) => !all.some((other) => within(rep, other)))
   const repOf = new Map()
-  for (const g of groups) {
-    const rep = g.toSorted((a, b) => a.forks - b.forks || a.createdAt - b.createdAt)[0]
-    for (const s of g) repOf.set(s.record.sessionId, rep)
-  }
-  const reps = [...new Set(repOf.values())]
+  for (const [rep, g] of picked) for (const s of g) repOf.set(s.record.sessionId, reps.find((r) => r === rep || within(rep, r)) ?? rep)
   const targets = []
   for (const s of to.sessions) {
     if (!s.id) continue
-    const r = await roots(s.id, ctx)
+    const r = await roots(s.id, ctx, s.cwd)
     if (r.size) targets.push({ record: s.record.sessionId, roots: r })
   }
   const covering = (rootSet) => (rootSet.size ? targets.find((t) => [...rootSet].every((id) => t.roots.has(id)))?.record ?? null : null)
   const there = []
   const move = []
-  for (const s of reps) (!s.invalid && covering(s.roots) ? there : move).push(s)
+  for (const s of reps) (covering(s.roots) && !s.invalid ? there : move).push(s)
   const parent = (recordId) => {
     const rep = repOf.get(recordId)
     return rep ? { record: rep.record.sessionId, target: covering(rep.roots) } : null
@@ -443,21 +437,21 @@ export async function inventory(from, to, paths) {
   return { total, missing, twice: found.length - reps.length, there, move, parent, from: from.map((a) => a.label) }
 }
 
-function planned(s, to, targetId) {
-  const dir = path.dirname(s.transcript)
-  return [path.join(dir, `${targetId}.jsonl`), path.join(dir, targetId), path.join(to.dir, `local_${targetId}.json`)]
-}
-
-async function one(s, to, targetId, now) {
+async function one(s, to, targetId, now, journal) {
   const source = await load(s.transcript)
   if (source.invalid) throw new Error(`${source.invalid} unparseable lines`)
   const { entries, replays, conflicts } = normalize(source.entries)
   if (conflicts) throw new Error(`${conflicts} conflicting duplicate uuids`)
-  const title = s.title.trim() || derive(entries) || 'Untitled'
+  const current = await readJson(s.file)
+  const title = (current.title ?? '').trim() || derive(entries) || 'Untitled'
   const text = jsonl(fork(entries, s.id, targetId, title))
-  const [targetTranscript, targetDir, record] = planned(s, to, targetId)
+  const targetSha = sha(text)
+  await journal(targetSha)
+  const dir = path.dirname(s.transcript)
+  const targetTranscript = path.join(dir, `${targetId}.jsonl`)
   await writeNew(targetTranscript, text)
-  const sourceDir = path.join(path.dirname(s.transcript), s.id)
+  const sourceDir = path.join(dir, s.id)
+  const targetDir = path.join(dir, targetId)
   let sidecars = { count: 0, bytes: 0, sha: null }
   if (await exists(sourceDir)) {
     await copyTree(sourceDir, targetDir)
@@ -467,10 +461,11 @@ async function one(s, to, targetId, now) {
   const want = new Set(entries.filter((e) => TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain && e.type !== 'progress').map((e) => e.uuid))
   const got = new Set([...(await scan(targetTranscript)).forked.values()].map((f) => f.messageUuid))
   if (!same(want, got)) throw new Error('provenance mismatch')
-  const recordText = `${JSON.stringify(clone(s.record, targetId, title, now), null, 2)}\n`
+  const record = path.join(to.dir, `local_${targetId}.json`)
+  const recordText = `${JSON.stringify(clone(current, targetId, title, now), null, 2)}\n`
   await writeNew(record, recordText)
   if (sha(await readFile(s.transcript)) !== source.sha) throw new Error('source changed during move')
-  return { id: s.id, targetId, title, archived: s.archived, transcript: s.transcript, sourceSha: source.sha, targetTranscript, targetSha: sha(text), targetDir: sidecars.sha ? targetDir : null, record, recordSha: sha(recordText), sidecars, events: want.size, replays, forkedFromSessionId: s.record.forkedFromSessionId ?? null, sourceRecordId: s.record.sessionId ?? null }
+  return { id: s.id, targetId, title, archived: current.isArchived === true, transcript: s.transcript, sourceSha: source.sha, targetTranscript, targetSha, targetDir: sidecars.sha ? targetDir : null, record, recordSha: sha(recordText), sidecars, events: want.size, replays, forkedFromSessionId: current.forkedFromSessionId ?? null, sourceRecordId: current.sessionId ?? null }
 }
 
 async function link(rows, inv) {
@@ -510,16 +505,30 @@ async function verify(rows) {
 
 const receipts = async (paths) => (await readdir(paths.state).catch(() => [])).filter((f) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}\.json$/.test(f)).sort()
 
+const saveJson = async (file, value) => {
+  await writeFile(`${file}.tmp`, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+  await rename(`${file}.tmp`, file)
+}
+
 async function reconcile(paths) {
   const name = (await receipts(paths)).at(-1)
-  if (!name) return
+  if (!name) return null
   const file = path.join(paths.state, name)
-  const receipt = await readJson(file)
-  if (!receipt.pending) return
-  await quarantine(receipt.pending.made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-  receipt.failed.push({ id: receipt.pending.id, title: receipt.pending.title, error: 'interrupted' })
+  const receipt = await readJson(file).catch(() => null)
+  if (!receipt) {
+    await rename(file, `${file}.corrupt`)
+    return { title: name, error: 'corrupt receipt set aside' }
+  }
+  const pending = receipt.pending
+  if (!pending) return null
+  const [transcript] = pending.made
+  const used = pending.sha && (await exists(transcript)) && sha(await readFile(transcript)) !== pending.sha
+  if (!used) await quarantine(pending.made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
+  const error = used ? 'interrupted, copy changed since, left in place' : 'interrupted'
+  receipt.failed.push({ id: pending.id, title: pending.title, error })
   receipt.pending = null
-  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
+  await saveJson(file, receipt)
+  return { title: pending.title, error }
 }
 
 export function move(inv, to, paths, report = () => {}) {
@@ -529,17 +538,18 @@ export function move(inv, to, paths, report = () => {}) {
     const at = stamp()
     const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: [] }
     const file = path.join(paths.state, `${at}.json`)
-    const save = () => writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
+    const save = () => saveJson(file, receipt)
     let events = 0
     let replays = 0
     for (const [i, s] of inv.move.entries()) {
       report('fork', `${i + 1}/${inv.move.length}`, { live: true })
       const targetId = randomUUID()
-      const made = planned(s, to, targetId)
-      receipt.pending = { id: s.id, title: s.title, made }
+      const dir = path.dirname(s.transcript)
+      const made = [path.join(dir, `${targetId}.jsonl`), path.join(dir, targetId), path.join(to.dir, `local_${targetId}.json`)]
+      receipt.pending = { id: s.id, title: s.title, made, sha: null }
       await save()
       try {
-        const row = await one(s, to, targetId, started)
+        const row = await one(s, to, targetId, started, async (targetSha) => { receipt.pending.sha = targetSha; await save() })
         receipt.sessions.push(row)
         events += row.events
         replays += row.replays
@@ -721,6 +731,8 @@ async function main(argv) {
   const paths = layout()
   const out = process.stdout
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
+  const reconciled = await locked(paths, () => reconcile(paths))
+  if (reconciled && args.cmd !== 'accounts') args.json ? emit({ reconciled }) : out.write(`  reconciled  ${reconciled.title} | ${reconciled.error}\n`)
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
     if (args.json) return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, activeAt }) => ({ account, org, email, orgName, label, stats, active, sessions: sessions.length, activeAt })))
