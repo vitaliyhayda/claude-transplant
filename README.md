@@ -1,12 +1,12 @@
-# claude-transplant
+<h1 align="center">claude-transplant</h1>
 
-Move Claude Code history between accounts. Either via menubar or CLI - macOS only.
+<h3 align="center">Move Claude Code history between accounts. Either via menubar or CLI.</h3>
 
-![Claude Transplant: pick from, pick to, move](https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif)
+<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant: pick from, pick to, move" width="760"></p>
 
 ## What it is
 
-Claude Desktop keeps Claude Code sessions inside the account that created them. Switch accounts and your history stays behind. claude-transplant rebuilds it in the account you are switching to. Pick the accounts to take from, pick the one to land in, done. Every copied message records the message it came from, the sources are never touched, and the last move undoes with one command. Run it twice and the second run finds nothing to move.
+Claude Desktop keeps Claude Code sessions inside the account that created them. Switch accounts and your history stays behind. claude-transplant rebuilds it in the account you are switching to. Pick the accounts to take from, pick the one to land in, done. Every copied message records the message it came from, the sources are never touched, and the last move undoes with one command. Run it twice and the second run finds nothing to move. macOS only, because it works on Claude Desktop's own files.
 
 ## Menubar or CLI
 

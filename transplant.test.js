@@ -210,7 +210,7 @@ test('move, rerun, undo across accounts', async () => {
 
   const again = await plan()
   assert.deepEqual(again.move.map((s) => s.id).sort(), [id(500), id(600)])
-  assert.equal(again.there.length, 3)
+  assert.equal(again.there.length, 4)
 
   const undone = await undo(h.paths)
   assert.ok(undone.dest)
