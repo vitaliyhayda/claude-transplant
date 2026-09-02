@@ -118,26 +118,53 @@ test('an invalid duplicate is refused, never hidden behind a valid twin', async 
   assert.equal(result.receipt.sessions.length, 1)
 })
 
-test('a fuller version supersedes the copy this tool made, and undo restores it', async () => {
+test('a fuller version supersedes the copy this tool made, even across diverged branches, and undo restores it', async () => {
   const h = await home()
   const l1 = [entry('user', 970, null, id(970)), entry('assistant', 971, 970, id(970))]
   await h.write(id(970), l1)
   await h.record('P', id(970))
-  const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { from: [by[h.acct.P]], to: by[h.acct.Z] } }
+  const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { from: [by[h.acct.P], by[h.acct.T]], to: by[h.acct.Z] } }
   let p = await pick()
   const first = await move(await inventory(p.from, p.to, h.paths), p.to, h.paths)
   const older = first.receipt.sessions[0].targetId
   await appendFile(path.join(h.project, `${id(970)}.jsonl`), JSON.stringify(entry('user', 972, 971, id(970))) + '\n')
+  await h.write(id(975), [...fork(l1, id(970), id(975), 'L'), entry('user', 973, null, id(975))])
+  await h.record('T', id(975))
   p = await pick()
   const inv = await inventory(p.from, p.to, h.paths)
-  assert.deepEqual(inv.move.map((s) => s.id), [id(970)])
+  assert.equal(inv.apart, 2)
+  assert.deepEqual(inv.move.map((s) => s.id).sort(), [id(970), id(975)])
   const second = await move(inv, p.to, h.paths)
-  assert.equal(second.receipt.superseded.length, 1)
-  assert.equal(second.receipt.superseded[0].id, older)
-  const records = async () => (await readdir(h.dir('Z'))).map((f) => f.slice(6, -5))
-  assert.deepEqual(await records(), [second.receipt.sessions[0].targetId])
+  assert.equal(second.ok, true)
+  assert.equal(second.receipt.sessions.length, 2)
+  assert.deepEqual(second.receipt.superseded.map((s) => s.id), [older])
+  assert.equal(second.receipt.retiring, null)
+  const records = async () => (await readdir(h.dir('Z'))).map((f) => f.slice(6, -5)).sort()
+  assert.deepEqual(await records(), second.receipt.sessions.map((r) => r.targetId).sort())
+  const dummy = path.join(h.project, 'dummy.txt')
+  await writeFile(dummy, 'x')
+  await writeFile(path.join(h.paths.state, '2099-01-01T00-00-00-000.json'), JSON.stringify({ at: '2099-01-01T00-00-00-000', from: [], to: 'x', sessions: [], failed: [], superseded: [], retiring: [{ id: 'd', title: 'd', by: 'e', moved: [[dummy, path.join(h.paths.state, 'quarantine', 'x', 'dummy.txt')]] }] }))
+  const undone = await undo(h.paths)
+  assert.ok(undone.dest)
+  assert.equal(JSON.parse(await readFile(path.join(undone.dest, 'receipt.json'), 'utf8')).superseded.length, 1)
+  assert.equal(await readFile(dummy, 'utf8'), 'x')
   assert.ok((await undo(h.paths)).dest)
   assert.deepEqual(await records(), [older])
+})
+
+test('a target copy without the source sidecars does not count as already there', async () => {
+  const h = await home()
+  const n1 = [entry('user', 985, null, id(985)), entry('assistant', 986, 985, id(985))]
+  await h.write(id(985), n1)
+  await mkdir(path.join(h.project, id(985), 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, id(985), 'subagents', 'agent-n.jsonl'), '{"agent":"n"}\n')
+  await h.record('P', id(985))
+  await h.write(id(995), fork(n1, id(985), id(995), 'N'))
+  await h.record('Z', id(995))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  assert.equal(inv.there.length, 0)
+  assert.deepEqual(inv.move.map((s) => s.id), [id(985)])
 })
 
 test('versions that grew apart both move and are counted', async () => {
@@ -310,7 +337,7 @@ test('move, rerun, undo across accounts', async () => {
   await appendFile(second.receipt.sessions[0].targetTranscript, JSON.stringify({ type: 'mode', sessionId: second.receipt.sessions[0].targetId, mode: 'x' }) + '\n')
   assert.ok((await undo(h.paths)).dest)
   const third = await move(await plan(), (await pick()).to, h.paths)
-  await appendFile(third.receipt.sessions[0].targetTranscript, JSON.stringify(entry('user', 999, null, third.receipt.sessions[0].targetId)) + '\n')
+  await appendFile(third.receipt.sessions[0].targetTranscript, JSON.stringify({ type: 'content-replacement', sessionId: third.receipt.sessions[0].targetId, replacements: [{ uuid: id(1), text: 'x' }] }) + '\n')
   const refused = await undo(h.paths)
   assert.deepEqual(refused.changed, [third.receipt.sessions[0].title])
   assert.equal((await readdir(h.dir('Z'))).length, 7)

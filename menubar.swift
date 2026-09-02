@@ -153,26 +153,28 @@ final class Model: ObservableObject {
     }
 
     func restartDesktop() {
-        let quit = Process()
-        quit.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        quit.arguments = ["-e", "quit app \"Claude\""]
-        try? quit.run()
-        quit.waitUntilExit()
-        for _ in 0..<40 {
-            let probe = Process()
-            probe.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            probe.arguments = ["-x", "Claude"]
-            probe.standardOutput = FileHandle.nullDevice
-            try? probe.run()
-            probe.waitUntilExit()
-            if probe.terminationStatus != 0 { break }
-            Thread.sleep(forTimeInterval: 0.25)
+        note = "restarting Claude Desktop"
+        DispatchQueue.global().async { [weak self] in
+            let quit = Model.shell("/usr/bin/osascript", ["-e", "quit app \"Claude\""]) == 0
+            var gone = false
+            for _ in 0..<40 {
+                if Model.shell("/usr/bin/pgrep", ["-x", "Claude"]) != 0 { gone = true; break }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            let opened = gone && Model.shell("/usr/bin/open", ["-a", "Claude"]) == 0
+            DispatchQueue.main.async { self?.note = quit && opened ? "" : "could not restart Claude Desktop, quit and reopen it yourself" }
         }
-        let open = Process()
-        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-a", "Claude"]
-        try? open.run()
-        note = ""
+    }
+
+    nonisolated private static func shell(_ executable: String, _ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return 1 }
+        process.waitUntilExit()
+        return process.terminationStatus
     }
 
     private func finish(_ status: Int32) {
