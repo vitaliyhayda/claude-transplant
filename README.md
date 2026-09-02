@@ -1,6 +1,8 @@
 # claude-transplant
 
-Move Claude Code history between Claude accounts on a Mac. Sources stay untouched, every copy is verified, and one command undoes the last move.
+Move Claude Code history between accounts. Two picks, verified copies, sources untouched, one-step undo.
+
+![Claude Transplant menubar: pick from, pick to, move](https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif)
 
 ```
 npx claude-transplant
