@@ -18,12 +18,14 @@ struct Config: Decodable {
 }
 
 struct Failure: Decodable {
+    let id: String?
     let title: String?
     let error: String
 }
 
 struct Problem: Decodable {
-    let title: String
+    let id: String?
+    let title: String?
     let check: String
 }
 
@@ -37,6 +39,7 @@ struct Event: Decodable {
     let failed: [Failure]?
     let problems: [Problem]?
     let note: String?
+    let restart: Bool?
     let undone: String?
     let sessions: Int?
     let refused: [String]?
@@ -46,8 +49,6 @@ struct Event: Decodable {
 extension String {
     var sentence: String { prefix(1).uppercased() + dropFirst() }
 }
-
-let restartNote = "restart Claude Code to see them"
 
 @MainActor
 final class Model: ObservableObject {
@@ -59,6 +60,7 @@ final class Model: ObservableObject {
     @Published var badge = ""
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
+    @Published var restartAvailable = false
     let demo: Bool
     private let config: Config?
 
@@ -92,7 +94,7 @@ final class Model: ObservableObject {
 
     func refresh() {
         var text = ""
-        run(["accounts", "--json"], line: { text += $0 }) { [weak self] _ in
+        run(["accounts", "--json"], line: { text += $0 }) { [weak self] _, _ in
             guard let self, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             from = from.filter { id in list.contains { $0.id == id } }
@@ -104,19 +106,20 @@ final class Model: ObservableObject {
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
         let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--json"]
         begin()
-        run(args, line: { [weak self] in self?.handle($0) }) { [weak self] in self?.finish($0) }
+        run(args, line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
 
     func undo() {
         guard !running else { return }
         begin()
-        run(["undo", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] in self?.finish($0) }
+        run(["undo", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
 
     func begin() {
         lines = []
         note = ""
         running = true
+        restartAvailable = false
         symbol = "arrow.triangle.2.circlepath"
     }
 
@@ -133,23 +136,34 @@ final class Model: ObservableObject {
             let moved = event.moved ?? 0
             let failed = event.failed ?? []
             if !failed.isEmpty {
-                lines.append(("failed", failed.map { ($0.title ?? "?") + " | " + $0.error }.joined(separator: "\n")))
+                lines.append(("failed", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n")))
             }
             let good = event.ok ?? true
             let problems = event.problems ?? []
-            for problem in problems { lines.append(("check", problem.title + " | " + problem.check + " failed")) }
-            let summary = (moved == 0 ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed") : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")) + (problems.isEmpty ? "" : ", verification failed")
+            for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
+            let movedText = moved == 0
+                ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed")
+                : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")
+            let summary = movedText + (problems.isEmpty ? "" : ", verification failed")
             note = good ? (event.note ?? summary) : summary
+            restartAvailable = event.restart ?? false
             notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
         } else if event.undone != nil {
             note = event.note ?? ""
+            restartAvailable = event.restart ?? false
             notify("\(event.sessions ?? 0) sessions undone", note)
         } else if let refused = event.refused {
             note = "Undo refused, \(refused.count) sessions gained messages"
+            restartAvailable = false
             lines = refused.map { ("kept", $0) }
         } else if event.nothing == true {
             note = "Nothing to undo"
+            restartAvailable = false
         }
+    }
+
+    private func identity(_ title: String?, _ id: String?) -> String {
+        [title, id.map { String($0.prefix(8)) }].compactMap { $0 }.joined(separator: " | ")
     }
 
     func restartDesktop() {
@@ -177,13 +191,13 @@ final class Model: ObservableObject {
         return process.terminationStatus
     }
 
-    private func finish(_ status: Int32) {
+    private func finish(_ status: Int32, _ error: String) {
         running = false
         badge = ""
         from = []
         to = nil
         symbol = status == 0 ? "checkmark" : "exclamationmark.triangle"
-        if status != 0, note.isEmpty { note = "Failed, run npx claude-transplant in a terminal" }
+        if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.symbol = "arrow.left.arrow.right" }
         refresh()
     }
@@ -209,15 +223,16 @@ final class Model: ObservableObject {
         return found.isEmpty ? configured : found
     }
 
-    private func run(_ args: [String], line: @escaping (String) -> Void, done: @escaping (Int32) -> Void) {
-        guard let config else { done(1); return }
+    private func run(_ args: [String], line: @escaping (String) -> Void, done: @escaping (Int32, String) -> Void) {
+        guard let config else { done(1, "Menubar configuration is missing"); return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node(config.node))
         process.arguments = [config.script] + args
         let pipe = Pipe()
+        let errors = Pipe()
         process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { done(1); return }
+        process.standardError = errors
+        do { try process.run() } catch { done(1, error.localizedDescription); return }
         DispatchQueue.global().async {
             let handle = pipe.fileHandleForReading
             var buffer = Data()
@@ -231,9 +246,10 @@ final class Model: ObservableObject {
                     DispatchQueue.main.async { line(text) }
                 }
             }
+            let error = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             process.waitUntilExit()
             let status = process.terminationStatus
-            DispatchQueue.main.async { done(status) }
+            DispatchQueue.main.async { done(status, error) }
         }
     }
 }
@@ -318,9 +334,11 @@ struct Panel: View {
                     Row(account: account, on: model.from.contains(account.id), radio: false) { model.toggle(account.id) }
                 }
             }
-            block("To") {
-                ForEach(model.remaining) { account in
-                    Row(account: account, on: model.to == account.id, radio: true) { model.to = account.id }
+            if !model.from.isEmpty {
+                block("To") {
+                    ForEach(model.remaining) { account in
+                        Row(account: account, on: model.to == account.id, radio: true) { model.to = account.id }
+                    }
                 }
             }
             if !model.lines.isEmpty || !model.note.isEmpty { Divider() }
@@ -332,7 +350,7 @@ struct Panel: View {
                 .font(.system(.caption, design: .monospaced))
             }
             if let progress = model.progress { Bar(value: progress) }
-            if model.note == restartNote {
+            if model.restartAvailable {
                 Button(action: { model.restartDesktop() }) { Text(model.note.sentence).font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
             } else if !model.note.isEmpty {
                 Text(model.note.sentence).font(.callout.weight(.medium))
@@ -413,7 +431,15 @@ struct Screen: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            LinearGradient(colors: [Color(red: 0.13, green: 0.17, blue: 0.38), Color(red: 0.42, green: 0.16, blue: 0.36), Color(red: 0.86, green: 0.42, blue: 0.30)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            LinearGradient(
+                colors: [
+                    Color(red: 0.13, green: 0.17, blue: 0.38),
+                    Color(red: 0.42, green: 0.16, blue: 0.36),
+                    Color(red: 0.86, green: 0.42, blue: 0.30)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
             VStack(alignment: .trailing, spacing: 6) {
                 MenuBar(open: open, symbol: model.symbol, badge: model.badge)
                 if open {
@@ -491,8 +517,11 @@ enum Demo {
         model.lines.append(("verify", "provenance ✓ | lineage ✓ | sidecars ✓ | desktop ✓ | sources unchanged ✓ | 38s"))
         snap(500)
         model.running = false
+        model.from = []
+        model.to = nil
         model.symbol = "checkmark"
-        model.note = "restart Claude Code to see them"
+        model.note = "restart Claude Desktop to see them"
+        model.restartAvailable = true
         snap(2800)
         try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))
         exit(0)

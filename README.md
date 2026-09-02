@@ -10,7 +10,7 @@ Claude Desktop keeps Claude Code sessions inside the account that created them. 
 
 ## Menubar or CLI
 
-Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Straight from this repository instead of the npm registry: `npx github:vitaliyhayda/claude-transplant`, append a hash and a release tag to pin one.
+Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Straight from this repository instead of the npm registry: `npx github:vitaliyhayda/claude-transplant`. Append `#v1.2.0` or a commit hash to pin one.
 
 ```
 npx claude-transplant menubar
@@ -39,7 +39,7 @@ To    ↑↓ move · enter confirm
 
   receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11-208.json
   undo        npx claude-transplant undo
-  then        restart Claude Code to see them
+  then        restart Claude Desktop to see them
 ```
 
 ## Options
@@ -58,7 +58,7 @@ To    ↑↓ move · enter confirm
 The inventory line, decoded:
 
 - without history: a Desktop record whose transcript no longer exists on disk
-- older versions skipped: the same history present in more than one source account, or in several versions where one contains the others, moved once as the fullest version, and only when that version also carries every sidecar file of the ones it replaces. A version with an unparseable line is never folded away, it is refused and named
+- older versions skipped: the same history present in more than one source account, or in several compatible versions where one contains the others, moved once as the fullest version. Shared messages, meaningful state, and sidecars must agree before one version can replace another. An unparseable or conflicting version is never folded away
 - grew apart: two versions of one history that both continued after a copy, so neither contains the other. All of them move and the line says so
 - already there: the target already holds every message and every sidecar file, followed through earlier copies whose transcripts are still on disk
 
@@ -66,7 +66,13 @@ Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profil
 
 ## How it works
 
-A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, every target Desktop record byte for byte, and that the source transcripts and sidecars did not change underneath it. Source records are re-read at copy time. Changed means the conversation itself changed, a new message, a content replacement, or richer tool output under an existing id. Title and mode records that Claude Desktop appends to sessions it opens never count. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. A duplicate message id counts as a sync replay only when the copies differ in runtime metadata alone, parent pointer, folder, slug, prompt id, version, git branch, tool output verbosity, and every parent exists. Anything else is a conflict and the session is refused. This rests on one assumption made deliberately: a message id names one event, so two placements of the same id are one event, and the richer copy is kept. Run again once the session is quiet. When a fuller version lands in an account that already holds an older copy made by this tool, that older copy is retired into quarantine after the new copies pass verification, only if it has not changed since and every one of its sidecar files exists in the new copy, with the retirement journaled in the receipt before any file moves. The output says superseded, and each account converges to one entry per history. A receipt records every path and hash, and that receipt is what `undo` reads, including the superseded copies it puts back.
+A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. The Desktop record keeps the source session's created, activity, and focus times.
+
+After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, every target Desktop record byte for byte, and that the source transcripts and sidecars did not change underneath it. Source records are re-read at copy time. Changed means the conversation itself changed, a new message, a content replacement, richer tool output under an existing id, an unparseable line, or a newly conflicting replay. Title and mode records that Claude Desktop appends to sessions it opens never count. A failed check is tied to the copied session id, exits nonzero, and prevents that copy from superseding anything.
+
+A duplicate message id counts as a sync replay only when the copies differ in runtime metadata alone, parent pointer, folder, slug, prompt id, version, git branch, or tool output verbosity, and every parent exists. Anything else is a conflict and the session is refused. This rests on one assumption made deliberately: a message id names one event, so two compatible placements of the same id are one event, and the richer copy is kept.
+
+Lineage comparison follows every copied message back to its root. A source version is skipped only when another compatible version contains every one of its root messages and sidecars. Versions with different shared content, replacements, or state move separately. When a complete version lands beside an older copy made by this tool, the older copy is retired into quarantine only after verification and an unchanged check. A receipt journals copying, verification, and retirement so an interrupted run is either finished safely or rolled back on the next move. `undo` reads that receipt and restores superseded copies.
 
 ## Why it is built this way
 
@@ -84,7 +90,7 @@ Every green light in this system proves one layer. A transcript that parses says
 
 Tools that share one transcript store across accounts solve a different problem: who pays for the next turn. They do not make history belong to an account, and they cannot make it appear in Claude Desktop under that account. If you live in a terminal and rotate logins for rate limits, use one of those. If Claude Desktop is your home and you switch accounts deliberately, move the history, sign in on your phone to the same account, and accept a few minutes of login tax for behavior that is supported end to end.
 
-The cost of this design is a copy that lives beside its source rather than replacing it, and an occasional second copy when a source kept growing after it was moved. The benefit is that nothing can be lost, and every number on screen has a witness on disk.
+The cost of this design is a copy that lives beside its source rather than replacing it, and an occasional second copy when two versions genuinely grew apart. The benefit is that the untouched source remains the recovery baseline, and every number on screen has a witness on disk.
 
 ## Dead ends
 
@@ -105,10 +111,11 @@ Each of these was tried. Each looked like it worked until the layer below was ch
 
 ## Boundaries
 
-- macOS with Claude Desktop. Everything is local.
+- macOS 13 or newer with Claude Desktop. Everything is local.
 - Remote Control bridges, scheduled tasks, and cloud ownership do not move. They belong to the account that created them.
-- The transcript and record layouts are undocumented and may change. Verified with Claude Code 2.1.257 and Agent SDK 0.3.258.
+- Inline sidechain events in the main transcript do not move, matching the official `forkSession` behavior. Sidecar subagent transcripts and tool results do move.
+- The transcript and record layouts are undocumented and may change. Verified with Claude Code 2.1.257, Desktop transcript 2.1.258, and Agent SDK 0.3.259.
 - Moving history out of a Team organization is your organization's call, not this tool's.
 - Unofficial. Not affiliated with Anthropic.
 
-Receipts, quarantine, and the menubar app live in `~/Library/Application Support/claude-transplant`. Quarantine holds undone and failed copies, sources are intact, so recovery is a rerun, and the `quarantine` folder inside can be deleted once its receipts are no longer wanted. A run interrupted mid-copy is reconciled by the next run or undo, which quarantines the half-written copy and names it. A lock file names the running process and is cleared automatically once that process is gone. MIT.
+Receipts, quarantine, and the menubar app live in `~/Library/Application Support/claude-transplant`. Quarantine holds undone and failed copies, sources are intact, so recovery is a rerun, and the `quarantine` folder inside can be deleted once its receipts are no longer wanted. A run interrupted before final verification is finished or rolled back by the next run or undo. A kernel lock prevents overlapping runs and releases automatically when its holder exits. MIT.

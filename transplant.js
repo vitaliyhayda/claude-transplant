@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, realpathSync } from 'node:fs'
-import { copyFile, link as hardlink, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -12,8 +12,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const TYPES = new Set(['user', 'assistant', 'attachment', 'system', 'progress'])
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SEPARATORS = new RegExp(`[${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g')
-const NOTE = 'restart Claude Code to see them'
+const NOTE = 'restart Claude Desktop to see them'
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
+const SEMANTIC_VERSION = 2
 const HELP = `claude-transplant   move Claude Code history between accounts, sources untouched
 
   claude-transplant             pick from → to, move, print receipt
@@ -36,7 +37,9 @@ const exists = (p) => stat(p).then(() => true, () => false)
 const readJson = async (p) => JSON.parse(await readFile(p, 'utf8'))
 const stamp = () => new Date().toISOString().slice(0, 23).replace(/[:.]/g, '-')
 const jsonl = (entries) => entries.map((e) => JSON.stringify(e).replace(SEPARATORS, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)).join('\n') + '\n'
-const same = (a, b) => a.size === b.size && [...a].every((v) => b.has(v))
+const typed = (e) => e && typeof e === 'object' && TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain
+const message = (e) => typed(e) && e.type !== 'progress'
+const same = (a, b) => a.size === b.size && a.isSubsetOf(b)
 
 export function layout(home = os.homedir()) {
   const support = path.join(home, 'Library/Application Support')
@@ -105,25 +108,18 @@ async function quarantine(items, dest) {
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
-  const mine = path.join(paths.state, `lock.${process.pid}`)
-  const holder = () => readFile(lockFile, 'utf8').catch(() => null)
-  const alive = (pid) => { try { return pid > 0 && process.kill(pid, 0) } catch { return false } }
-  const grab = () => hardlink(mine, lockFile).then(() => true, () => false)
-  await writeFile(mine, String(process.pid), { mode: 0o600 })
+  const guard = spawn('/usr/bin/lockf', ['-s', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  await new Promise((resolve, reject) => {
+    let ready = false
+    guard.stdout.once('data', () => { ready = true; resolve() })
+    guard.once('error', reject)
+    guard.once('exit', () => { if (!ready) reject(new Error('another run holds the lock')) })
+  })
   try {
-    if (!(await grab())) {
-      const stale = await holder()
-      if (alive(Number(stale))) throw new Error(`another run holds the lock, pid ${Number(stale)}`)
-      if ((await holder()) === stale) await unlink(lockFile).catch(() => {})
-      if (!(await grab())) throw new Error('another run holds the lock')
-    }
-    try {
-      return await work()
-    } finally {
-      if ((await holder()) === String(process.pid)) await unlink(lockFile).catch(() => {})
-    }
+    return await work()
   } finally {
-    await unlink(mine).catch(() => {})
+    guard.stdin.end()
+    if (guard.exitCode === null) await new Promise((resolve) => guard.once('exit', resolve))
   }
 }
 
@@ -147,7 +143,9 @@ async function logins(paths) {
     if (a?.accountUuid && a.emailAddress) emails.set(a.accountUuid, a.emailAddress)
     if (a?.organizationUuid && a.organizationName) orgs.set(a.organizationUuid, a.organizationType && !/team|enterprise/.test(a.organizationType) ? 'Personal' : a.organizationName)
   }
-  for (const e of await readdir(paths.home, { withFileTypes: true }).catch(() => [])) if (e.name.startsWith('.claude')) await take(e.isDirectory() ? path.join(paths.home, e.name, '.claude.json') : path.join(paths.home, e.name))
+  for (const e of await readdir(paths.home, { withFileTypes: true }).catch(() => [])) {
+    if (e.name.startsWith('.claude')) await take(e.isDirectory() ? path.join(paths.home, e.name, '.claude.json') : path.join(paths.home, e.name))
+  }
   for (const f of await readdir(paths.backups).catch(() => [])) if (f.startsWith('.claude.json.backup')) await take(path.join(paths.backups, f))
   await take(paths.login)
   for (const { account, files } of await records(paths.agentSessions)) {
@@ -189,7 +187,17 @@ export async function accounts(paths) {
     for (const file of files) {
       const r = await readJson(file).catch(() => null)
       if (!r) continue
-      sessions.push({ file, id: UUID.test(r.cliSessionId ?? '') ? r.cliSessionId : null, cwd: r.cwd ?? '', title: r.title ?? '', archived: r.isArchived === true, createdAt: r.createdAt ?? 0, activeAt: r.lastActivityAt ?? 0, focusedAt: r.lastFocusedAt ?? 0, record: r })
+      sessions.push({
+        file,
+        id: UUID.test(r.cliSessionId ?? '') ? r.cliSessionId : null,
+        cwd: r.cwd ?? '',
+        title: r.title ?? '',
+        archived: r.isArchived === true,
+        createdAt: r.createdAt ?? 0,
+        activeAt: r.lastActivityAt ?? 0,
+        focusedAt: r.lastFocusedAt ?? 0,
+        record: r
+      })
     }
     const activeAt = Math.max(0, ...sessions.map((s) => s.activeAt))
     const email = emails.get(account) ?? null
@@ -231,7 +239,7 @@ export async function scan(file) {
     if (!text) continue
     let e
     try { e = JSON.parse(text) } catch { invalid++; continue }
-    if (!e || typeof e !== 'object' || !TYPES.has(e.type) || typeof e.uuid !== 'string' || e.isSidechain || e.type === 'progress') continue
+    if (!message(e)) continue
     ids.push(e.uuid)
     if (typeof e.forkedFrom?.messageUuid === 'string') forked.set(e.uuid, e.forkedFrom)
   }
@@ -253,7 +261,7 @@ async function load(file) {
   return { sha: sha(raw), entries, invalid }
 }
 
-const canonical = (e) => {
+const replayShape = (e) => {
   const c = structuredClone(e)
   for (const k of ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']) delete c[k]
   if (c.toolUseResult && typeof c.toolUseResult === 'object' && !Array.isArray(c.toolUseResult)) {
@@ -263,10 +271,16 @@ const canonical = (e) => {
   return stable(c)
 }
 
+const semanticShape = (e) => {
+  const c = structuredClone(e)
+  for (const k of ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']) delete c[k]
+  return stable(c)
+}
+
 const richness = (e) => ['stdout', 'stderr'].reduce((n, k) => n + (typeof e.toolUseResult?.[k] === 'string' ? Buffer.byteLength(e.toolUseResult[k]) : 0), 0)
 
 function survivor(rows, ids) {
-  if (new Set(rows.map((r) => canonical(r.entry))).size !== 1) return null
+  if (new Set(rows.map((r) => replayShape(r.entry))).size !== 1) return null
   if (rows.some((r) => r.entry.parentUuid && !ids.has(r.entry.parentUuid))) return null
   const keep = {}
   for (const k of ['stdout', 'stderr']) {
@@ -279,7 +293,7 @@ function survivor(rows, ids) {
 }
 
 export function normalize(entries) {
-  const rows = entries.map((entry, line) => ({ entry, line })).filter(({ entry }) => TYPES.has(entry.type) && typeof entry.uuid === 'string' && !entry.isSidechain)
+  const rows = entries.map((entry, line) => ({ entry, line })).filter(({ entry }) => typed(entry))
   const groups = Map.groupBy(rows, (r) => r.entry.uuid)
   const ids = new Set(groups.keys())
   const drop = new Set()
@@ -295,11 +309,11 @@ export function normalize(entries) {
   return { entries: entries.filter((_, line) => !drop.has(line)), replays, conflicts }
 }
 
-export function semantic(entries, sessionId) {
-  const { entries: kept } = normalize(entries)
-  const rows = kept.filter((e) => TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain && e.type !== 'progress').map(canonical)
-  const replacements = entries.filter((e) => e.type === 'content-replacement' && e.sessionId === sessionId).map((e) => stable(e.replacements))
-  return sha(stable({ rows, replacements, suppressed: entries.some((e) => e.type === 'history-suppression') }))
+export function semantic(entries, sessionId, invalid = 0) {
+  const normalized = normalize(entries)
+  const rows = normalized.entries.filter(message).map((e) => sha(semanticShape(e)))
+  const replacements = entries.filter((e) => e.type === 'content-replacement' && e.sessionId === sessionId).map((e) => sha(stable(e.replacements)))
+  return sha(stable({ rows, replacements, suppressed: entries.some((e) => e.type === 'history-suppression'), invalid, conflicts: normalized.conflicts }))
 }
 
 function derive(entries) {
@@ -372,7 +386,19 @@ export function fork(entries, sourceId, targetId, title, now = new Date().toISOS
 function clone(source, targetId, title, now) {
   const r = structuredClone(source)
   for (const k of ['forkedFromSessionId', 'writtenBranch', 'writtenBranches', 'scheduledTaskId', 'notifySessionId']) delete r[k]
-  return { ...r, sessionId: `local_${targetId}`, cliSessionId: targetId, createdAt: now, lastActivityAt: now, lastFocusedAt: now, title, titleSource: 'user', bridgeSessionIds: [], sessionPermissionUpdates: [], spawnSeed: {} }
+  return {
+    ...r,
+    sessionId: `local_${targetId}`,
+    cliSessionId: targetId,
+    createdAt: source.createdAt ?? now,
+    lastActivityAt: source.lastActivityAt ?? now,
+    lastFocusedAt: source.lastFocusedAt ?? source.lastActivityAt ?? now,
+    title,
+    titleSource: 'user',
+    bridgeSessionIds: [],
+    sessionPermissionUpdates: [],
+    spawnSeed: {}
+  }
 }
 
 async function scanned(id, ctx, cwd = '') {
@@ -393,10 +419,10 @@ async function sidecarSet(transcript, id) {
   }
 }
 
-async function roots(id, ctx, cwd = '') {
-  const out = new Set()
+async function origins(id, ctx, cwd = '') {
+  const out = new Map()
   const own = await scanned(id, ctx, cwd)
-  for (const uuid of own?.ids ?? []) {
+  for (const uuid of new Set(own?.ids ?? [])) {
     let cursor = uuid
     let session = own
     const seen = new Set()
@@ -407,10 +433,70 @@ async function roots(id, ctx, cwd = '') {
       cursor = from.messageUuid
       session = await scanned(from.sessionId, ctx)
     }
-    out.add(cursor)
+    out.set(uuid, cursor)
   }
   return out
 }
+
+const lineageEvent = (entry) => {
+  const c = structuredClone(entry)
+  const output = { stdout: null, stderr: null }
+  const ignored = [
+    'uuid', 'parentUuid', 'logicalParentUuid', 'sessionId', 'timestamp', 'slug', 'promptId', 'version', 'cwd', 'gitBranch',
+    'forkedFrom', 'teamName', 'agentName', 'sessionKind', 'sourceToolAssistantUUID', 'neutralizedByFork'
+  ]
+  for (const k of ignored) delete c[k]
+  if (c.toolUseResult && typeof c.toolUseResult === 'object' && !Array.isArray(c.toolUseResult)) {
+    for (const k of ['stdout', 'stderr']) {
+      if (typeof c.toolUseResult[k] === 'string' && c.toolUseResult[k]) output[k] = sha(c.toolUseResult[k])
+      delete c.toolUseResult[k]
+    }
+    if (!Object.keys(c.toolUseResult).length) delete c.toolUseResult
+  }
+  return { base: sha(stable(c)), ...output }
+}
+
+const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && ['stdout', 'stderr'].every((k) => !a[k] || a[k] === b[k])
+
+function lineageState(entries, sessionId, origin) {
+  const replacements = []
+  for (const e of entries) {
+    if (e.type === 'content-replacement' && e.sessionId === sessionId && Array.isArray(e.replacements)) {
+      for (const replacement of e.replacements) {
+        const copy = structuredClone(replacement)
+        if (typeof copy.uuid === 'string') copy.uuid = origin.get(copy.uuid) ?? copy.uuid
+        replacements.push(copy)
+      }
+    }
+  }
+  return sha(stable({ replacements, suppressed: entries.some((e) => e.type === 'history-suppression') }))
+}
+
+async function history(id, transcript, ctx, cwd = '') {
+  const data = await load(transcript)
+  const normalized = normalize(data.entries)
+  const origin = await origins(id, ctx, cwd)
+  const events = new Map()
+  let conflicts = normalized.conflicts
+  for (const e of normalized.entries.filter(message)) {
+    const root = origin.get(e.uuid) ?? e.uuid
+    const shape = lineageEvent(e)
+    const prior = events.get(root)
+    if (!prior || eventIncluded(prior, shape)) events.set(root, shape)
+    else if (!eventIncluded(shape, prior)) conflicts++
+  }
+  const roots = new Set(events.keys())
+  const state = lineageState(data.entries, id, origin)
+  const comparable = data.invalid === 0 && conflicts === 0 && roots.size > 0
+  const historyKey = comparable ? sha(stable({ events: [...events].sort(([a], [b]) => a.localeCompare(b)), state })) : null
+  return { roots, events, state, invalid: data.invalid, conflicts, comparable, historyKey, snapshot: semantic(data.entries, id, data.invalid) }
+}
+
+const historyIncluded = (a, b) => a.comparable && b.comparable && a.roots.isSubsetOf(b.roots) && a.state === b.state && [...a.events].every(([id, event]) => eventIncluded(event, b.events.get(id)))
+const carries = (a, b) => Boolean(a.sidecars && b.sidecars && a.sidecars.isSubsetOf(b.sidecars))
+const included = (a, b) => historyIncluded(a, b) && carries(a, b)
+const within = (a, b) => included(a, b) && !included(b, a)
+const overlaps = (a, b) => !a.roots.isDisjointFrom(b.roots)
 
 export async function inventory(from, to, paths, skip = new Set()) {
   const ctx = { index: await index(paths.pool), scans: new Map() }
@@ -426,20 +512,18 @@ export async function inventory(from, to, paths, skip = new Set()) {
       if (!transcript) { missing.push(s); continue }
       if (seen.has(transcript)) continue
       seen.add(transcript)
-      const rootSet = await roots(s.id, ctx, s.cwd)
-      const { invalid, forked } = ctx.scans.get(transcript)
-      if (!rootSet.size && !invalid) { missing.push(s); continue }
-      found.push({ ...s, account, transcript, roots: rootSet, invalid, forks: forked.size, sidecars: await sidecarSet(transcript, s.id) })
+      const detail = await history(s.id, transcript, ctx, s.cwd)
+      const { forked } = ctx.scans.get(transcript)
+      if (!detail.roots.size && !detail.invalid) { missing.push(s); continue }
+      found.push({ ...s, account, transcript, ...detail, forks: forked.size, sidecars: await sidecarSet(transcript, s.id) })
     }
   }
-  const groups = Map.groupBy(found, (s) => sha(s.invalid || !s.roots.size ? s.transcript : [...s.roots].sort().join('\n')))
-  const carries = (a, b) => a.sidecars && b.sidecars && [...a.sidecars].every((f) => b.sidecars.has(f))
+  const groups = Map.groupBy(found, (s) => s.historyKey ?? `file:${s.transcript}`)
   const picked = [...groups.values()].flatMap((g) => {
     const ordered = g.toSorted((a, b) => a.forks - b.forks || a.createdAt - b.createdAt)
     const rep = ordered.find((c) => ordered.every((m) => carries(m, c)))
     return rep ? [[rep, g]] : g.map((s) => [s, [s]])
   })
-  const within = (a, b) => !a.invalid && !b.invalid && a.roots.size < b.roots.size && [...a.roots].every((id) => b.roots.has(id)) && carries(a, b)
   const reps = picked.map(([rep]) => rep).filter((rep, _, all) => !all.some((other) => within(rep, other)))
   const repOf = new Map()
   for (const [rep, g] of picked) for (const s of g) repOf.set(s.record.sessionId, reps.find((r) => r === rep || within(rep, r)) ?? rep)
@@ -447,10 +531,10 @@ export async function inventory(from, to, paths, skip = new Set()) {
   for (const s of to.sessions) {
     if (!s.id || skip.has(s.file)) continue
     const transcript = locate(ctx.index, s.id, s.cwd)
-    const r = transcript ? await roots(s.id, ctx, s.cwd) : new Set()
-    if (r.size) targets.push({ record: s.record.sessionId, roots: r, session: s, transcript, sidecars: await sidecarSet(transcript, s.id) })
+    const detail = transcript ? await history(s.id, transcript, ctx, s.cwd) : null
+    if (detail?.roots.size) targets.push({ record: s.record.sessionId, ...detail, session: s, transcript, sidecars: await sidecarSet(transcript, s.id) })
   }
-  const covering = (s) => (s.roots.size ? targets.find((t) => [...s.roots].every((id) => t.roots.has(id)) && carries(s, t))?.record ?? null : null)
+  const covering = (s) => targets.find((t) => included(s, t))?.record ?? null
   const there = []
   const move = []
   for (const s of reps) (covering(s) && !s.invalid ? there : move).push(s)
@@ -458,7 +542,6 @@ export async function inventory(from, to, paths, skip = new Set()) {
     const rep = repOf.get(recordId)
     return rep ? { record: rep.record.sessionId, target: covering(rep) } : null
   }
-  const overlaps = (a, b) => { for (const id of a.roots) if (b.roots.has(id)) return true; return false }
   const apart = reps.filter((a) => reps.some((b) => a !== b && overlaps(a, b))).length
   return { total, missing, twice: found.length - reps.length, apart, there, move, parent, targets, from: from.map((a) => a.label) }
 }
@@ -468,14 +551,15 @@ async function one(s, to, targetId, now, journal) {
   if (source.invalid) throw new Error(`${source.invalid} unparseable lines`)
   const { entries, replays, conflicts } = normalize(source.entries)
   if (conflicts) throw new Error(`${conflicts} conflicting duplicate uuids`)
-  const sourceSemantic = semantic(source.entries, s.id)
+  const sourceSemantic = semantic(source.entries, s.id, source.invalid)
+  if (s.snapshot && sourceSemantic !== s.snapshot) throw new Error('source changed since inventory')
   const current = await readJson(s.file)
   const title = (current.title ?? '').trim() || derive(entries) || 'Untitled'
   const forked = fork(entries, s.id, targetId, title)
   const text = jsonl(forked)
-  const want = new Set(entries.filter((e) => TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain && e.type !== 'progress').map((e) => e.uuid))
+  const want = new Set(entries.filter(message).map((e) => e.uuid))
   const targetSemantic = semantic(forked, targetId)
-  await journal({ sha: sha(text), events: want.size, semantic: targetSemantic })
+  await journal({ sha: sha(text), events: want.size, semantic: targetSemantic, semanticVersion: SEMANTIC_VERSION })
   const dir = path.dirname(s.transcript)
   const targetTranscript = path.join(dir, `${targetId}.jsonl`)
   await writeNew(targetTranscript, text)
@@ -492,8 +576,29 @@ async function one(s, to, targetId, now, journal) {
   const record = path.join(to.dir, `local_${targetId}.json`)
   const recordText = `${JSON.stringify(clone(current, targetId, title, now), null, 2)}\n`
   await writeNew(record, recordText)
-  if (semantic((await load(s.transcript)).entries, s.id) !== sourceSemantic) throw new Error('source changed during move')
-  return { id: s.id, targetId, title, archived: current.isArchived === true, transcript: s.transcript, sourceSemantic, targetTranscript, targetSha: sha(text), targetSemantic, targetDir: sidecars.sha ? targetDir : null, record, recordSha: sha(recordText), sidecars, events: want.size, replays, forkedFromSessionId: current.forkedFromSessionId ?? null, sourceRecordId: current.sessionId ?? null }
+  const after = await load(s.transcript)
+  if (semantic(after.entries, s.id, after.invalid) !== sourceSemantic) throw new Error('source changed during move')
+  return {
+    id: s.id,
+    targetId,
+    title,
+    archived: current.isArchived === true,
+    transcript: s.transcript,
+    sourceSemantic,
+    sourceSemanticVersion: SEMANTIC_VERSION,
+    targetTranscript,
+    targetSha: sha(text),
+    targetSemantic,
+    targetSemanticVersion: SEMANTIC_VERSION,
+    targetDir: sidecars.sha ? targetDir : null,
+    record,
+    recordSha: sha(recordText),
+    sidecars,
+    events: want.size,
+    replays,
+    forkedFromSessionId: current.forkedFromSessionId ?? null,
+    sourceRecordId: current.sessionId ?? null
+  }
 }
 
 async function link(rows, inv) {
@@ -506,9 +611,7 @@ async function link(rows, inv) {
     if (!target || target === `local_${r.targetId}`) continue
     const record = await readJson(r.record)
     record.forkedFromSessionId = target
-    const text = `${JSON.stringify(record, null, 2)}\n`
-    await writeFile(`${r.record}.tmp`, text, { mode: 0o600 })
-    await rename(`${r.record}.tmp`, r.record)
+    const text = await saveJson(r.record, record)
     r.linkedTo = target
     r.recordSha = sha(text)
   }
@@ -518,34 +621,52 @@ const gained = (c) => [...new Set(c.ids)].some((u) => !c.forked.has(u))
 
 async function changed(file, sessionId, known) {
   if (!(await exists(file))) return false
-  if (known) return semantic((await load(file)).entries, sessionId) !== known
+  if (known?.semantic && known.semanticVersion === SEMANTIC_VERSION) {
+    const data = await load(file)
+    return semantic(data.entries, sessionId, data.invalid) !== known.semantic
+  }
+  if (known?.sha) return sha(await readFile(file)) !== known.sha
   return gained(await scan(file))
 }
 
 async function verify(rows) {
   const bad = { provenance: 0, lineage: 0, sidecars: 0, desktop: 0, sources: 0 }
   const problems = []
-  const flag = (key, r) => { bad[key]++; problems.push({ title: r.title, check: key }) }
+  const flag = (key, r) => { bad[key]++; problems.push({ id: r.targetId, title: r.title, check: key }) }
   for (const r of rows) {
     const target = (await exists(r.targetTranscript)) ? await load(r.targetTranscript) : null
-    if (!target || semantic(target.entries, r.targetId) !== r.targetSemantic) flag('provenance', r)
+    if (!target || semantic(target.entries, r.targetId, target.invalid) !== r.targetSemantic) flag('provenance', r)
     if (r.linkedTo && (await readJson(r.record).catch(() => ({}))).forkedFromSessionId !== r.linkedTo) flag('lineage', r)
     const sourceDir = path.join(path.dirname(r.transcript), r.id)
     if (r.targetDir ? (await digest(r.targetDir)).sha !== r.sidecars.sha || (await digest(sourceDir)).sha !== r.sidecars.sha : await exists(sourceDir)) flag('sidecars', r)
     const raw = await readFile(r.record, 'utf8').catch(() => null)
     if (!raw || sha(raw) !== r.recordSha) flag('desktop', r)
     const source = (await exists(r.transcript)) ? await load(r.transcript) : null
-    if (!source || semantic(source.entries, r.id) !== r.sourceSemantic) flag('sources', r)
+    if (!source || semantic(source.entries, r.id, source.invalid) !== r.sourceSemantic) flag('sources', r)
   }
   const mark = (v) => (v ? `✗ ${v}` : '✓')
-  return { ok: problems.length === 0, problems, lines: [`provenance ${mark(bad.provenance)}`, `lineage ${mark(bad.lineage)}`, `sidecars ${mark(bad.sidecars)}`, `desktop ${mark(bad.desktop)}`, `sources unchanged ${mark(bad.sources)}`] }
+  const lines = [
+    `provenance ${mark(bad.provenance)}`,
+    `lineage ${mark(bad.lineage)}`,
+    `sidecars ${mark(bad.sidecars)}`,
+    `desktop ${mark(bad.desktop)}`,
+    `sources unchanged ${mark(bad.sources)}`
+  ]
+  return { ok: problems.length === 0, problems, lines }
 }
 
 const receipts = async (paths) => (await readdir(paths.state).catch(() => [])).filter((f) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}\.json$/.test(f)).sort()
 
 const saveJson = async (file, value) => {
-  await writeFile(`${file}.tmp`, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-  await rename(`${file}.tmp`, file)
+  const text = `${JSON.stringify(value, null, 2)}\n`
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temp, text, { flag: 'wx', mode: 0o600 })
+    await rename(temp, file)
+    return text
+  } finally {
+    await unlink(temp).catch(() => {})
+  }
 }
 
 async function pending(paths) {
@@ -554,7 +675,7 @@ async function pending(paths) {
   const file = path.join(paths.state, name)
   const receipt = await readJson(file).catch(() => null)
   if (!receipt) return { name, file, corrupt: true }
-  return receipt.pending || receipt.retiring ? { name, file, receipt } : null
+  return receipt.pending || receipt.retiring || receipt.finalizing ? { name, file, receipt } : null
 }
 
 async function park(plan) {
@@ -567,6 +688,14 @@ async function park(plan) {
   }
 }
 
+async function restore(plan) {
+  for (const p of [...plan].reverse()) {
+    for (const [original, parked] of [...p.moved].reverse()) {
+      if ((await exists(parked)) && !(await exists(original))) await rename(parked, original)
+    }
+  }
+}
+
 async function reconcile(paths) {
   const p = await pending(paths)
   if (!p) return null
@@ -575,49 +704,96 @@ async function reconcile(paths) {
     return { title: p.name, error: 'corrupt receipt set aside' }
   }
   const { receipt } = p
+  receipt.failed ??= []
+  receipt.superseded ??= []
   if (receipt.retiring) {
     const plan = receipt.retiring
     await park(plan)
-    receipt.superseded = [...(receipt.superseded ?? []), ...plan]
+    receipt.superseded = [...receipt.superseded, ...plan]
     receipt.retiring = null
+    receipt.finalizing = false
     await saveJson(p.file, receipt)
     return { title: `${plan.length} superseded copies`, error: 'retirement finished' }
   }
-  const { id, title, targetId, made, semantic: known } = receipt.pending
-  const used = await changed(made[0], targetId, known)
-  if (!used) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-  const error = used ? 'interrupted, copy changed since, left in place' : 'interrupted'
-  receipt.failed.push({ id, title, error })
-  receipt.pending = null
+  let recovered = null
+  if (receipt.pending) {
+    const { id, title, targetId, made, semantic: known, semanticVersion, sha: targetSha } = receipt.pending
+    const used = await changed(made[0], targetId, { semantic: known, semanticVersion, sha: targetSha })
+    if (!used) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
+    const error = used ? 'interrupted, copy changed since, left in place' : 'interrupted'
+    receipt.failed.push({ id, title, error })
+    receipt.pending = null
+    recovered = { title, error }
+  }
+  if (receipt.finalizing) {
+    await restore(receipt.superseded)
+    const kept = []
+    let rolledBack = 0
+    for (const row of receipt.sessions ?? []) {
+      const known = { semantic: row.targetSemantic, semanticVersion: row.targetSemanticVersion, sha: row.targetSha }
+      if (await changed(row.targetTranscript, row.targetId, known)) {
+        kept.push(row)
+        receipt.failed.push({ id: row.id, title: row.title, error: 'interrupted finalization, copy changed since, left in place' })
+      } else {
+        const dest = path.join(paths.state, 'quarantine', receipt.at, 'failed')
+        await quarantine([row.targetTranscript, row.targetDir, row.record].filter(Boolean), dest)
+        receipt.failed.push({ id: row.id, title: row.title, error: 'interrupted finalization' })
+        rolledBack++
+      }
+    }
+    receipt.sessions = kept
+    receipt.superseded = []
+    receipt.finalizing = false
+    receipt.verification = {
+      ok: false,
+      problems: kept.map((row) => ({ id: row.targetId, title: row.title, check: 'interrupted finalization' }))
+    }
+    recovered = {
+      title: `${rolledBack} unfinished copies`,
+      error: kept.length ? `${kept.length} changed copies left in place` : 'interrupted finalization rolled back'
+    }
+  }
   await saveJson(p.file, receipt)
-  return { title, error }
+  return recovered
 }
 
 async function created(paths) {
   const ours = new Map()
-  for (const name of await receipts(paths)) for (const r of (await readJson(path.join(paths.state, name)).catch(() => ({}))).sessions ?? []) ours.set(r.targetId, r.targetSemantic ?? null)
+  for (const name of await receipts(paths)) {
+    for (const r of (await readJson(path.join(paths.state, name)).catch(() => ({}))).sessions ?? []) {
+      if (r.targetId && await exists(r.targetTranscript)) {
+        ours.set(r.targetId, { semantic: r.targetSemantic, semanticVersion: r.targetSemanticVersion, sha: r.targetSha })
+      }
+    }
+  }
   return ours
 }
 
 async function retire(inv, ours, receipt, paths, at, problems, save) {
-  const bad = new Set(problems.map((p) => p.title))
+  const bad = new Set(problems.map((p) => p.id))
   const plan = []
   for (const row of receipt.sessions) {
-    if (bad.has(row.title)) continue
+    if (bad.has(row.targetId)) continue
     const s = inv.move.find((m) => m.id === row.id)
+    if (!s) continue
     for (const t of inv.targets) {
-      if (plan.some((p) => p.id === t.session.id) || !ours.has(t.session.id) || !t.transcript || !t.sidecars || !s.sidecars) continue
-      if (!(t.roots.size < s.roots.size && [...t.roots].every((id) => s.roots.has(id)) && [...t.sidecars].every((f) => s.sidecars.has(f)))) continue
+      if (plan.some((p) => p.id === t.session.id) || !ours.has(t.session.id) || !t.transcript || !included(t, s)) continue
       if (await changed(t.transcript, t.session.id, ours.get(t.session.id))) continue
       const dest = path.join(paths.state, 'quarantine', at, 'superseded')
-      plan.push({ id: t.session.id, title: t.session.title, by: row.targetId, moved: [t.transcript, path.join(path.dirname(t.transcript), t.session.id), t.session.file].map((p) => [p, path.join(dest, path.basename(p))]) })
+      const items = [t.transcript, path.join(path.dirname(t.transcript), t.session.id), t.session.file]
+      plan.push({
+        id: t.session.id,
+        title: t.session.title,
+        by: row.targetId,
+        moved: items.map((p) => [p, path.join(dest, path.basename(p))])
+      })
     }
   }
   if (!plan.length) return
   receipt.retiring = plan
   await save()
   await park(plan)
-  receipt.superseded = plan
+  receipt.superseded = [...receipt.superseded, ...plan]
   receipt.retiring = null
   await save()
 }
@@ -627,7 +803,7 @@ async function transfer(inv, to, paths, report) {
   const ours = await created(paths)
   const started = Date.now()
   const at = stamp()
-  const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: [], superseded: [] }
+  const receipt = { version: 2, at, from: inv.from, to: to.label, sessions: [], failed: [], superseded: [], finalizing: true }
   const file = path.join(paths.state, `${at}.json`)
   const save = () => saveJson(file, receipt)
   let events = 0
@@ -637,7 +813,7 @@ async function transfer(inv, to, paths, report) {
     const targetId = randomUUID()
     const dir = path.dirname(s.transcript)
     const made = [path.join(dir, `${targetId}.jsonl`), path.join(dir, targetId), path.join(to.dir, `local_${targetId}.json`)]
-    receipt.pending = { id: s.id, title: s.title, targetId, made, sha: null, events: null, semantic: null }
+    receipt.pending = { id: s.id, title: s.title, targetId, made, sha: null, events: null, semantic: null, semanticVersion: SEMANTIC_VERSION }
     await save()
     try {
       const row = await one(s, to, targetId, started, async (journal) => { Object.assign(receipt.pending, journal); await save() })
@@ -654,14 +830,26 @@ async function transfer(inv, to, paths, report) {
   await link(receipt.sessions, inv)
   await save()
   const done = receipt.sessions.length
-  report('fork', [`${count(done)} ✓`, `${count(events)} events`, replays ? `${count(replays)} replay duplicates collapsed` : null, receipt.failed.length ? `${receipt.failed.length} failed` : null].filter(Boolean).join(' | '))
+  report('fork', [
+    `${count(done)} ✓`,
+    `${count(events)} events`,
+    replays ? `${count(replays)} replay duplicates collapsed` : null,
+    receipt.failed.length ? `${receipt.failed.length} failed` : null
+  ].filter(Boolean).join(' | '))
   report('sidecars', `${count(receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0))} files | sha256 ✓`)
   const { ok, lines, problems } = await verify(receipt.sessions)
   receipt.verification = { ok, problems }
   await save()
   await retire(inv, ours, receipt, paths, at, problems, save)
+  receipt.finalizing = false
+  await save()
   const archived = receipt.sessions.filter((r) => r.archived).length
-  report('desktop', [`${count(done)} records`, `${count(archived)} archived`, `${count(done - archived)} active`, receipt.superseded.length ? `${count(receipt.superseded.length)} superseded` : null].filter(Boolean).join(' | '))
+  report('desktop', [
+    `${count(done)} records`,
+    `${count(archived)} archived`,
+    `${count(done - archived)} active`,
+    receipt.superseded.length ? `${count(receipt.superseded.length)} superseded` : null
+  ].filter(Boolean).join(' | '))
   report('verify', [...lines, `${Math.round((Date.now() - started) / 1000)}s`].join(' | '))
   return { file, receipt, checks: lines, problems, ok: ok && receipt.failed.length === 0 }
 }
@@ -675,9 +863,12 @@ export function undo(paths) {
     if (!name) return { nothing: true }
     const receipt = await readJson(path.join(paths.state, name))
     const kept = []
-    for (const r of receipt.sessions) if (await changed(r.targetTranscript, r.targetId, r.targetSemantic)) kept.push(r.title)
+    for (const r of receipt.sessions) {
+      const known = { semantic: r.targetSemantic, semanticVersion: r.targetSemanticVersion, sha: r.targetSha }
+      if (await changed(r.targetTranscript, r.targetId, known)) kept.push(`${r.title} | ${short(r.targetId)}`)
+    }
     if (kept.length) return { receipt, changed: kept }
-    for (const sup of receipt.superseded ?? []) for (const [original, parked] of sup.moved) if ((await exists(parked)) && !(await exists(original))) await rename(parked, original)
+    await restore(receipt.superseded ?? [])
     const dest = path.join(paths.state, 'quarantine', receipt.at)
     await mkdir(dest, { recursive: true })
     for (const r of receipt.sessions) await quarantine([r.targetTranscript, r.targetDir, r.record].filter(Boolean), dest)
@@ -717,7 +908,14 @@ async function pick(title, rows, multi) {
   const width = Math.max(...rows.map((r) => r.label.length))
   const { stdin: input, stdout: output } = process
   let state = { cursor: 0, chosen: new Set(), size: rows.length, multi }
-  const lines = () => [`${title}  ${hint}`, ...rows.map((r, i) => `  ${i === state.cursor ? '❯' : ' '} ${multi ? (state.chosen.has(i) ? '◉' : '○') : i === state.cursor ? '●' : '○'} ${r.label.padEnd(width)}  ${r.stats}`)]
+  const lines = () => [
+    `${title}  ${hint}`,
+    ...rows.map((r, i) => {
+      const cursor = i === state.cursor ? '❯' : ' '
+      const choice = multi ? (state.chosen.has(i) ? '◉' : '○') : i === state.cursor ? '●' : '○'
+      return `  ${cursor} ${choice} ${r.label.padEnd(width)}  ${r.stats}`
+    })
+  ]
   const erase = `\x1b[${rows.length + 1}A\x1b[J`
   readline.emitKeypressEvents(input)
   input.setRawMode(true)
@@ -754,7 +952,24 @@ function reporter(json) {
   }
 }
 
-const plist = (dict) => `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>${Object.entries(dict).map(([k, v]) => `<key>${k}</key>${v === true ? '<true/>' : Array.isArray(v) ? `<array>${v.map((s) => `<string>${s}</string>`).join('')}</array>` : `<string>${v}</string>`}`).join('')}</dict></plist>\n`
+const xml = (value) => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
+const plist = (dict) => {
+  const entry = ([key, value]) => {
+    const body = value === true
+      ? '<true/>'
+      : Array.isArray(value)
+        ? `<array>${value.map((s) => `<string>${xml(s)}</string>`).join('')}</array>`
+        : `<string>${xml(value)}</string>`
+    return `<key>${xml(key)}</key>${body}`
+  }
+  const body = Object.entries(dict).map(entry).join('')
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    `<plist version="1.0"><dict>${body}</dict></plist>`,
+    ''
+  ].join('\n')
+}
 
 async function menubar(paths, remove) {
   const app = path.join(paths.state, 'Claude Transplant.app')
@@ -780,7 +995,17 @@ async function menubar(paths, remove) {
     await mkdir(path.join(fresh, 'Contents/MacOS'), { recursive: true })
     await mkdir(path.join(fresh, 'Contents/Resources'), { recursive: true })
     const { version } = await readJson(path.join(HERE, 'package.json'))
-    await writeFile(path.join(fresh, 'Contents/Info.plist'), plist({ CFBundleIdentifier: LABEL, CFBundleName: 'Claude Transplant', CFBundleExecutable: 'Claude Transplant', CFBundlePackageType: 'APPL', CFBundleShortVersionString: version, LSMinimumSystemVersion: '13.0', LSUIElement: true, NSHighResolutionCapable: true }))
+    const info = {
+      CFBundleIdentifier: LABEL,
+      CFBundleName: 'Claude Transplant',
+      CFBundleExecutable: 'Claude Transplant',
+      CFBundlePackageType: 'APPL',
+      CFBundleShortVersionString: version,
+      LSMinimumSystemVersion: '13.0',
+      LSUIElement: true,
+      NSHighResolutionCapable: true
+    }
+    await writeFile(path.join(fresh, 'Contents/Info.plist'), plist(info))
     const build = spawnSync('swiftc', ['-O', '-parse-as-library', '-o', path.join(fresh, 'Contents/MacOS/Claude Transplant'), source], { encoding: 'utf8' })
     if (build.error) throw new Error('swiftc not found, run xcode-select --install')
     if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
@@ -815,6 +1040,11 @@ function parse(argv) {
     else throw new Error(`unknown argument ${a}`)
   }
   if ((args.from.length > 0) !== Boolean(args.to)) throw new Error('--from and --to go together')
+  if ((args.help || args.version) && argv.length > 1) throw new Error(`${args.help ? '--help' : '--version'} goes alone`)
+  if (args.cmd === 'accounts' && (args.from.length || args.to || args.dry || args.remove)) throw new Error('accounts accepts only --json')
+  if (args.cmd === 'undo' && (args.from.length || args.to || args.dry || args.remove)) throw new Error('undo accepts only --json')
+  if (args.cmd === 'menubar' && (args.from.length || args.to || args.dry || args.json)) throw new Error('menubar accepts only --remove')
+  if (args.cmd !== 'menubar' && args.remove) throw new Error('--remove requires menubar')
   return args
 }
 
@@ -822,21 +1052,19 @@ async function main(argv) {
   const args = parse(argv)
   if (args.help) return process.stdout.write(HELP)
   if (args.version) return process.stdout.write(`${(await readJson(path.join(HERE, 'package.json'))).version}\n`)
+  if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('Node 22 or newer is required')
   const paths = layout()
   const out = process.stdout
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
-  const all = await accounts(paths)
-  if (args.cmd === 'accounts') {
-    if (args.json) return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, activeAt }) => ({ account, org, email, orgName, label, stats, active, sessions: sessions.length, activeAt })))
-    if (!all.length) return out.write('no accounts found\n')
-    const width = Math.max(...all.map((a) => a.label.length))
-    return out.write(`${all.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
-  }
-  if (args.cmd === 'menubar') return out.write(`${await menubar(paths, args.remove)}\n`)
+  if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove))}\n`)
   if (args.cmd === 'undo') {
     const result = await undo(paths)
     if (result.changed) process.exitCode = 1
-    if (args.json) return emit(result.nothing ? { nothing: true } : result.changed ? { refused: result.changed, at: result.receipt.at } : { undone: result.receipt.at, quarantine: result.dest, sessions: result.receipt.sessions.length, note: NOTE })
+    if (args.json) {
+      if (result.nothing) return emit({ nothing: true })
+      if (result.changed) return emit({ refused: result.changed, at: result.receipt.at })
+      return emit({ undone: result.receipt.at, quarantine: result.dest, sessions: result.receipt.sessions.length, note: NOTE, restart: true })
+    }
     if (result.nothing) return out.write('nothing to undo\n')
     const { receipt } = result
     out.write(`Undo  ${receipt.at} | ${receipt.from.join(' + ')} → ${receipt.to}\n`)
@@ -844,7 +1072,24 @@ async function main(argv) {
       return out.write(`  refused | ${result.changed.length} sessions changed since the move | nothing changed\n${result.changed.map((t) => `    ${t}`).join('\n')}\n`)
     }
     const files = receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0)
-    return out.write(`  ${count(receipt.sessions.length)} transcripts | ${count(files)} sidecar files | ${count(receipt.sessions.length)} desktop records → quarantine\n  sources unchanged ✓\n  quarantine  ${result.dest}\n  then        ${NOTE}\n`)
+    return out.write([
+      `  ${count(receipt.sessions.length)} transcripts | ${count(files)} sidecar files | ${count(receipt.sessions.length)} desktop records → quarantine`,
+      '  sources unchanged ✓',
+      `  quarantine  ${result.dest}`,
+      `  then        ${NOTE}`,
+      ''
+    ].join('\n'))
+  }
+  const all = await accounts(paths)
+  if (args.cmd === 'accounts') {
+    if (args.json) {
+      return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, activeAt }) => ({
+        account, org, email, orgName, label, stats, active, sessions: sessions.length, activeAt
+      })))
+    }
+    if (!all.length) return out.write('no accounts found\n')
+    const width = Math.max(...all.map((a) => a.label.length))
+    return out.write(`${all.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
   }
   if (args.cmd) throw new Error(`unknown command ${args.cmd}`)
   let from
@@ -860,10 +1105,23 @@ async function main(argv) {
   if (from.includes(to)) throw new Error('to must differ from from')
   const report = reporter(args.json)
   if (!args.json) out.write(`From  ${describe(from)}\nTo    ${to.label}\n\n`)
-  const summary = (inv) => report('inventory', [`${count(inv.total)} records`, inv.missing.length ? `${count(inv.missing.length)} without history` : null, inv.twice ? `${count(inv.twice)} older versions skipped` : null, inv.apart ? `${count(inv.apart)} grew apart, all kept` : null, inv.there.length ? `${count(inv.there.length)} already there` : null, `${count(inv.move.length)} to move`].filter(Boolean).join(' | '))
+  const summary = (inv) => report('inventory', [
+    `${count(inv.total)} records`,
+    inv.missing.length ? `${count(inv.missing.length)} without history` : null,
+    inv.twice ? `${count(inv.twice)} older versions skipped` : null,
+    inv.apart ? `${count(inv.apart)} grew apart, all kept` : null,
+    inv.there.length ? `${count(inv.there.length)} already there` : null,
+    `${count(inv.move.length)} to move`
+  ].filter(Boolean).join(' | '))
   if (args.dry) {
     const p = await pending(paths)
-    if (p) report('pending', p.corrupt ? `${p.name} | corrupt receipt, set aside on the next move` : `${p.receipt.pending.title} | interrupted copy, reconciled on the next move`)
+    if (p) {
+      let text = `${p.receipt?.sessions?.length ?? 0} copies | interrupted finalization, reconciled on the next move`
+      if (p.corrupt) text = `${p.name} | corrupt receipt, set aside on the next move`
+      else if (p.receipt.pending) text = `${p.receipt.pending.title} | interrupted copy, reconciled on the next move`
+      else if (p.receipt.retiring) text = `${p.receipt.retiring.length} copies | interrupted retirement, reconciled on the next move`
+      report('pending', text)
+    }
     const inv = await inventory(from, to, paths, new Set(p?.receipt?.pending?.made ?? []))
     summary(inv)
     return args.json ? emit({ done: true, ok: true, dry: true, moved: 0, planned: inv.move.length }) : out.write(inv.move.length ? '  dry run     nothing written\n' : '  nothing to move\n')
@@ -879,8 +1137,10 @@ async function main(argv) {
   const { file, receipt, checks, problems, ok } = result
   if (!ok) process.exitCode = 1
   const note = receipt.sessions.length ? NOTE : null
-  if (args.json) return emit({ done: true, ok, receipt: file, moved: receipt.sessions.length, superseded: receipt.superseded.length, failed: receipt.failed, problems, checks, note })
-  const troubles = [...receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`), ...problems.map((p) => `${p.title} | ${p.check} check failed`)]
+  if (args.json) {
+    return emit({ done: true, ok, receipt: file, moved: receipt.sessions.length, superseded: receipt.superseded.length, failed: receipt.failed, problems, checks, note, restart: Boolean(note) })
+  }
+  const troubles = [...receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`), ...problems.map((p) => `${p.title || short(p.id)} | ${short(p.id)} | ${p.check} check failed`)]
   if (troubles.length) out.write(`  failed      ${troubles.join('\n              ')}\n`)
   out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
 }
