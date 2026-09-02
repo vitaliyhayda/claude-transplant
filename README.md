@@ -52,7 +52,7 @@ The same two choices from the menubar, no terminal. It starts at login, shows pr
 | `--from <match> --to <match>` | skip the picker, repeat `--from`; match on email, org name, or uuid prefix |
 | `--json` | machine-readable output |
 
-Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profile directory, and Desktop's agent-mode records. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, then its session count, last activity, and most common project folder.
+Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profile directory, and Desktop's agent-mode records. Personal-plan organizations show as Personal, and the account Claude Desktop is signed into is marked active. An account with no known email shows a uuid prefix, then its session count, last activity, and most common project folder.
 
 ## How it works
 

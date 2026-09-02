@@ -42,6 +42,8 @@ export function layout(home = os.homedir()) {
     home,
     records: path.join(support, 'Claude/claude-code-sessions'),
     agentSessions: path.join(support, 'Claude/local-agent-mode-sessions'),
+    desktop: path.join(support, 'Claude/config.json'),
+    usage: path.join(support, 'Claude/plan-usage-history.json'),
     pool: path.join(home, '.claude/projects'),
     login: path.join(home, '.claude.json'),
     backups: path.join(home, '.claude/backups'),
@@ -143,23 +145,34 @@ function mode(values) {
   return [...tally].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '—'
 }
 
+async function current(paths) {
+  const desktop = await readJson(paths.desktop).catch(() => ({}))
+  const samples = (await readJson(paths.usage).catch(() => ({}))).samples ?? []
+  const latest = samples.reduce((best, s) => (s?.t > (best?.t ?? -1) ? s : best), null)
+  return { account: desktop.lastKnownAccountUuid ?? null, org: latest?.org ?? null }
+}
+
 export async function accounts(paths) {
   const { emails, orgs } = await logins(paths)
+  const cur = await current(paths)
   const out = []
   for (const { account, org, dir, files } of await records(paths.records)) {
     const sessions = []
     for (const file of files) {
       const r = await readJson(file).catch(() => null)
       if (!r) continue
-      sessions.push({ file, id: UUID.test(r.cliSessionId ?? '') ? r.cliSessionId : null, cwd: r.cwd ?? '', title: r.title ?? '', archived: r.isArchived === true, createdAt: r.createdAt ?? 0, activeAt: r.lastActivityAt ?? 0, record: r })
+      sessions.push({ file, id: UUID.test(r.cliSessionId ?? '') ? r.cliSessionId : null, cwd: r.cwd ?? '', title: r.title ?? '', archived: r.isArchived === true, createdAt: r.createdAt ?? 0, activeAt: r.lastActivityAt ?? 0, focusedAt: r.lastFocusedAt ?? 0, record: r })
     }
     const activeAt = Math.max(0, ...sessions.map((s) => s.activeAt))
     const email = emails.get(account) ?? null
     const orgName = orgs.get(org) ?? null
     const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
     const stats = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | —'
-    out.push({ account, org, dir, email, orgName, sessions, activeAt, label, stats })
+    out.push({ account, org, dir, email, orgName, sessions, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false })
   }
+  const mine = out.filter((a) => a.account === cur.account)
+  const chosen = mine.find((a) => a.org === cur.org) ?? mine.toSorted((a, b) => b.focusedAt - a.focusedAt)[0]
+  if (chosen) Object.assign(chosen, { active: true, stats: `${chosen.stats} | active` })
   return out.sort((a, b) => b.activeAt - a.activeAt)
 }
 
@@ -615,7 +628,7 @@ async function main(argv) {
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
-    if (args.json) return emit(all.map(({ account, org, email, orgName, label, stats, sessions, activeAt }) => ({ account, org, email, orgName, label, stats, sessions: sessions.length, activeAt })))
+    if (args.json) return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, activeAt }) => ({ account, org, email, orgName, label, stats, active, sessions: sessions.length, activeAt })))
     const width = Math.max(...all.map((a) => a.label.length))
     return out.write(`${all.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
   }

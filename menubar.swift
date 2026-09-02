@@ -6,9 +6,10 @@ struct Account: Decodable, Identifiable {
     let org: String
     let label: String
     let stats: String
+    let active: Bool?
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
-    var detail: String { stats.replacingOccurrences(of: " | ", with: "  ·  ") }
+    var detail: String { stats.replacingOccurrences(of: " | active", with: "").replacingOccurrences(of: " | ", with: "  ·  ") }
 }
 
 struct Config: Decodable {
@@ -194,6 +195,14 @@ struct Row: View {
                 Image(systemName: on ? (radio ? "largecircle.fill.circle" : "checkmark.circle.fill") : "circle")
                     .foregroundStyle(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
                 Text(account.label).lineLimit(1).truncationMode(.tail)
+                if account.active == true {
+                    Text("active")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.green)
+                }
                 Spacer(minLength: 12)
                 Text(account.detail).font(.system(.caption, design: .rounded)).monospacedDigit().foregroundStyle(.secondary).fixedSize()
             }
@@ -288,36 +297,128 @@ struct Panel: View {
     }
 }
 
+struct MenuBar: View {
+    let open: Bool
+    let symbol: String
+    let badge: String
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "apple.logo").padding(.leading, 18).padding(.trailing, 18)
+            Text("Finder").fontWeight(.bold).padding(.trailing, 18)
+            ForEach(["File", "Edit", "View", "Go", "Window", "Help"], id: \.self) { Text($0).padding(.trailing, 18) }
+            Spacer()
+            HStack(spacing: 4) {
+                Image(systemName: symbol).font(.system(size: 12, weight: .medium))
+                if !badge.isEmpty { Text(badge).font(.system(size: 12)).monospacedDigit() }
+            }
+            .padding(.horizontal, 7)
+            .frame(height: 20)
+            .background(open ? Color.white.opacity(0.22) : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+            Image(systemName: "wifi").frame(width: 28)
+            Image(systemName: "battery.100").frame(width: 28)
+            Text("Tue 9:41 AM").frame(width: 92, alignment: .trailing).padding(.trailing, 12)
+        }
+        .font(.system(size: 13))
+        .foregroundStyle(.white)
+        .frame(height: 24)
+        .background(Color.black.opacity(0.32))
+    }
+}
+
+struct Cursor: View {
+    static func arrow() -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: 0, y: 0))
+        path.addLine(to: CGPoint(x: 0, y: 17))
+        path.addLine(to: CGPoint(x: 4.5, y: 13))
+        path.addLine(to: CGPoint(x: 8, y: 20))
+        path.addLine(to: CGPoint(x: 10.5, y: 19))
+        path.addLine(to: CGPoint(x: 7, y: 12))
+        path.addLine(to: CGPoint(x: 12.5, y: 12))
+        path.closeSubpath()
+        return path
+    }
+
+    var body: some View {
+        Cursor.arrow().fill(.black)
+            .overlay(Cursor.arrow().stroke(.white, lineWidth: 1.2))
+            .frame(width: 14, height: 21)
+    }
+}
+
+struct Screen: View {
+    @ObservedObject var model: Model
+    let open: Bool
+    let cursor: CGPoint
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            LinearGradient(colors: [Color(red: 0.13, green: 0.17, blue: 0.38), Color(red: 0.42, green: 0.16, blue: 0.36), Color(red: 0.86, green: 0.42, blue: 0.30)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            VStack(alignment: .trailing, spacing: 6) {
+                MenuBar(open: open, symbol: model.symbol, badge: model.badge)
+                if open {
+                    Panel().environmentObject(model)
+                        .background(Color(white: 0.11))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .shadow(color: .black.opacity(0.5), radius: 26, y: 14)
+                        .padding(.trailing, 8)
+                }
+            }
+            Cursor().offset(x: cursor.x, y: cursor.y)
+        }
+        .frame(width: 760, height: 500, alignment: .topLeading)
+        .environment(\.colorScheme, .dark)
+    }
+}
+
 enum Demo {
     static let accounts = [
-        Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "86 | 2h ago | api"),
-        Account(account: "john", org: "team", label: "john@example.com · Team", stats: "212 | 10m ago | api"),
-        Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "35 | 3d ago | notes"),
-        Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "12 | 1d ago | notes")
+        Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "86 | 2h ago | api", active: false),
+        Account(account: "john", org: "team", label: "john@example.com · Team", stats: "212 | 3d ago | api", active: false),
+        Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "35 | 5d ago | notes", active: false),
+        Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "12 | 4m ago | notes", active: true)
     ]
 
     @MainActor
     static func play(_ model: Model, into dir: URL) {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var durations: [Int] = []
+        var cursor = CGPoint(x: 430, y: 340)
+        var open = false
         func snap(_ ms: Int) {
-            let renderer = ImageRenderer(content: Panel().environmentObject(model).background(Color(white: 0.11)).environment(\.colorScheme, .dark))
+            let renderer = ImageRenderer(content: Screen(model: model, open: open, cursor: cursor))
             renderer.scale = 2
             guard let tiff = renderer.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
             try? png.write(to: dir.appendingPathComponent(String(format: "frame-%03d.png", durations.count)))
             durations.append(ms)
         }
-        snap(900)
-        for (index, account) in accounts.prefix(3).enumerated() {
-            model.toggle(account.id)
-            snap(index == 2 ? 1100 : 700)
+        func glide(to target: CGPoint, frames: Int) {
+            let start = cursor
+            for step in 1...frames {
+                let t = Double(step) / Double(frames)
+                let eased = t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
+                cursor = CGPoint(x: start.x + (target.x - start.x) * eased, y: start.y + (target.y - start.y) * eased)
+                snap(step == frames ? 180 : 40)
+            }
         }
+        snap(700)
+        glide(to: CGPoint(x: 586, y: 12), frames: 9)
+        open = true
+        snap(900)
+        for (index, y) in [108.0, 130.0, 152.0].enumerated() {
+            glide(to: CGPoint(x: 292, y: y), frames: 7)
+            model.toggle(accounts[index].id)
+            snap(index == 2 ? 1000 : 450)
+        }
+        glide(to: CGPoint(x: 282, y: 238), frames: 8)
         model.begin()
         model.lines = [("inventory", "333 records | 4 without history | 21 same lineage twice | 3 already there | 305 to move")]
-        snap(500)
+        snap(250)
+        glide(to: CGPoint(x: 150, y: 420), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
             model.badge = "\(done)/305"
-            snap(110)
+            snap(100)
         }
         model.badge = "305/305"
         snap(150)
@@ -333,7 +434,7 @@ enum Demo {
         model.running = false
         model.symbol = "checkmark"
         model.note = "restart Claude Code to see them"
-        snap(2600)
+        snap(2800)
         try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))
         exit(0)
     }

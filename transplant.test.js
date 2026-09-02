@@ -88,6 +88,8 @@ async function home() {
   await writeFile(path.join(root, '.claude-x', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: acct.Z, organizationUuid: org.Z, emailAddress: 'z@example.com', organizationName: 'Zed Person', organizationType: 'claude_max' } }))
   await mkdir(project, { recursive: true })
   await mkdir(paths.backups, { recursive: true })
+  await writeFile(paths.desktop, JSON.stringify({ lastKnownAccountUuid: acct.P }))
+  await writeFile(paths.usage, JSON.stringify({ samples: [{ org: org.T, t: 1 }, { org: org.P, t: 2 }] }))
   await writeFile(paths.login, JSON.stringify({ oauthAccount: { accountUuid: acct.P, organizationUuid: org.P, emailAddress: 'p@example.com', organizationName: 'Personal P' } }))
   await writeFile(path.join(paths.backups, '.claude.json.backup.1'), JSON.stringify({ oauthAccount: { accountUuid: acct.T, organizationUuid: org.T, emailAddress: 't@example.com', organizationName: 'Team T' } }))
   const record = (a, sid, extra = {}) => writeFile(path.join(dir(a), `local_${sid}.json`), JSON.stringify({ sessionId: `local_${sid}`, cliSessionId: sid, cwd: '/tmp/fixture', originCwd: '/tmp/fixture', createdAt: 1, lastActivityAt: 2, lastFocusedAt: 2, model: 'x', isArchived: false, title: `Session ${sid.slice(-3)}`, titleSource: 'user', permissionMode: 'auto', bridgeSessionIds: ['b'], spawnSeed: { a: 1 }, ...extra }, null, 2))
@@ -127,6 +129,9 @@ test('move, rerun, undo across accounts', async () => {
   assert.equal(by[h.acct.Z].label, 'z@example.com · Personal')
   assert.equal(by[h.acct.Q].label, `${h.acct.Q.slice(0, 8)} · ${h.org.Q.slice(0, 8)}`)
   assert.equal(by[h.acct.Q].stats, '0 | —')
+  assert.equal(by[h.acct.P].active, true)
+  assert.match(by[h.acct.P].stats, / \| active$/)
+  assert.equal(by[h.acct.T].active, false)
   assert.match(by[h.acct.Z].stats, /^1 \| .* \| fixture$/)
 
   const inv = await inventory(from, to, h.paths)
