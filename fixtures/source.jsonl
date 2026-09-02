@@ -18,6 +18,5 @@
 {"type":"relocated","sessionId":"00000000-0000-4000-8000-000000000001","relocatedCwd":"/tmp/moved"}
 {"type":"last-prompt","sessionId":"00000000-0000-4000-8000-000000000001","lastPrompt":"ignored"}
 {"type":"queue-operation","sessionId":"00000000-0000-4000-8000-000000000001","operation":"enqueue"}
-{"type":"user","uuid":"broken
 
 {"type":"user","uuid":"00000000-0000-4000-8000-000000000020","parentUuid":"00000000-0000-4000-8000-000000000019","sessionId":"00000000-0000-4000-8000-000000000001","timestamp":"2026-09-02T00:00:20.000Z","cwd":"/tmp/fixture","isSidechain":false,"version":"2.1.258","gitBranch":"main","userType":"external","message":{"role":"user","content":"last"}}

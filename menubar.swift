@@ -27,6 +27,7 @@ struct Event: Decodable {
     let text: String?
     let live: Bool?
     let done: Bool?
+    let ok: Bool?
     let moved: Int?
     let failed: [Failure]?
     let note: String?
@@ -122,11 +123,13 @@ final class Model: ObservableObject {
             }
         } else if event.done == true {
             let moved = event.moved ?? 0
-            if let failed = event.failed, !failed.isEmpty {
+            let failed = event.failed ?? []
+            if !failed.isEmpty {
                 lines.append(("failed", failed.map { ($0.title ?? "?") + " | " + $0.error }.joined(separator: "\n")))
             }
-            note = event.note ?? (moved == 0 ? "Nothing to move" : "")
-            notify(moved == 0 ? "Nothing to move" : "\(moved) sessions moved", event.note ?? "")
+            let summary = moved == 0 ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed") : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")
+            note = event.note ?? summary
+            notify(summary, event.note ?? "")
         } else if event.undone != nil {
             note = event.note ?? ""
             notify("\(event.sessions ?? 0) sessions undone", note)
@@ -154,10 +157,24 @@ final class Model: ObservableObject {
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 
+    private func node(_ configured: String) -> String {
+        if FileManager.default.isExecutableFile(atPath: configured) { return configured }
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        probe.arguments = ["-lc", "command -v node"]
+        let pipe = Pipe()
+        probe.standardOutput = pipe
+        probe.standardError = FileHandle.nullDevice
+        try? probe.run()
+        probe.waitUntilExit()
+        let found = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return found.isEmpty ? configured : found
+    }
+
     private func run(_ args: [String], line: @escaping (String) -> Void, done: @escaping (Int32) -> Void) {
         guard let config else { done(1); return }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: config.node)
+        process.executableURL = URL(fileURLWithPath: node(config.node))
         process.arguments = [config.script] + args
         let pipe = Pipe()
         process.standardOutput = pipe

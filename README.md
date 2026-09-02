@@ -10,13 +10,13 @@ Claude Desktop keeps Claude Code sessions inside the account that created them. 
 
 ## Menubar or CLI
 
-Same engine, two doors.
+Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Without npm, `npx github:vitaliyhayda/claude-transplant` runs the same thing straight from this repository.
 
 ```
 npx claude-transplant menubar
 ```
 
-The menubar app asks the same two questions and nothing else. It starts at login, shows progress in the icon, posts a notification when done, and marks the account Claude Desktop is signed into as active. When one account is left unpicked it becomes the destination on its own. It is a single Swift file, compiled once with the Xcode command line tools, that runs the CLI and reads its JSON. `menubar --remove` takes it out.
+The menubar app asks the same two questions and nothing else. It starts at login, shows progress in the icon, posts a notification when done, and marks the account Claude Desktop is signed into as active. When one account is left unpicked it becomes the destination on its own. It is a single Swift file, compiled once, that keeps its own copy of the CLI inside the app bundle and reads its JSON, so after upgrading the package run the menubar command again. `menubar --remove` takes it out. The animation above is rendered by the app itself: `Claude Transplant --demo <dir>` writes the frames and their durations.
 
 ```
 npx claude-transplant
@@ -48,11 +48,12 @@ To    ↑↓ move · enter confirm
 |---|---|
 | `claude-transplant` | pick From and To, move, print a receipt |
 | `claude-transplant --dry-run` | plan only, write nothing |
-| `claude-transplant undo` | quarantine the last move, refused if a moved session gained messages |
+| `claude-transplant undo` | quarantine the last move, refused if a moved session changed since |
 | `claude-transplant accounts` | list accounts |
 | `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
 | `--json` | machine-readable output, one event per line |
+| `--version` | print the version |
 
 The inventory line, decoded:
 
@@ -64,13 +65,13 @@ Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profil
 
 ## How it works
 
-A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes, and that the sources did not change underneath it. A receipt records every path and hash, and that receipt is what `undo` reads.
+A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes, and that the sources did not change underneath it. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. Run again once the session is quiet. A receipt records every path and hash, and that receipt is what `undo` reads.
 
 ## Why it is built this way
 
 - Reconstruction, not reassignment. No supported operation changes a session's owner, so new ids with per-message provenance are the honest equivalent.
 - The source is the rollback. Nothing in a source account is renamed, archived, or rewritten. A bad copy is disposable, a changed source would destroy the only trustworthy baseline.
-- No confirmation prompt. Safety lives in properties, not dialogs: runs are idempotent, copies get fresh ids, and undo refuses only when a copy has gained messages.
+- No confirmation prompt. Safety lives in properties, not dialogs: runs are idempotent, copies get fresh ids, and undo refuses only when a copy changed after the move.
 - Lineage over bookkeeping. "Already there" follows `forkedFrom` pointers to the root, so copies made through earlier hops, or by other tools, are recognized without a shared database.
 - The official fork, ported. The TypeScript Agent SDK's `forkSession` is the reference implementation. Both official SDKs bundle the entire CLI for what is one screen of logic, so the routine is ported, pinned by a golden fixture, and checked in CI against the real SDK on every push.
 - One file, no dependencies. Plain JavaScript on Node 22, no build step, nothing to audit but a file you can read in one sitting. The menubar is one Swift file for the same reason.
@@ -98,6 +99,7 @@ Each of these was tried. Each looked like it worked until the layer below was ch
 | Pass repeated message UUIDs through | Every occurrence is written again | Sync replays collapsed, conflicts refused |
 | Edit `cwd` on a record | Relabels metadata without moving history | Records keep their folder, transcripts keep their project |
 | Undo by deleting | New messages in the copy would vanish | Undo refuses when a copy changed, otherwise quarantines |
+| Skip lines that fail to parse | The copy looks complete and is not | Sessions with unparseable lines are refused and named |
 
 ## Boundaries
 

@@ -8,6 +8,7 @@ import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
+const HERE = path.dirname(fileURLToPath(import.meta.url))
 const TYPES = new Set(['user', 'assistant', 'attachment', 'system', 'progress'])
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SEPARATORS = new RegExp(`[${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g')
@@ -23,6 +24,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts, sou
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
   --json                        machine-readable output
+  --version
 `
 
 const sha = (data) => createHash('sha256').update(data).digest('hex')
@@ -32,7 +34,7 @@ const short = (id) => id.slice(0, 8)
 const count = (v) => v.toLocaleString('en-US')
 const exists = (p) => stat(p).then(() => true, () => false)
 const readJson = async (p) => JSON.parse(await readFile(p, 'utf8'))
-const stamp = () => new Date().toISOString().slice(0, 19).replace(/:/g, '-')
+const stamp = () => new Date().toISOString().slice(0, 23).replace(/[:.]/g, '-')
 const jsonl = (entries) => entries.map((e) => JSON.stringify(e).replace(SEPARATORS, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)).join('\n') + '\n'
 const same = (a, b) => a.size === b.size && [...a].every((v) => b.has(v))
 
@@ -63,6 +65,7 @@ async function tree(root) {
       const p = path.join(dir, e.name)
       if (e.isDirectory()) await walk(p)
       else if (e.isFile()) out.push(p)
+      else throw new Error(`unsupported entry ${p}`)
     }
   }
   if (await exists(root)) await walk(root)
@@ -96,6 +99,18 @@ async function quarantine(items, dest) {
     if (!(await exists(p))) continue
     await mkdir(dest, { recursive: true })
     await rename(p, path.join(dest, path.basename(p)))
+  }
+}
+
+async function locked(paths, work) {
+  await mkdir(paths.state, { recursive: true })
+  const lockFile = path.join(paths.state, 'lock')
+  const lock = await open(lockFile, 'wx').catch(() => { throw new Error('another run holds the lock') })
+  try {
+    return await work()
+  } finally {
+    await lock.close()
+    await unlink(lockFile).catch(() => {})
   }
 }
 
@@ -207,15 +222,16 @@ export async function scan(file) {
 async function load(file) {
   const raw = await readFile(file, 'utf8')
   const entries = []
+  let invalid = 0
   for (const line of raw.split('\n')) {
     const text = line.trim()
     if (!text) continue
     try {
       const e = JSON.parse(text)
       if (e && typeof e === 'object' && !Array.isArray(e)) entries.push(e)
-    } catch {}
+    } catch { invalid++ }
   }
-  return { sha: sha(raw), entries }
+  return { sha: sha(raw), entries, invalid }
 }
 
 const canonical = (e) => {
@@ -344,8 +360,9 @@ async function roots(id, ctx) {
   for (const uuid of own?.ids ?? []) {
     let cursor = uuid
     let session = own
-    let hops = 0
-    while (session && hops++ < 16) {
+    const seen = new Set()
+    while (session && !seen.has(cursor)) {
+      seen.add(cursor)
       const from = session.forked.get(cursor)
       if (!from) break
       cursor = from.messageUuid
@@ -379,16 +396,22 @@ export async function inventory(from, to, paths) {
   for (const s of to.sessions) {
     if (!s.id) continue
     const r = await roots(s.id, ctx)
-    if (r.size) targets.push(r)
+    if (r.size) targets.push({ record: s.record.sessionId, roots: r })
   }
+  const covering = (rootSet) => (rootSet.size ? targets.find((t) => [...rootSet].every((id) => t.roots.has(id)))?.record ?? null : null)
   const there = []
   const move = []
-  for (const s of reps) (targets.some((t) => [...s.roots].every((id) => t.has(id))) ? there : move).push(s)
-  return { total, missing, twice: found.length - reps.length, there, move, from: from.map((a) => a.label) }
+  for (const s of reps) (covering(s.roots) ? there : move).push(s)
+  const parent = async (recordId) => {
+    const s = from.flatMap((a) => a.sessions).find((x) => x.record.sessionId === recordId)
+    return s?.id ? covering(await roots(s.id, ctx)) : null
+  }
+  return { total, missing, twice: found.length - reps.length, there, move, parent, from: from.map((a) => a.label) }
 }
 
 async function one(s, to, made, now) {
   const source = await load(s.transcript)
+  if (source.invalid) throw new Error(`${source.invalid} unparseable lines`)
   const { entries, replays, conflicts } = normalize(source.entries)
   if (conflicts) throw new Error(`${conflicts} conflicting duplicate uuids`)
   const targetId = randomUUID()
@@ -417,15 +440,18 @@ async function one(s, to, made, now) {
   return { id: s.id, targetId, title, archived: s.archived, transcript: s.transcript, sourceSha: source.sha, targetTranscript, targetSha: sha(text), targetDir: sidecars.sha ? targetDir : null, record, sidecars, events: want.size, replays, forkedFromSessionId: s.record.forkedFromSessionId ?? null, sourceRecordId: s.record.sessionId ?? null }
 }
 
-async function link(rows) {
+async function link(rows, inv) {
   const byRecord = new Map(rows.map((r) => [r.sourceRecordId, r]))
   for (const r of rows) {
-    const parent = r.forkedFromSessionId && byRecord.get(r.forkedFromSessionId)
-    if (!parent) continue
+    if (!r.forkedFromSessionId) continue
+    const inBatch = byRecord.get(r.forkedFromSessionId)
+    const target = inBatch ? `local_${inBatch.targetId}` : await inv.parent(r.forkedFromSessionId)
+    if (!target) continue
     const record = await readJson(r.record)
-    record.forkedFromSessionId = `local_${parent.targetId}`
-    await writeFile(r.record, `${JSON.stringify(record, null, 2)}\n`)
-    r.linkedTo = parent.targetId
+    record.forkedFromSessionId = target
+    await writeFile(`${r.record}.tmp`, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 })
+    await rename(`${r.record}.tmp`, r.record)
+    r.linkedTo = target
   }
 }
 
@@ -433,24 +459,21 @@ async function verify(rows) {
   const bad = { provenance: 0, lineage: 0, sidecars: 0, sources: 0 }
   for (const r of rows) {
     if (!(await exists(r.targetTranscript)) || sha(await readFile(r.targetTranscript)) !== r.targetSha) bad.provenance++
-    if (r.linkedTo && (await readJson(r.record).catch(() => ({}))).forkedFromSessionId !== `local_${r.linkedTo}`) bad.lineage++
+    if (r.linkedTo && (await readJson(r.record).catch(() => ({}))).forkedFromSessionId !== r.linkedTo) bad.lineage++
     if (r.targetDir && (await digest(r.targetDir)).sha !== r.sidecars.sha) bad.sidecars++
     if (!(await exists(r.transcript)) || sha(await readFile(r.transcript)) !== r.sourceSha) bad.sources++
   }
   const mark = (v) => (v ? `✗ ${v}` : '✓')
-  return [`provenance ${mark(bad.provenance)}`, `lineage ${mark(bad.lineage)}`, `sidecars ${mark(bad.sidecars)}`, `sources unchanged ${mark(bad.sources)}`]
+  return { ok: Object.values(bad).every((v) => v === 0), lines: [`provenance ${mark(bad.provenance)}`, `lineage ${mark(bad.lineage)}`, `sidecars ${mark(bad.sidecars)}`, `sources unchanged ${mark(bad.sources)}`] }
 }
 
-export async function move(inv, to, paths, report = () => {}) {
-  await mkdir(paths.state, { recursive: true })
-  const lockFile = path.join(paths.state, 'lock')
-  const lock = await open(lockFile, 'wx').catch(() => { throw new Error('another run holds the lock') })
-  const started = Date.now()
-  const at = stamp()
-  const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: [] }
-  const file = path.join(paths.state, `${at}.json`)
-  const save = () => writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
-  try {
+export function move(inv, to, paths, report = () => {}) {
+  return locked(paths, async () => {
+    const started = Date.now()
+    const at = stamp()
+    const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: [] }
+    const file = path.join(paths.state, `${at}.json`)
+    const save = () => writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
     let events = 0
     let replays = 0
     for (const [i, s] of inv.move.entries()) {
@@ -467,35 +490,34 @@ export async function move(inv, to, paths, report = () => {}) {
       }
       await save()
     }
-    await link(receipt.sessions)
+    await link(receipt.sessions, inv)
     await save()
     const done = receipt.sessions.length
     report('fork', [`${count(done)} ✓`, `${count(events)} events`, replays ? `${count(replays)} replay duplicates collapsed` : null, receipt.failed.length ? `${receipt.failed.length} failed` : null].filter(Boolean).join(' | '))
     report('sidecars', `${count(receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0))} files | sha256 ✓`)
     const archived = receipt.sessions.filter((r) => r.archived).length
     report('desktop', `${count(done)} records | ${count(archived)} archived | ${count(done - archived)} active`)
-    const checks = await verify(receipt.sessions)
-    report('verify', [...checks, `${Math.round((Date.now() - started) / 1000)}s`].join(' | '))
-    return { file, receipt, checks }
-  } finally {
-    await lock.close()
-    await unlink(lockFile).catch(() => {})
-  }
+    const { ok, lines } = await verify(receipt.sessions)
+    report('verify', [...lines, `${Math.round((Date.now() - started) / 1000)}s`].join(' | '))
+    return { file, receipt, checks: lines, ok: ok && receipt.failed.length === 0 }
+  })
 }
 
-export async function undo(paths) {
-  const names = (await readdir(paths.state).catch(() => [])).filter((f) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.json$/.test(f)).sort()
-  const name = names.at(-1)
-  if (!name) return { nothing: true }
-  const receipt = await readJson(path.join(paths.state, name))
-  const changed = []
-  for (const r of receipt.sessions) if ((await exists(r.targetTranscript)) && sha(await readFile(r.targetTranscript)) !== r.targetSha) changed.push(r.title)
-  if (changed.length) return { receipt, changed }
-  const dest = path.join(paths.state, 'quarantine', receipt.at)
-  await mkdir(dest, { recursive: true })
-  for (const r of receipt.sessions) await quarantine([r.targetTranscript, r.targetDir, r.record].filter(Boolean), dest)
-  await rename(path.join(paths.state, name), path.join(dest, 'receipt.json'))
-  return { receipt, dest }
+export function undo(paths) {
+  return locked(paths, async () => {
+    const names = (await readdir(paths.state)).filter((f) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}\.json$/.test(f)).sort()
+    const name = names.at(-1)
+    if (!name) return { nothing: true }
+    const receipt = await readJson(path.join(paths.state, name))
+    const changed = []
+    for (const r of receipt.sessions) if ((await exists(r.targetTranscript)) && sha(await readFile(r.targetTranscript)) !== r.targetSha) changed.push(r.title)
+    if (changed.length) return { receipt, changed }
+    const dest = path.join(paths.state, 'quarantine', receipt.at)
+    await mkdir(dest, { recursive: true })
+    for (const r of receipt.sessions) await quarantine([r.targetTranscript, r.targetDir, r.record].filter(Boolean), dest)
+    await rename(path.join(paths.state, name), path.join(dest, 'receipt.json'))
+    return { receipt, dest }
+  })
 }
 
 function describe(list) {
@@ -573,29 +595,37 @@ async function menubar(paths, remove) {
   const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
   const agent = path.join(paths.home, 'Library/LaunchAgents', `${LABEL}.plist`)
   const domain = `gui/${process.getuid()}`
-  spawnSync('launchctl', ['bootout', `${domain}/${LABEL}`])
-  spawnSync('pkill', ['-x', 'Claude Transplant'])
+  const stop = () => {
+    spawnSync('launchctl', ['bootout', `${domain}/${LABEL}`])
+    spawnSync('pkill', ['-x', 'Claude Transplant'])
+  }
   if (remove) {
+    stop()
     await rm(app, { recursive: true, force: true })
     await rm(agent, { force: true })
     return 'menubar removed'
   }
-  const here = path.dirname(fileURLToPath(import.meta.url))
-  const source = path.join(here, 'menubar.swift')
-  const swift = await readFile(source, 'utf8')
-  const built = path.join(app, 'Contents/Resources/source.sha256')
-  if ((await readFile(built, 'utf8').catch(() => '')) !== sha(swift)) {
-    await rm(app, { recursive: true, force: true })
-    await mkdir(path.dirname(binary), { recursive: true })
-    await mkdir(path.dirname(built), { recursive: true })
-    const { version } = await readJson(path.join(here, 'package.json'))
-    await writeFile(path.join(app, 'Contents/Info.plist'), plist({ CFBundleIdentifier: LABEL, CFBundleName: 'Claude Transplant', CFBundleExecutable: 'Claude Transplant', CFBundlePackageType: 'APPL', CFBundleShortVersionString: version, LSMinimumSystemVersion: '13.0', LSUIElement: true, NSHighResolutionCapable: true }))
-    const build = spawnSync('swiftc', ['-O', '-parse-as-library', '-o', binary, source], { encoding: 'utf8' })
+  const source = path.join(HERE, 'menubar.swift')
+  const key = sha((await readFile(source, 'utf8')) + (await readJson(path.join(HERE, 'package.json'))).version)
+  const built = path.join(app, 'Contents/Resources/build.sha256')
+  if ((await readFile(built, 'utf8').catch(() => '')) !== key) {
+    const fresh = `${app}.building`
+    await rm(fresh, { recursive: true, force: true })
+    await mkdir(path.join(fresh, 'Contents/MacOS'), { recursive: true })
+    await mkdir(path.join(fresh, 'Contents/Resources'), { recursive: true })
+    const { version } = await readJson(path.join(HERE, 'package.json'))
+    await writeFile(path.join(fresh, 'Contents/Info.plist'), plist({ CFBundleIdentifier: LABEL, CFBundleName: 'Claude Transplant', CFBundleExecutable: 'Claude Transplant', CFBundlePackageType: 'APPL', CFBundleShortVersionString: version, LSMinimumSystemVersion: '13.0', LSUIElement: true, NSHighResolutionCapable: true }))
+    const build = spawnSync('swiftc', ['-O', '-parse-as-library', '-o', path.join(fresh, 'Contents/MacOS/Claude Transplant'), source], { encoding: 'utf8' })
     if (build.error) throw new Error('swiftc not found, run xcode-select --install')
     if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
-    await writeFile(built, sha(swift))
-  }
-  await writeFile(path.join(paths.state, 'menubar.json'), `${JSON.stringify({ node: process.execPath, script: fileURLToPath(import.meta.url) })}\n`)
+    await writeFile(path.join(fresh, 'Contents/Resources/build.sha256'), key)
+    stop()
+    await rm(app, { recursive: true, force: true })
+    await rename(fresh, app)
+  } else stop()
+  const script = path.join(app, 'Contents/Resources/transplant.js')
+  await copyFile(path.join(HERE, 'transplant.js'), script)
+  await writeFile(path.join(paths.state, 'menubar.json'), `${JSON.stringify({ node: process.execPath, script })}\n`)
   await mkdir(path.dirname(agent), { recursive: true })
   await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary], RunAtLoad: true }))
   const load = spawnSync('launchctl', ['bootstrap', domain, agent], { encoding: 'utf8' })
@@ -604,14 +634,16 @@ async function menubar(paths, remove) {
 }
 
 function parse(argv) {
-  const args = { from: [], to: null, cmd: null, dry: false, json: false, help: false }
+  const args = { from: [], to: null, cmd: null, dry: false, json: false, help: false, version: false, remove: false }
+  const value = (i) => { if (argv[i] === undefined || argv[i].startsWith('-')) throw new Error(`${argv[i - 1]} needs a value`); return argv[i] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a === '--from') args.from.push(argv[++i])
-    else if (a === '--to') args.to = argv[++i]
+    if (a === '--from') args.from.push(value(++i))
+    else if (a === '--to') args.to = value(++i)
     else if (a === '--dry-run') args.dry = true
     else if (a === '--json') args.json = true
     else if (a === '--remove') args.remove = true
+    else if (a === '--version' || a === '-v') args.version = true
     else if (a === '--help' || a === '-h') args.help = true
     else if (!a.startsWith('-') && !args.cmd) args.cmd = a
     else throw new Error(`unknown argument ${a}`)
@@ -623,12 +655,14 @@ function parse(argv) {
 async function main(argv) {
   const args = parse(argv)
   if (args.help) return process.stdout.write(HELP)
+  if (args.version) return process.stdout.write(`${(await readJson(path.join(HERE, 'package.json'))).version}\n`)
   const paths = layout()
   const out = process.stdout
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
     if (args.json) return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, activeAt }) => ({ account, org, email, orgName, label, stats, active, sessions: sessions.length, activeAt })))
+    if (!all.length) return out.write('no accounts found\n')
     const width = Math.max(...all.map((a) => a.label.length))
     return out.write(`${all.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
   }
@@ -639,7 +673,10 @@ async function main(argv) {
     if (result.nothing) return out.write('nothing to undo\n')
     const { receipt } = result
     out.write(`Undo  ${receipt.at} | ${receipt.from.join(' + ')} → ${receipt.to}\n`)
-    if (result.changed) return out.write(`  refused | ${result.changed.length} sessions gained messages since the move | nothing changed\n${result.changed.map((t) => `    ${t}`).join('\n')}\n`)
+    if (result.changed) {
+      process.exitCode = 1
+      return out.write(`  refused | ${result.changed.length} sessions changed since the move | nothing changed\n${result.changed.map((t) => `    ${t}`).join('\n')}\n`)
+    }
     const files = receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0)
     return out.write(`  ${count(receipt.sessions.length)} transcripts | ${count(files)} sidecar files | ${count(receipt.sessions.length)} desktop records → quarantine\n  sources unchanged ✓\n  quarantine  ${result.dest}\n  then        ${NOTE}\n`)
   }
@@ -659,11 +696,12 @@ async function main(argv) {
   if (!args.json) out.write(`From  ${describe(from)}\nTo    ${to.label}\n\n`)
   const inv = await inventory(from, to, paths)
   report('inventory', [`${count(inv.total)} records`, inv.missing.length ? `${count(inv.missing.length)} without history` : null, inv.twice ? `${count(inv.twice)} same lineage twice` : null, inv.there.length ? `${count(inv.there.length)} already there` : null, `${count(inv.move.length)} to move`].filter(Boolean).join(' | '))
-  if (!inv.move.length) return args.json ? emit({ done: true, moved: 0 }) : out.write('  nothing to move\n')
-  if (args.dry) return args.json ? emit({ done: true, dry: true, moved: 0 }) : out.write('  dry run     nothing written\n')
-  const { file, receipt, checks } = await move(inv, to, paths, report)
+  if (!inv.move.length) return args.json ? emit({ done: true, ok: true, moved: 0 }) : out.write('  nothing to move\n')
+  if (args.dry) return args.json ? emit({ done: true, ok: true, dry: true, moved: 0 }) : out.write('  dry run     nothing written\n')
+  const { file, receipt, checks, ok } = await move(inv, to, paths, report)
+  if (!ok) process.exitCode = 1
   const note = receipt.sessions.length ? NOTE : null
-  if (args.json) return emit({ done: true, receipt: file, moved: receipt.sessions.length, failed: receipt.failed, checks, note })
+  if (args.json) return emit({ done: true, ok, receipt: file, moved: receipt.sessions.length, failed: receipt.failed, checks, note })
   if (receipt.failed.length) out.write(`  failed      ${receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`).join('\n              ')}\n`)
   out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
 }

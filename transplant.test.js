@@ -36,7 +36,7 @@ test('fork matches the official SDK golden', async () => {
 })
 
 test('fork matches the official SDK live', async (t) => {
-  try { await import('@anthropic-ai/claude-agent-sdk') } catch { return t.skip('sdk not installed') }
+  try { await import('@anthropic-ai/claude-agent-sdk') } catch (error) { if (process.env.CI) throw error; return t.skip('sdk not installed') }
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'ct-')))
   const dir = path.join(root, 'p')
   const config = path.join(root, 'c')
@@ -107,7 +107,7 @@ test('move, rerun, undo across accounts', async () => {
   await h.record('P', SOURCE, { forkedFromSessionId: `local_${id(200)}` })
   const b = [entry('user', 200, null, id(200)), entry('assistant', 201, 200, id(200)), entry('user', 202, 201, id(200), { toolUseResult: { stdout: '', stderr: '' } })]
   await h.write(id(200), [...b, { ...b[2], toolUseResult: { stdout: 'rich', stderr: '' } }])
-  await h.record('P', id(200))
+  await h.record('P', id(200), { forkedFromSessionId: `local_${id(300)}` })
   const c1 = [entry('user', 300, null, id(300)), entry('assistant', 301, 300, id(300))]
   await h.write(id(300), c1)
   await h.record('P', id(300))
@@ -120,6 +120,9 @@ test('move, rerun, undo across accounts', async () => {
   const e = [entry('user', 500, null, id(500)), entry('assistant', 501, 500, id(500))]
   await h.write(id(500), [...e, { ...e[1], message: { role: 'assistant', content: 'conflict' } }])
   await h.record('T', id(500))
+  await h.write(id(600), [entry('user', 600, null, id(600))])
+  await appendFile(path.join(h.project, `${id(600)}.jsonl`), '{"type":"user","uuid":"broken\n')
+  await h.record('T', id(600))
 
   const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { by, from: [by[h.acct.P], by[h.acct.T]], to: by[h.acct.Z] } }
   const plan = async () => { const p = await pick(); return inventory(p.from, p.to, h.paths) }
@@ -135,19 +138,20 @@ test('move, rerun, undo across accounts', async () => {
   assert.match(by[h.acct.Z].stats, /^1 \| .* \| fixture$/)
 
   const inv = await inventory(from, to, h.paths)
-  assert.equal(inv.total, 6)
+  assert.equal(inv.total, 7)
   assert.equal(inv.missing.length, 1)
   assert.equal(inv.twice, 1)
   assert.equal(inv.there.length, 1)
-  assert.deepEqual(inv.move.map((s) => s.id).sort(), [SOURCE, id(200), id(500)].sort())
+  assert.deepEqual(inv.move.map((s) => s.id).sort(), [SOURCE, id(200), id(500), id(600)].sort())
 
   const stages = []
   const result = await move(inv, to, h.paths, (stage, text, extra = {}) => { if (!extra.live) stages.push(`${stage} ${text}`) })
   assert.equal(result.receipt.sessions.length, 2)
-  assert.equal(result.receipt.failed.length, 1)
-  assert.match(result.receipt.failed[0].error, /conflicting/)
+  assert.equal(result.receipt.failed.length, 2)
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.receipt.failed.map((f) => f.error).sort(), ['1 conflicting duplicate uuids', '1 unparseable lines'])
   assert.deepEqual(result.checks, ['provenance ✓', 'lineage ✓', 'sidecars ✓', 'sources unchanged ✓'])
-  assert.match(stages[0], /^fork 2 ✓ \| \d+ events \| 1 replay duplicates collapsed \| 1 failed$/)
+  assert.match(stages[0], /^fork 2 ✓ \| \d+ events \| 1 replay duplicates collapsed \| 2 failed$/)
   assert.equal(stages[1], 'sidecars 2 files | sha256 ✓')
   assert.equal(stages[2], 'desktop 2 records | 0 archived | 2 active')
 
@@ -163,19 +167,20 @@ test('move, rerun, undo across accounts', async () => {
   assert.deepEqual(record.bridgeSessionIds, [])
   assert.deepEqual(record.spawnSeed, {})
   assert.equal(record.forkedFromSessionId, `local_${result.receipt.sessions.find((r) => r.id === id(200)).targetId}`)
+  assert.equal(JSON.parse(await readFile(result.receipt.sessions.find((r) => r.id === id(200)).record, 'utf8')).forkedFromSessionId, `local_${id(320)}`)
   assert.equal(await readFile(path.join(h.project, `${SOURCE}.jsonl`), 'utf8'), source)
   assert.equal((await readdir(h.dir('Z'))).length, 3)
   assert.equal(await readdir(path.join(h.paths.state, 'quarantine')).catch(() => 'none'), 'none')
 
   const again = await plan()
-  assert.deepEqual(again.move.map((s) => s.id), [id(500)])
+  assert.deepEqual(again.move.map((s) => s.id).sort(), [id(500), id(600)])
   assert.equal(again.there.length, 3)
 
   const undone = await undo(h.paths)
   assert.ok(undone.dest)
   assert.equal((await readdir(h.dir('Z'))).length, 1)
   assert.equal((await readdir(undone.dest)).length, 6)
-  assert.equal((await plan()).move.length, 3)
+  assert.equal((await plan()).move.length, 4)
   assert.deepEqual(await undo(h.paths), { nothing: true })
 
   const second = await move(await plan(), (await pick()).to, h.paths)

@@ -10,3 +10,4 @@ jobs:
       - run: npm i --no-save --omit=optional @anthropic-ai/claude-agent-sdk@0.3.258
       - run: npm test
       - run: swiftc -parse-as-library -typecheck menubar.swift
+      - run: npm pack && npm i -g ./claude-transplant-*.tgz && claude-transplant --version && claude-transplant --help

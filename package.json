@@ -1,6 +1,6 @@
 {
   "name": "claude-transplant",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Move Claude Code history between accounts. Sources untouched, provenance verified, undo included.",
   "type": "module",
   "bin": {
@@ -27,5 +27,8 @@
     "migrate",
     "transfer"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ]
 }
