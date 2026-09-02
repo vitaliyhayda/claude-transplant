@@ -10,7 +10,7 @@ Claude Desktop keeps Claude Code sessions inside the account that created them. 
 
 ## Menubar or CLI
 
-Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Straight from this repository instead of the npm registry: `npx github:vitaliyhayda/claude-transplant`.
+Same engine, two doors. Both need Node 22 or newer. The menubar also needs the Xcode command line tools once, `xcode-select --install`. Straight from this repository instead of the npm registry: `npx github:vitaliyhayda/claude-transplant`, with `#v1.0.2` appended to pin a release.
 
 ```
 npx claude-transplant menubar
@@ -65,7 +65,7 @@ Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profil
 
 ## How it works
 
-A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, the target Desktop records, and that the sources did not change underneath it. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. Run again once the session is quiet. A receipt records every path and hash, and that receipt is what `undo` reads.
+A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, every target Desktop record byte for byte, and that the sources did not change underneath it. A session whose transcript has an unparseable line, conflicting duplicate ids, or changes while it is being copied is skipped and named in the output, and the command exits nonzero so nothing partial passes as success. Run again once the session is quiet. A receipt records every path and hash, and that receipt is what `undo` reads.
 
 ## Why it is built this way
 
@@ -109,4 +109,4 @@ Each of these was tried. Each looked like it worked until the layer below was ch
 - Moving history out of a Team organization is your organization's call, not this tool's.
 - Unofficial. Not affiliated with Anthropic.
 
-Receipts and quarantine live in `~/Library/Application Support/claude-transplant`. Quarantine holds undone and failed copies, sources are intact, so recovery is a rerun, and the folder can be deleted once its receipts are no longer wanted. A lock file there names the running process and is cleared automatically when that process is gone. MIT.
+Receipts, quarantine, and the menubar app live in `~/Library/Application Support/claude-transplant`. Quarantine holds undone and failed copies, sources are intact, so recovery is a rerun, and the `quarantine` folder inside can be deleted once its receipts are no longer wanted. A run interrupted mid-copy is reconciled by the next run or undo, which quarantines the half-written copy and names it. A lock file names the running process and is cleared automatically once that process is gone. MIT.

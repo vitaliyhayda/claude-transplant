@@ -67,6 +67,7 @@ test('normalize collapses replays and reports conflicts', () => {
   const x = entry('assistant', 5, 1, id(0))
   assert.equal(normalize([a, b, c, d, { ...d, parentUuid: id(2) }]).replays, 1)
   assert.equal(normalize([a, b, c, d, x, { ...d, parentUuid: id(5) }]).conflicts, 1)
+  assert.equal(normalize([a, b, c, { ...d, parentUuid: id(2) }, d]).conflicts, 1)
 })
 
 test('cli exits nonzero on partial failure and undoes over json', async () => {
@@ -152,6 +153,10 @@ test('move, rerun, undo across accounts', async () => {
   await h.write(id(600), [entry('user', 600, null, id(600))])
   await appendFile(path.join(h.project, `${id(600)}.jsonl`), '{"type":"user","uuid":"broken\n')
   await h.record('T', id(600))
+  await h.write(id(800), [entry('user', 800, null, id(800)), entry('assistant', 801, 800, id(800))])
+  await h.record('T', id(800), { forkedFromSessionId: `local_${id(310)}` })
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, 'lock'), '999999')
 
   const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { by, from: [by[h.acct.P], by[h.acct.T]], to: by[h.acct.Z] } }
   const plan = async () => { const p = await pick(); return inventory(p.from, p.to, h.paths) }
@@ -167,23 +172,23 @@ test('move, rerun, undo across accounts', async () => {
   assert.match(by[h.acct.Z].stats, /^1 \| .* \| fixture$/)
 
   const inv = await inventory(from, to, h.paths)
-  assert.equal(inv.total, 7)
+  assert.equal(inv.total, 8)
   assert.equal(inv.missing.length, 1)
   assert.equal(inv.twice, 1)
   assert.equal(inv.there.length, 1)
-  assert.deepEqual(inv.move.map((s) => s.id).sort(), [SOURCE, id(200), id(500), id(600)].sort())
+  assert.deepEqual(inv.move.map((s) => s.id).sort(), [SOURCE, id(200), id(500), id(600), id(800)].sort())
 
   const stages = []
   const result = await move(inv, to, h.paths, (stage, text, extra = {}) => { if (!extra.live) stages.push(`${stage} ${text}`) })
-  assert.equal(result.receipt.sessions.length, 2)
+  assert.equal(result.receipt.sessions.length, 3)
   assert.equal(result.receipt.failed.length, 2)
   assert.equal(result.ok, false)
   assert.deepEqual(result.receipt.failed.map((f) => f.error).sort(), ['1 conflicting duplicate uuids', '1 unparseable lines'])
   assert.deepEqual(result.checks, ['provenance ✓', 'lineage ✓', 'sidecars ✓', 'desktop ✓', 'sources unchanged ✓'])
   assert.deepEqual(result.problems, [])
-  assert.match(stages[0], /^fork 2 ✓ \| \d+ events \| 1 replay duplicates collapsed \| 2 failed$/)
+  assert.match(stages[0], /^fork 3 ✓ \| \d+ events \| 1 replay duplicates collapsed \| 2 failed$/)
   assert.equal(stages[1], 'sidecars 2 files | sha256 ✓')
-  assert.equal(stages[2], 'desktop 2 records | 0 archived | 2 active')
+  assert.equal(stages[2], 'desktop 3 records | 0 archived | 3 active')
 
   const moved = result.receipt.sessions.find((r) => r.id === SOURCE)
   const copy = await readFile(moved.targetTranscript, 'utf8')
@@ -198,8 +203,9 @@ test('move, rerun, undo across accounts', async () => {
   assert.deepEqual(record.spawnSeed, {})
   assert.equal(record.forkedFromSessionId, `local_${result.receipt.sessions.find((r) => r.id === id(200)).targetId}`)
   assert.equal(JSON.parse(await readFile(result.receipt.sessions.find((r) => r.id === id(200)).record, 'utf8')).forkedFromSessionId, `local_${id(320)}`)
+  assert.equal(JSON.parse(await readFile(result.receipt.sessions.find((r) => r.id === id(800)).record, 'utf8')).forkedFromSessionId, `local_${id(320)}`)
   assert.equal(await readFile(path.join(h.project, `${SOURCE}.jsonl`), 'utf8'), source)
-  assert.equal((await readdir(h.dir('Z'))).length, 3)
+  assert.equal((await readdir(h.dir('Z'))).length, 4)
   assert.equal(await readdir(path.join(h.paths.state, 'quarantine')).catch(() => 'none'), 'none')
 
   const again = await plan()
@@ -209,13 +215,20 @@ test('move, rerun, undo across accounts', async () => {
   const undone = await undo(h.paths)
   assert.ok(undone.dest)
   assert.equal((await readdir(h.dir('Z'))).length, 1)
-  assert.equal((await readdir(undone.dest)).length, 6)
-  assert.equal((await plan()).move.length, 4)
+  assert.equal((await readdir(undone.dest)).length, 8)
+  assert.equal((await plan()).move.length, 5)
   assert.deepEqual(await undo(h.paths), { nothing: true })
+  const orphan = path.join(h.project, `${id(900)}.jsonl`)
+  await writeFile(orphan, '{}\n')
+  await writeFile(path.join(h.paths.state, '2099-01-01T00-00-00-000.json'), JSON.stringify({ at: '2099-01-01T00-00-00-000', from: [], to: 'x', sessions: [], failed: [], pending: { id: id(900), title: 'Orphan', made: [orphan] } }))
+  const reconciled = await undo(h.paths)
+  assert.equal(reconciled.receipt.failed[0].error, 'interrupted')
+  assert.equal(await readFile(orphan, 'utf8').catch(() => 'gone'), 'gone')
+  assert.ok(await readFile(path.join(h.paths.state, 'quarantine', '2099-01-01T00-00-00-000', 'failed', `${id(900)}.jsonl`), 'utf8'))
 
   const second = await move(await plan(), (await pick()).to, h.paths)
   await appendFile(second.receipt.sessions[0].targetTranscript, JSON.stringify(entry('user', 999, null, second.receipt.sessions[0].targetId)) + '\n')
   const refused = await undo(h.paths)
   assert.deepEqual(refused.changed, [second.receipt.sessions[0].title])
-  assert.equal((await readdir(h.dir('Z'))).length, 3)
+  assert.equal((await readdir(h.dir('Z'))).length, 4)
 })

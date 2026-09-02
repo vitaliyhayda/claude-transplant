@@ -2,7 +2,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, realpathSync } from 'node:fs'
-import { copyFile, mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, link as hardlink, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -105,20 +105,25 @@ async function quarantine(items, dest) {
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
+  const mine = path.join(paths.state, `lock.${process.pid}`)
+  const holder = () => readFile(lockFile, 'utf8').catch(() => null)
   const alive = (pid) => { try { return pid > 0 && process.kill(pid, 0) } catch { return false } }
-  let lock = await open(lockFile, 'wx').catch(() => null)
-  if (!lock) {
-    const pid = Number(await readFile(lockFile, 'utf8').catch(() => 0))
-    if (alive(pid)) throw new Error(`another run holds the lock, pid ${pid}`)
-    await unlink(lockFile).catch(() => {})
-    lock = await open(lockFile, 'wx').catch(() => { throw new Error('another run holds the lock') })
-  }
-  await lock.writeFile(String(process.pid))
+  const grab = () => hardlink(mine, lockFile).then(() => true, () => false)
+  await writeFile(mine, String(process.pid), { mode: 0o600 })
   try {
-    return await work()
+    if (!(await grab())) {
+      const stale = await holder()
+      if (alive(Number(stale))) throw new Error(`another run holds the lock, pid ${Number(stale)}`)
+      if ((await holder()) === stale) await unlink(lockFile).catch(() => {})
+      if (!(await grab())) throw new Error('another run holds the lock')
+    }
+    try {
+      return await work()
+    } finally {
+      if ((await holder()) === String(process.pid)) await unlink(lockFile).catch(() => {})
+    }
   } finally {
-    await lock.close()
-    await unlink(lockFile).catch(() => {})
+    await unlink(mine).catch(() => {})
   }
 }
 
@@ -268,6 +273,9 @@ function survivor(rows, ids, parentOf) {
     return a === null
   }
   if (!parents.every((a) => parents.every((b) => a === b || above(a, b) || above(b, a)))) return null
+  const depth = (p) => { const seen = new Set(); for (let cur = p; cur && !seen.has(cur); cur = parentOf.get(cur) ?? null) seen.add(cur); return seen.size }
+  const depths = rows.toSorted((a, b) => a.line - b.line).map((r) => depth(r.entry.parentUuid ?? null))
+  if (depths.some((d, i) => i && d > depths[i - 1])) return null
   const keep = {}
   for (const k of ['stdout', 'stderr']) {
     const values = new Set(rows.map((r) => r.entry.toolUseResult?.[k]).filter((v) => typeof v === 'string' && v.length))
@@ -411,8 +419,13 @@ export async function inventory(from, to, paths) {
       found.push({ ...s, account, transcript: ctx.index.get(s.id), roots: rootSet, invalid, forks: ctx.scans.get(s.id).forked.size })
     }
   }
-  const groups = Map.groupBy(found, (s) => sha(s.roots.size && !s.invalid ? [...s.roots].sort().join('\n') : s.id))
-  const reps = [...groups.values()].map((g) => g.toSorted((a, b) => a.forks - b.forks || a.createdAt - b.createdAt)[0])
+  const groups = [...Map.groupBy(found, (s) => sha(s.roots.size && !s.invalid ? [...s.roots].sort().join('\n') : s.id)).values()]
+  const repOf = new Map()
+  for (const g of groups) {
+    const rep = g.toSorted((a, b) => a.forks - b.forks || a.createdAt - b.createdAt)[0]
+    for (const s of g) repOf.set(s.record.sessionId, rep)
+  }
+  const reps = [...new Set(repOf.values())]
   const targets = []
   for (const s of to.sessions) {
     if (!s.id) continue
@@ -423,30 +436,30 @@ export async function inventory(from, to, paths) {
   const there = []
   const move = []
   for (const s of reps) (!s.invalid && covering(s.roots) ? there : move).push(s)
-  const parent = async (recordId) => {
-    const s = from.flatMap((a) => a.sessions).find((x) => x.record.sessionId === recordId)
-    return s?.id ? covering(await roots(s.id, ctx)) : null
+  const parent = (recordId) => {
+    const rep = repOf.get(recordId)
+    return rep ? { record: rep.record.sessionId, target: covering(rep.roots) } : null
   }
   return { total, missing, twice: found.length - reps.length, there, move, parent, from: from.map((a) => a.label) }
 }
 
-async function one(s, to, made, now) {
+function planned(s, to, targetId) {
+  const dir = path.dirname(s.transcript)
+  return [path.join(dir, `${targetId}.jsonl`), path.join(dir, targetId), path.join(to.dir, `local_${targetId}.json`)]
+}
+
+async function one(s, to, targetId, now) {
   const source = await load(s.transcript)
   if (source.invalid) throw new Error(`${source.invalid} unparseable lines`)
   const { entries, replays, conflicts } = normalize(source.entries)
   if (conflicts) throw new Error(`${conflicts} conflicting duplicate uuids`)
-  const targetId = randomUUID()
   const title = s.title.trim() || derive(entries) || 'Untitled'
   const text = jsonl(fork(entries, s.id, targetId, title))
-  const dir = path.dirname(s.transcript)
-  const targetTranscript = path.join(dir, `${targetId}.jsonl`)
-  made.push(targetTranscript)
+  const [targetTranscript, targetDir, record] = planned(s, to, targetId)
   await writeNew(targetTranscript, text)
-  const sourceDir = path.join(dir, s.id)
-  const targetDir = path.join(dir, targetId)
+  const sourceDir = path.join(path.dirname(s.transcript), s.id)
   let sidecars = { count: 0, bytes: 0, sha: null }
   if (await exists(sourceDir)) {
-    made.push(targetDir)
     await copyTree(sourceDir, targetDir)
     sidecars = await digest(targetDir)
     if (sidecars.sha !== (await digest(sourceDir)).sha) throw new Error('sidecar copy mismatch')
@@ -454,25 +467,27 @@ async function one(s, to, made, now) {
   const want = new Set(entries.filter((e) => TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain && e.type !== 'progress').map((e) => e.uuid))
   const got = new Set([...(await scan(targetTranscript)).forked.values()].map((f) => f.messageUuid))
   if (!same(want, got)) throw new Error('provenance mismatch')
-  const record = path.join(to.dir, `local_${targetId}.json`)
-  made.push(record)
-  await writeNew(record, `${JSON.stringify(clone(s.record, targetId, title, now), null, 2)}\n`)
+  const recordText = `${JSON.stringify(clone(s.record, targetId, title, now), null, 2)}\n`
+  await writeNew(record, recordText)
   if (sha(await readFile(s.transcript)) !== source.sha) throw new Error('source changed during move')
-  return { id: s.id, targetId, title, archived: s.archived, transcript: s.transcript, sourceSha: source.sha, targetTranscript, targetSha: sha(text), targetDir: sidecars.sha ? targetDir : null, record, sidecars, events: want.size, replays, forkedFromSessionId: s.record.forkedFromSessionId ?? null, sourceRecordId: s.record.sessionId ?? null }
+  return { id: s.id, targetId, title, archived: s.archived, transcript: s.transcript, sourceSha: source.sha, targetTranscript, targetSha: sha(text), targetDir: sidecars.sha ? targetDir : null, record, recordSha: sha(recordText), sidecars, events: want.size, replays, forkedFromSessionId: s.record.forkedFromSessionId ?? null, sourceRecordId: s.record.sessionId ?? null }
 }
 
 async function link(rows, inv) {
   const byRecord = new Map(rows.map((r) => [r.sourceRecordId, r]))
   for (const r of rows) {
     if (!r.forkedFromSessionId) continue
-    const inBatch = byRecord.get(r.forkedFromSessionId)
-    const target = inBatch ? `local_${inBatch.targetId}` : await inv.parent(r.forkedFromSessionId)
+    const p = inv.parent(r.forkedFromSessionId)
+    const inBatch = p && byRecord.get(p.record)
+    const target = inBatch ? `local_${inBatch.targetId}` : p?.target
     if (!target) continue
     const record = await readJson(r.record)
     record.forkedFromSessionId = target
-    await writeFile(`${r.record}.tmp`, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 })
+    const text = `${JSON.stringify(record, null, 2)}\n`
+    await writeFile(`${r.record}.tmp`, text, { mode: 0o600 })
     await rename(`${r.record}.tmp`, r.record)
     r.linkedTo = target
+    r.recordSha = sha(text)
   }
 }
 
@@ -482,19 +497,34 @@ async function verify(rows) {
   const flag = (check, r) => { bad[check]++; problems.push({ title: r.title, check }) }
   for (const r of rows) {
     if (!(await exists(r.targetTranscript)) || sha(await readFile(r.targetTranscript)) !== r.targetSha) flag('provenance', r)
-    const record = await readJson(r.record).catch(() => null)
-    if (r.linkedTo && record?.forkedFromSessionId !== r.linkedTo) flag('lineage', r)
+    const raw = await readFile(r.record, 'utf8').catch(() => null)
+    if (r.linkedTo && (raw ? JSON.parse(raw) : {}).forkedFromSessionId !== r.linkedTo) flag('lineage', r)
     const sourceDir = path.join(path.dirname(r.transcript), r.id)
     if (r.targetDir ? (await digest(r.targetDir)).sha !== r.sidecars.sha || (await digest(sourceDir)).sha !== r.sidecars.sha : await exists(sourceDir)) flag('sidecars', r)
-    if (record?.cliSessionId !== r.targetId || record?.sessionId !== `local_${r.targetId}`) flag('desktop', r)
+    if (!raw || sha(raw) !== r.recordSha) flag('desktop', r)
     if (!(await exists(r.transcript)) || sha(await readFile(r.transcript)) !== r.sourceSha) flag('sources', r)
   }
   const mark = (v) => (v ? `✗ ${v}` : '✓')
   return { ok: problems.length === 0, problems, lines: [`provenance ${mark(bad.provenance)}`, `lineage ${mark(bad.lineage)}`, `sidecars ${mark(bad.sidecars)}`, `desktop ${mark(bad.desktop)}`, `sources unchanged ${mark(bad.sources)}`] }
 }
 
+const receipts = async (paths) => (await readdir(paths.state).catch(() => [])).filter((f) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}\.json$/.test(f)).sort()
+
+async function reconcile(paths) {
+  const name = (await receipts(paths)).at(-1)
+  if (!name) return
+  const file = path.join(paths.state, name)
+  const receipt = await readJson(file)
+  if (!receipt.pending) return
+  await quarantine(receipt.pending.made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
+  receipt.failed.push({ id: receipt.pending.id, title: receipt.pending.title, error: 'interrupted' })
+  receipt.pending = null
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
+}
+
 export function move(inv, to, paths, report = () => {}) {
   return locked(paths, async () => {
+    await reconcile(paths)
     const started = Date.now()
     const at = stamp()
     const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: [] }
@@ -504,9 +534,12 @@ export function move(inv, to, paths, report = () => {}) {
     let replays = 0
     for (const [i, s] of inv.move.entries()) {
       report('fork', `${i + 1}/${inv.move.length}`, { live: true })
-      const made = []
+      const targetId = randomUUID()
+      const made = planned(s, to, targetId)
+      receipt.pending = { id: s.id, title: s.title, made }
+      await save()
       try {
-        const row = await one(s, to, made, started)
+        const row = await one(s, to, targetId, started)
         receipt.sessions.push(row)
         events += row.events
         replays += row.replays
@@ -514,6 +547,7 @@ export function move(inv, to, paths, report = () => {}) {
         await quarantine(made, path.join(paths.state, 'quarantine', at, 'failed'))
         receipt.failed.push({ id: s.id, title: s.title, error: error.message })
       }
+      receipt.pending = null
       await save()
     }
     await link(receipt.sessions, inv)
@@ -533,8 +567,8 @@ export function move(inv, to, paths, report = () => {}) {
 
 export function undo(paths) {
   return locked(paths, async () => {
-    const names = (await readdir(paths.state)).filter((f) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}\.json$/.test(f)).sort()
-    const name = names.at(-1)
+    await reconcile(paths)
+    const name = (await receipts(paths)).at(-1)
     if (!name) return { nothing: true }
     const receipt = await readJson(path.join(paths.state, name))
     const changed = []

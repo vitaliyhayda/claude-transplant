@@ -1,6 +1,6 @@
 {
   "name": "claude-transplant",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Move Claude Code history between accounts. Sources untouched, provenance verified, undo included.",
   "type": "module",
   "bin": {

@@ -134,10 +134,11 @@ final class Model: ObservableObject {
                 lines.append(("failed", failed.map { ($0.title ?? "?") + " | " + $0.error }.joined(separator: "\n")))
             }
             let good = event.ok ?? true
-            for problem in event.problems ?? [] { lines.append(("check", problem.title + " | " + problem.check + " failed")) }
-            let summary = (moved == 0 ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed") : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")) + (good ? "" : ", verification failed")
+            let problems = event.problems ?? []
+            for problem in problems { lines.append(("check", problem.title + " | " + problem.check + " failed")) }
+            let summary = (moved == 0 ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed") : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")) + (problems.isEmpty ? "" : ", verification failed")
             note = good ? (event.note ?? summary) : summary
-            notify(summary, good ? (event.note ?? "") : "Check the receipt before trusting the copies")
+            notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
         } else if event.undone != nil {
             note = event.note ?? ""
             notify("\(event.sessions ?? 0) sessions undone", note)
@@ -294,10 +295,10 @@ struct Panel: View {
                 }
             }
             if !model.lines.isEmpty || !model.note.isEmpty { Divider() }
-            ForEach(model.lines, id: \.0) { item in
+            ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(item.0).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                    Text(item.1)
+                    Text(item.element.0).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+                    Text(item.element.1)
                 }
                 .font(.system(.caption, design: .monospaced))
             }
