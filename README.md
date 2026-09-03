@@ -47,7 +47,7 @@ To    ↑↓ move · enter confirm
 | Command | What it does |
 |---|---|
 | `claude-transplant` | pick From and To, move, print a receipt |
-| `claude-transplant --dry-run` | plan only, write nothing, reports an interrupted copy if one is pending |
+| `claude-transplant --dry-run` | plan only, write nothing, refuses to predict until an interrupted run is reconciled |
 | `claude-transplant undo` | quarantine the last move, refused if a moved session changed since |
 | `claude-transplant accounts` | list accounts |
 | `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
@@ -58,8 +58,8 @@ To    ↑↓ move · enter confirm
 The inventory line, decoded:
 
 - without history: a Desktop record whose transcript no longer exists on disk
-- older versions skipped: the same history present in more than one source account, or in several compatible versions where one contains the others, moved once as the fullest version. Shared messages, meaningful state, and sidecars must agree before one version can replace another. An unparseable or conflicting version is never folded away
-- grew apart: two versions of one history that both continued after a copy, so neither contains the other. All of them move and the line says so
+- older versions skipped: the same history present in more than one source account, or in several compatible versions where one contains the others, moved once as the fullest version. Shared messages, content replacements, history-suppression and relocation state, and sidecars must agree before one version can replace another. An unparseable or conflicting version is never folded away
+- grew apart: overlapping versions with different messages or meaningful state, or two branches that both continued after a copy. All of them move and the line says so
 - already there: the target already holds every message and every sidecar file, followed through earlier copies whose transcripts are still on disk
 
 Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profile directory, and Desktop's agent-mode records. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, then its session count, last activity, and most common project folder.
@@ -68,11 +68,11 @@ Accounts are labeled from `~/.claude.json`, its backups, any `~/.claude*` profil
 
 A Claude Code session is three things that can disagree: the transcript in `~/.claude/projects`, the sidecar files beside it (subagent transcripts and tool results), and the account-scoped record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. Anthropic exposes no way to reassign a session to another account, so a move is a reconstruction. Each source session gets a new id, a forked transcript in which every message carries `forkedFrom` with the id of its source message, a byte-identical copy of its sidecar tree, and a fresh Desktop record in the target account. The Desktop record keeps the source session's created, activity, and focus times.
 
-After writing, the tool re-reads what it wrote and checks provenance, sidecar hashes on both sides, every target Desktop record byte for byte, and that the source transcripts and sidecars did not change underneath it. Source records are re-read at copy time. Changed means the conversation itself changed, a new message, a content replacement, richer tool output under an existing id, an unparseable line, or a newly conflicting replay. Title and mode records that Claude Desktop appends to sessions it opens never count. A failed check is tied to the copied session id, exits nonzero, and prevents that copy from superseding anything.
+Before writing, the tool rechecks the planned transcript semantics and sidecar manifest. After writing, it re-reads what it wrote and checks provenance, sidecar hashes against that same manifest, every target Desktop record byte for byte, and that the source transcripts and sidecars did not change underneath it. Source records are re-read at copy time. Changed means the conversation itself changed, a new message, a content replacement, richer tool output under an existing id, an unparseable line, or a newly conflicting replay. Title, mode, and internal ATIS latch records that Claude Desktop appends never count. Relocation state does. A failed check is tied to the copied session id, exits nonzero, and prevents that copy from superseding anything.
 
 A duplicate message id counts as a sync replay only when the copies differ in runtime metadata alone, parent pointer, folder, slug, prompt id, version, git branch, or tool output verbosity, and every parent exists. Anything else is a conflict and the session is refused. This rests on one assumption made deliberately: a message id names one event, so two compatible placements of the same id are one event, and the richer copy is kept.
 
-Lineage comparison follows every copied message back to its root. A source version is skipped only when another compatible version contains every one of its root messages and sidecars. Versions with different shared content, replacements, or state move separately. When a complete version lands beside an older copy made by this tool, the older copy is retired into quarantine only after verification and an unchanged check. A receipt journals copying, verification, and retirement so an interrupted run is either finished safely or rolled back on the next move. `undo` reads that receipt and restores superseded copies.
+Lineage comparison follows every copied message back to its root. A source version is skipped only when another compatible version contains every one of its root messages and sidecars. Versions with different shared content, replacements, suppression, or relocation state move separately. When a complete version lands beside an older copy made by this tool, the older copy is retired into quarantine only after verification and an unchanged check, so repeated moves converge to one compatible entry per history. A receipt journals copying, verification, and retirement. An interrupted retirement finishes. Any earlier interruption rolls back its unchanged copies before the next plan, while a copy that gained meaningful changes stays in place and remains identified in the receipt. `undo` stops after any recovery and must be run again, so a corrupt newest receipt can never make it cross into the previous batch.
 
 ## Why it is built this way
 
@@ -81,7 +81,7 @@ Lineage comparison follows every copied message back to its root. A source versi
 - No confirmation prompt. Safety lives in properties, not dialogs: runs are idempotent, copies get fresh ids, and undo refuses only when a copy changed after the move.
 - Lineage over bookkeeping. "Already there" follows `forkedFrom` pointers to the root, so copies made through earlier hops, or by other tools, are recognized without a shared database.
 - The official fork, ported. The TypeScript Agent SDK's `forkSession` is the reference implementation. Both official SDKs bundle the entire CLI for what is one screen of logic, so the routine is ported, pinned by a golden fixture, and checked in CI against the real SDK on every push.
-- One file, no dependencies. Plain JavaScript on Node 22, no build step, nothing to audit but a file you can read in one sitting. The menubar is one Swift file for the same reason.
+- One file, no dependencies. Plain JavaScript on Node 22, no build step, and one source file to audit. The menubar is one Swift file for the same reason.
 - Local only. No tokens, cookies, or network. The tool never reads Desktop's credential caches.
 
 ## The long view
@@ -114,8 +114,9 @@ Each of these was tried. Each looked like it worked until the layer below was ch
 - macOS 13 or newer with Claude Desktop. Everything is local.
 - Remote Control bridges, scheduled tasks, and cloud ownership do not move. They belong to the account that created them.
 - Inline sidechain events in the main transcript do not move, matching the official `forkSession` behavior. Sidecar subagent transcripts and tool results do move.
+- Receipts from before 1.2.0 fall back to byte-exact undo checks. Opening one of those copies in Desktop may make undo refuse rather than guess that its changes were harmless.
 - The transcript and record layouts are undocumented and may change. Verified with Claude Code 2.1.257, Desktop transcript 2.1.258, and Agent SDK 0.3.259.
 - Moving history out of a Team organization is your organization's call, not this tool's.
 - Unofficial. Not affiliated with Anthropic.
 
-Receipts, quarantine, and the menubar app live in `~/Library/Application Support/claude-transplant`. Quarantine holds undone and failed copies, sources are intact, so recovery is a rerun, and the `quarantine` folder inside can be deleted once its receipts are no longer wanted. A run interrupted before final verification is finished or rolled back by the next run or undo. A kernel lock prevents overlapping runs and releases automatically when its holder exits. MIT.
+Receipts, quarantine, and the menubar app live in `~/Library/Application Support/claude-transplant`. Quarantine holds undone and failed copies, sources are intact, so recovery is a rerun, and the `quarantine` folder inside can be deleted once its receipts are no longer wanted. Dry-run never performs recovery and reports that no reliable plan is available until the next real move reconciles an interruption. A kernel lock prevents overlapping runs and releases automatically when its holder exits. MIT.

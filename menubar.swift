@@ -145,15 +145,15 @@ final class Model: ObservableObject {
                 ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed")
                 : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")
             let summary = movedText + (problems.isEmpty ? "" : ", verification failed")
-            note = good ? (event.note ?? summary) : summary
             restartAvailable = event.restart ?? false
+            note = good ? (restartAvailable ? "" : event.note ?? summary) : summary
             notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
         } else if event.undone != nil {
-            note = event.note ?? ""
             restartAvailable = event.restart ?? false
-            notify("\(event.sessions ?? 0) sessions undone", note)
+            note = restartAvailable ? "" : event.note ?? ""
+            notify("\(event.sessions ?? 0) sessions undone", event.note ?? "")
         } else if let refused = event.refused {
-            note = "Undo refused, \(refused.count) sessions gained messages"
+            note = "Undo refused, \(refused.count) sessions changed since the move"
             restartAvailable = false
             lines = refused.map { ("kept", $0) }
         } else if event.nothing == true {
@@ -168,6 +168,7 @@ final class Model: ObservableObject {
 
     func restartDesktop() {
         note = "restarting Claude Desktop"
+        restartAvailable = false
         DispatchQueue.global().async { [weak self] in
             let quit = Model.shell("/usr/bin/osascript", ["-e", "quit app \"Claude\""]) == 0
             var gone = false
@@ -229,13 +230,13 @@ final class Model: ObservableObject {
         process.executableURL = URL(fileURLWithPath: node(config.node))
         process.arguments = [config.script] + args
         let pipe = Pipe()
-        let errors = Pipe()
         process.standardOutput = pipe
-        process.standardError = errors
+        process.standardError = pipe
         do { try process.run() } catch { done(1, error.localizedDescription); return }
         DispatchQueue.global().async {
             let handle = pipe.fileHandleForReading
             var buffer = Data()
+            var errors: [String] = []
             while true {
                 let chunk = handle.availableData
                 if chunk.isEmpty { break }
@@ -243,13 +244,17 @@ final class Model: ObservableObject {
                 while let newline = buffer.firstIndex(of: 10) {
                     let text = String(decoding: buffer[buffer.startIndex..<newline], as: UTF8.self)
                     buffer.removeSubrange(buffer.startIndex...newline)
-                    DispatchQueue.main.async { line(text) }
+                    let trimmed = text.trimmingCharacters(in: .whitespaces)
+                    if trimmed.first == "{" || trimmed.first == "[" {
+                        DispatchQueue.main.async { line(text) }
+                    } else if !trimmed.isEmpty {
+                        errors.append(trimmed)
+                    }
                 }
             }
-            let error = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             process.waitUntilExit()
             let status = process.terminationStatus
-            DispatchQueue.main.async { done(status, error) }
+            DispatchQueue.main.async { done(status, errors.joined(separator: "\n")) }
         }
     }
 }
@@ -350,10 +355,11 @@ struct Panel: View {
                 .font(.system(.caption, design: .monospaced))
             }
             if let progress = model.progress { Bar(value: progress) }
-            if model.restartAvailable {
-                Button(action: { model.restartDesktop() }) { Text(model.note.sentence).font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
-            } else if !model.note.isEmpty {
+            if !model.note.isEmpty {
                 Text(model.note.sentence).font(.callout.weight(.medium))
+            }
+            if model.restartAvailable {
+                Button(action: { model.restartDesktop() }) { Text("Restart Claude Desktop to see them").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
             }
             HStack(spacing: 10) {
                 Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
@@ -520,7 +526,7 @@ enum Demo {
         model.from = []
         model.to = nil
         model.symbol = "checkmark"
-        model.note = "restart Claude Desktop to see them"
+        model.note = ""
         model.restartAvailable = true
         snap(2800)
         try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))
