@@ -14,7 +14,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SEPARATORS = new RegExp(`[${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g')
 const NOTE = 'restart Claude Desktop to see them'
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
-const SEMANTIC_VERSION = 2
+const SEMANTIC_VERSION = 3
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const HELP = `claude-transplant   move Claude Code history between accounts, sources untouched
 
@@ -508,6 +508,7 @@ export async function inventory(from, to, paths) {
   const seen = new Set()
   const missing = []
   const unreadable = []
+  const rejected = []
   const found = []
   let total = 0
   for (const account of from) {
@@ -520,10 +521,14 @@ export async function inventory(from, to, paths) {
       if (!transcript) { missing.push(s); continue }
       if (seen.has(transcript)) continue
       seen.add(transcript)
-      const detail = await history(s.id, transcript, ctx, s.cwd)
-      const { forked } = ctx.scans.get(transcript)
-      if (!detail.roots.size && !detail.invalid) { missing.push(s); continue }
-      found.push({ ...s, account, transcript, ...detail, forks: forked.size, sidecar: await sidecars(transcript, s.id) })
+      try {
+        const detail = await history(s.id, transcript, ctx, s.cwd)
+        const { forked } = ctx.scans.get(transcript)
+        if (!detail.roots.size && !detail.invalid) { missing.push(s); continue }
+        found.push({ ...s, account, transcript, ...detail, forks: forked.size, sidecar: await sidecars(transcript, s.id) })
+      } catch (error) {
+        rejected.push({ id: s.id, title: s.title, account, error: error.message })
+      }
     }
   }
   unreadable.push(...(to.unreadable ?? []).map((file) => ({ file, account: to, target: true })))
@@ -540,8 +545,12 @@ export async function inventory(from, to, paths) {
   for (const s of to.sessions) {
     if (!s.id) continue
     const transcript = locate(ctx.index, s.id, s.cwd)
-    const detail = transcript ? await history(s.id, transcript, ctx, s.cwd) : null
-    if (detail?.roots.size) targets.push({ record: s.record.sessionId, ...detail, session: s, transcript, sidecar: await sidecars(transcript, s.id) })
+    try {
+      const detail = transcript ? await history(s.id, transcript, ctx, s.cwd) : null
+      if (detail?.roots.size) targets.push({ record: s.record.sessionId, ...detail, session: s, transcript, sidecar: await sidecars(transcript, s.id) })
+    } catch (error) {
+      rejected.push({ id: s.id, title: s.title, account: to, target: true, error: error.message })
+    }
   }
   const covering = (s) => targets.find((t) => included(s, t))?.record ?? null
   const there = []
@@ -552,7 +561,7 @@ export async function inventory(from, to, paths) {
     return rep ? { record: rep.record.sessionId, target: covering(rep) } : null
   }
   const apart = reps.filter((a) => reps.some((b) => a !== b && overlaps(a, b))).length
-  return { total, missing, unreadable, twice: found.length - reps.length, apart, there, move, parent, targets, from: from.map((a) => a.label) }
+  return { total, missing, unreadable, rejected, twice: found.length - reps.length, apart, there, move, parent, targets, from: from.map((a) => a.label) }
 }
 
 async function one(s, to, targetId, now, journal) {
@@ -637,6 +646,12 @@ const knownOf = (row) => ({
 })
 const sourceKnownOf = (row) => ({ semantic: row.sourceSemantic, semanticVersion: row.sourceSemanticVersion })
 const artifacts = (row) => [row.targetTranscript, row.targetDir, row.record].filter(Boolean)
+const inventoryFailure = (item) => ({
+  id: item.id ?? null,
+  title: `${item.account.label} | ${item.title || path.basename(item.file)}`,
+  error: item.error ?? 'unreadable Desktop record'
+})
+const inventoryFailures = (inv) => [...inv.unreadable, ...inv.rejected].map(inventoryFailure)
 
 async function changed(file, sessionId, known) {
   if (!(await exists(file))) return false
@@ -826,12 +841,12 @@ async function retire(inv, ours, receipt, paths, at, problems, save) {
 }
 
 async function transfer(inv, to, paths, report) {
-  await reconcile(paths)
-  const ours = await created(paths)
   const started = Date.now()
   const at = stamp()
-  const unreadable = inv.unreadable.map((item) => ({ id: null, title: `${item.account.label} | ${path.basename(item.file)}`, error: 'unreadable Desktop record' }))
-  const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: unreadable, superseded: [], finalizing: true }
+  const initialFailures = inventoryFailures(inv)
+  const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: initialFailures, superseded: [], finalizing: true }
+  if (!inv.move.length) return { file: null, receipt, checks: [], problems: [], ok: false, validationOnly: true }
+  const ours = await created(paths)
   const file = path.join(paths.state, `${at}.json`)
   const save = () => saveJson(file, receipt)
   let events = 0
@@ -882,7 +897,10 @@ async function transfer(inv, to, paths, report) {
   return { file, receipt, checks: lines, problems, ok: ok && receipt.failed.length === 0 }
 }
 
-export const move = (inv, to, paths, report = () => {}) => locked(paths, () => transfer(inv, to, paths, report))
+export const move = (inv, to, paths, report = () => {}) => locked(paths, async () => {
+  const reconciled = await reconcile(paths)
+  return reconciled ? { reconciled, recoveryRequired: true, ok: false } : transfer(inv, to, paths, report)
+})
 
 export function undo(paths) {
   return locked(paths, async () => {
@@ -1150,7 +1168,10 @@ async function main(argv) {
   const summary = (inv) => report('inventory', [
     `${count(inv.total)} records`,
     inv.missing.length ? `${count(inv.missing.length)} without history` : null,
-    inv.unreadable.length ? `${count(inv.unreadable.length)} unreadable` : null,
+    inv.unreadable.filter((item) => !item.target).length ? `${count(inv.unreadable.filter((item) => !item.target).length)} source unreadable` : null,
+    inv.unreadable.filter((item) => item.target).length ? `${count(inv.unreadable.filter((item) => item.target).length)} target unreadable` : null,
+    inv.rejected.filter((item) => !item.target).length ? `${count(inv.rejected.filter((item) => !item.target).length)} source rejected` : null,
+    inv.rejected.filter((item) => item.target).length ? `${count(inv.rejected.filter((item) => item.target).length)} target rejected` : null,
     inv.twice ? `${count(inv.twice)} older versions skipped` : null,
     inv.apart ? `${count(inv.apart)} grew apart, all kept` : null,
     inv.there.length ? `${count(inv.there.length)} already there` : null,
@@ -1169,22 +1190,29 @@ async function main(argv) {
     }
     const inv = await inventory(from, to, paths)
     summary(inv)
-    if (inv.unreadable.length) process.exitCode = 1
-    const failures = inv.unreadable.map((item) => ({ title: `${item.account.label} | ${path.basename(item.file)}`, error: 'unreadable Desktop record' }))
+    const failures = inventoryFailures(inv)
+    if (failures.length) process.exitCode = 1
     return args.json
       ? emit({ done: true, ok: !failures.length, dry: true, moved: 0, planned: inv.move.length, failed: failures })
       : out.write(inv.move.length ? '  dry run     nothing written\n' : failures.length ? '  dry run     unreadable records must be repaired\n' : '  nothing to move\n')
   }
   const result = await locked(paths, async () => {
     const reconciled = await reconcile(paths)
-    if (reconciled) report('reconciled', `${reconciled.title} | ${reconciled.error}`)
+    if (reconciled) return { reconciled, recoveryRequired: true, ok: false }
     const latest = await accounts(paths)
     const currentFrom = from.map((account) => fresh(latest, account))
     const currentTo = fresh(latest, to)
     const inv = await inventory(currentFrom, currentTo, paths)
     summary(inv)
-    return inv.move.length || inv.unreadable.length ? transfer(inv, currentTo, paths, report) : null
+    return inv.move.length || inventoryFailures(inv).length ? transfer(inv, currentTo, paths, report) : null
   })
+  if (result?.recoveryRequired) {
+    process.exitCode = 1
+    report('reconciled', `${result.reconciled.title} | ${result.reconciled.error}`)
+    return args.json
+      ? emit({ done: true, ok: false, recoveryRequired: true, reconciled: result.reconciled })
+      : out.write('  move        not run, run it again after reviewing the recovery\n')
+  }
   if (!result) return args.json ? emit({ done: true, ok: true, moved: 0 }) : out.write('  nothing to move\n')
   const { file, receipt, checks, problems, ok } = result
   if (!ok) process.exitCode = 1
