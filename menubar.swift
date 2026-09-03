@@ -39,6 +39,8 @@ struct Event: Decodable {
     let stage: String?
     let text: String?
     let live: Bool?
+    let completed: Int?
+    let total: Int?
     let done: Bool?
     let ok: Bool?
     let moved: Int?
@@ -72,6 +74,8 @@ final class Model: ObservableObject {
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
     @Published var restartAvailable = false
+    @Published var progressCompleted: Int?
+    @Published var progressTotal: Int?
     let demo: Bool
     private let config: Config?
     private var refreshing = false
@@ -93,9 +97,8 @@ final class Model: ObservableObject {
     var remaining: [Account] { accounts.filter { !from.contains($0.id) } }
     var sources: [Account] { remaining.count == 1 && !from.isEmpty ? accounts.filter { $0.id != remaining[0].id } : accounts }
     var progress: Double? {
-        let parts = badge.split(separator: "/")
-        guard parts.count == 2, let done = Double(parts[0]), let total = Double(parts[1]), total > 0 else { return nil }
-        return done / total
+        guard let completed = progressCompleted, let total = progressTotal, total > 0 else { return nil }
+        return Double(completed) / Double(total)
     }
 
     func toggle(_ id: String) {
@@ -149,14 +152,22 @@ final class Model: ObservableObject {
         running = true
         restartAvailable = false
         symbol = "arrow.triangle.2.circlepath"
+        badge = "starting"
+        progressCompleted = nil
+        progressTotal = nil
     }
 
     private func handle(_ line: String) {
         guard let data = line.data(using: .utf8), let event = try? JSONDecoder().decode(Event.self, from: data) else { return }
         if let stage = event.stage, let text = event.text {
             if event.live == true {
-                badge = text
+                progressCompleted = event.completed
+                progressTotal = event.total
+                badge = event.completed != nil && event.total != nil ? "\(stage) \(text)" : stage
             } else {
+                progressCompleted = nil
+                progressTotal = nil
+                badge = stage
                 lines.removeAll { $0.0 == stage }
                 lines.append((stage, text))
             }
@@ -229,6 +240,8 @@ final class Model: ObservableObject {
     private func finish(_ status: Int32, _ error: String) {
         running = false
         badge = ""
+        progressCompleted = nil
+        progressTotal = nil
         from = []
         to = nil
         symbol = status == 0 ? "checkmark" : "exclamationmark.triangle"
@@ -342,6 +355,27 @@ struct Bar: View {
     }
 }
 
+struct ActivityBar: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+            GeometryReader { geo in
+                let width = geo.size.width
+                let segment = max(24, width * 0.22)
+                let phase = timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.1) / 1.1
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.quaternary)
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: segment)
+                        .offset(x: -segment + (width + segment) * phase)
+                }
+            }
+        }
+        .frame(height: 6)
+        .clipped()
+    }
+}
+
 struct Pill: View {
     let title: String
     let prominent: Bool
@@ -393,7 +427,10 @@ struct Panel: View {
                 }
                 .font(.system(.caption, design: .monospaced))
             }
-            if let progress = model.progress { Bar(value: progress) }
+            if model.running {
+                if let progress = model.progress { Bar(value: progress) }
+                else { ActivityBar() }
+            }
             if !model.note.isEmpty {
                 Text(model.note.sentence).font(.callout.weight(.medium))
             }
@@ -548,23 +585,29 @@ enum Demo {
         }
         glide(to: CGPoint(x: 282, y: 238), frames: 8)
         model.begin()
-        model.lines = [("inventory", "333 records | 4 without history | 21 older versions skipped | 3 already there | 305 to move")]
+        model.lines = [("inventory", "333 records | 4 without history | 21 compatible source versions | 3 blocked | 3 already there | 305 to move")]
         snap(250)
         glide(to: CGPoint(x: 150, y: 420), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
-            model.badge = "\(done)/305"
+            model.progressCompleted = done
+            model.progressTotal = 305
+            model.badge = "move \(done)/305"
             snap(100)
         }
-        model.badge = "305/305"
+        model.progressCompleted = 305
+        model.progressTotal = 305
+        model.badge = "move 305/305"
         snap(150)
         model.badge = ""
-        model.lines.append(("fork", "305 ✓ | 141,228 events | 9 replay duplicates collapsed"))
+        model.progressCompleted = nil
+        model.progressTotal = nil
+        model.lines.append(("move", "305 ✓ | 141,228 events | 305 zero-copy"))
         snap(350)
-        model.lines.append(("sidecars", "1,842 files | sha256 ✓"))
+        model.lines.append(("sidecars", "1,842 files | unchanged ✓"))
         snap(350)
         model.lines.append(("desktop", "305 records | 240 archived | 65 active"))
         snap(350)
-        model.lines.append(("verify", "provenance ✓ | lineage ✓ | sidecars ✓ | desktop ✓ | sources unchanged ✓ | 38s"))
+        model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓ | 2s"))
         snap(350)
         model.lines.append(("retired", "305 source records → quarantine | transcripts untouched"))
         snap(500)
