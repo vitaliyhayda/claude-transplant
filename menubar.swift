@@ -29,6 +29,11 @@ struct Problem: Decodable {
     let check: String
 }
 
+struct Reconciliation: Decodable {
+    let title: String
+    let error: String
+}
+
 struct Event: Decodable {
     let stage: String?
     let text: String?
@@ -40,6 +45,8 @@ struct Event: Decodable {
     let problems: [Problem]?
     let note: String?
     let restart: Bool?
+    let reconciled: Reconciliation?
+    let retry: Bool?
     let undone: String?
     let sessions: Int?
     let refused: [String]?
@@ -132,13 +139,16 @@ final class Model: ObservableObject {
                 lines.removeAll { $0.0 == stage }
                 lines.append((stage, text))
             }
+        } else if let reconciled = event.reconciled {
+            lines = [("recovered", reconciled.title + " | " + reconciled.error)]
+            note = event.retry == true ? "Run Undo last again if still wanted" : ""
+            restartAvailable = false
         } else if event.done == true {
             let moved = event.moved ?? 0
             let failed = event.failed ?? []
             if !failed.isEmpty {
                 lines.append(("failed", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n")))
             }
-            let good = event.ok ?? true
             let problems = event.problems ?? []
             for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
             let movedText = moved == 0
@@ -146,7 +156,7 @@ final class Model: ObservableObject {
                 : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")
             let summary = movedText + (problems.isEmpty ? "" : ", verification failed")
             restartAvailable = event.restart ?? false
-            note = good ? (restartAvailable ? "" : event.note ?? summary) : summary
+            note = summary
             notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
         } else if event.undone != nil {
             restartAvailable = event.restart ?? false
@@ -230,13 +240,20 @@ final class Model: ObservableObject {
         process.executableURL = URL(fileURLWithPath: node(config.node))
         process.arguments = [config.script] + args
         let pipe = Pipe()
+        let errorURL = FileManager.default.temporaryDirectory.appendingPathComponent("claude-transplant-\(UUID().uuidString).err")
+        FileManager.default.createFile(atPath: errorURL.path, contents: nil)
+        guard let errorHandle = try? FileHandle(forWritingTo: errorURL) else { done(1, "Could not capture command errors"); return }
         process.standardOutput = pipe
-        process.standardError = pipe
-        do { try process.run() } catch { done(1, error.localizedDescription); return }
+        process.standardError = errorHandle
+        do { try process.run() } catch {
+            try? errorHandle.close()
+            try? FileManager.default.removeItem(at: errorURL)
+            done(1, error.localizedDescription)
+            return
+        }
         DispatchQueue.global().async {
             let handle = pipe.fileHandleForReading
             var buffer = Data()
-            var errors: [String] = []
             while true {
                 let chunk = handle.availableData
                 if chunk.isEmpty { break }
@@ -244,17 +261,15 @@ final class Model: ObservableObject {
                 while let newline = buffer.firstIndex(of: 10) {
                     let text = String(decoding: buffer[buffer.startIndex..<newline], as: UTF8.self)
                     buffer.removeSubrange(buffer.startIndex...newline)
-                    let trimmed = text.trimmingCharacters(in: .whitespaces)
-                    if trimmed.first == "{" || trimmed.first == "[" {
-                        DispatchQueue.main.async { line(text) }
-                    } else if !trimmed.isEmpty {
-                        errors.append(trimmed)
-                    }
+                    DispatchQueue.main.async { line(text) }
                 }
             }
             process.waitUntilExit()
+            try? errorHandle.close()
+            let error = (try? String(contentsOf: errorURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            try? FileManager.default.removeItem(at: errorURL)
             let status = process.terminationStatus
-            DispatchQueue.main.async { done(status, errors.joined(separator: "\n")) }
+            DispatchQueue.main.async { done(status, error) }
         }
     }
 }
@@ -526,7 +541,7 @@ enum Demo {
         model.from = []
         model.to = nil
         model.symbol = "checkmark"
-        model.note = ""
+        model.note = "305 sessions moved"
         model.restartAvailable = true
         snap(2800)
         try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { appendFileSync, readdirSync } from 'node:fs'
-import { appendFile, mkdir, mkdtemp, readdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readdir, readFile, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -33,7 +33,7 @@ const cli = (home, args) => promisify(execFile)(process.execPath, [path.join(her
 }).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }))
 
 async function hold(file) {
-  const guard = spawn('/usr/bin/lockf', ['-k', '-s', '-w', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const guard = spawn('/usr/bin/lockf', ['-k', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
   await once(guard.stdout, 'data')
   return guard
 }
@@ -104,6 +104,9 @@ test('semantic change detection keeps richer output and parse state', () => {
   const rich = { ...plain, toolUseResult: { stdout: 'finished', stderr: '' } }
   assert.notEqual(semantic([a, plain], id(0)), semantic([a, rich], id(0)))
   assert.notEqual(semantic([a, rich], id(0)), semantic([a, rich], id(0), 1))
+  const before = [a, rich, { type: 'relocated', sessionId: id(0), relocatedCwd: '/before' }]
+  const after = [a, rich, { type: 'relocated', sessionId: id(0), relocatedCwd: '/after' }]
+  assert.notEqual(semantic(before, id(0)), semantic(after, id(0)))
 })
 
 test('cli exits nonzero on partial failure and undoes over json', async () => {
@@ -169,6 +172,23 @@ test('a second move cannot cross the kernel lock', async () => {
     guard.stdin.end()
     await exited
   }
+})
+
+test('unreadable Desktop records are counted and fail the move', async () => {
+  const h = await home()
+  const file = path.join(h.dir('P'), `local_${id(934)}.json`)
+  const target = path.join(h.dir('Z'), `local_${id(933)}.json`)
+  await writeFile(file, '{broken')
+  await writeFile(target, '{broken')
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  assert.deepEqual(by[h.acct.P].unreadable, [file])
+  assert.match(by[h.acct.P].stats, /1 unreadable/)
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  assert.equal(inv.total, 1)
+  assert.equal(inv.unreadable.length, 2)
+  const result = await move(inv, by[h.acct.Z], h.paths)
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.receipt.failed.map((failure) => failure.error), ['unreadable Desktop record', 'unreadable Desktop record'])
 })
 
 test('an invalid duplicate is refused, never hidden behind a valid twin', async () => {
@@ -351,6 +371,17 @@ test('sidecar drift after inventory cannot retire the complete target copy', asy
   assert.ok((await readdir(h.dir('Z'))).includes(`local_${older}.json`))
 })
 
+test('unsupported sidecar entries name the path instead of looking like drift', async () => {
+  const h = await home()
+  await h.write(id(984), [entry('user', 984, null, id(984))])
+  const dir = path.join(h.project, id(984))
+  await mkdir(dir, { recursive: true })
+  await symlink('/tmp', path.join(dir, 'linked'))
+  await h.record('P', id(984))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  await assert.rejects(inventory([by[h.acct.P]], by[h.acct.Z], h.paths), /unsupported entry .*linked/)
+})
+
 test('versions that grew apart both move and are counted', async () => {
   const h = await home()
   const m1 = [entry('user', 980, null, id(980)), entry('assistant', 981, 980, id(980))]
@@ -395,6 +426,20 @@ test('verification catches richer source output added after copying', async () =
   const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
   const result = await move(inv, by[h.acct.Z], h.paths, (stage) => {
     if (stage === 'sidecars') appendFileSync(path.join(h.project, `${id(925)}.jsonl`), JSON.stringify({ ...source[1], toolUseResult: { stdout: 'finished', stderr: '' } }) + '\n')
+  })
+  assert.equal(result.ok, false)
+  assert.ok(result.problems.some((p) => p.check === 'sources'))
+})
+
+test('verification catches source relocation after copying', async () => {
+  const h = await home()
+  const source = [entry('user', 923, null, id(923)), { type: 'relocated', sessionId: id(923), relocatedCwd: '/before' }]
+  await h.write(id(923), source)
+  await h.record('P', id(923))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  const result = await move(inv, by[h.acct.Z], h.paths, (stage) => {
+    if (stage === 'sidecars') appendFileSync(path.join(h.project, `${id(923)}.jsonl`), JSON.stringify({ type: 'relocated', sessionId: id(923), relocatedCwd: '/after' }) + '\n')
   })
   assert.equal(result.ok, false)
   assert.ok(result.problems.some((p) => p.check === 'sources'))
@@ -606,6 +651,7 @@ test('move, rerun, undo across accounts', async () => {
 
   const stages = []
   const result = await move(inv, to, h.paths, (stage, text, extra = {}) => { if (!extra.live) stages.push(`${stage} ${text}`) })
+  assert.ok(await readFile(path.join(h.paths.state, 'lock')))
   assert.equal(result.receipt.sessions.length, 6)
   assert.equal(result.receipt.failed.length, 2)
   assert.equal(result.ok, false)

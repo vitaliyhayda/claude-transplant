@@ -19,7 +19,7 @@ const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBr
 const HELP = `claude-transplant   move Claude Code history between accounts, sources untouched
 
   claude-transplant             pick from → to, move, print receipt
-  claude-transplant --dry-run   plan only, write nothing
+  claude-transplant --dry-run   plan only, write nothing, refuses while recovery is pending
   claude-transplant undo        quarantine the last move
   claude-transplant accounts    list accounts
   claude-transplant menubar     install the menubar app, starts at login, --remove uninstalls
@@ -192,9 +192,10 @@ export async function accounts(paths) {
   const out = []
   for (const { account, org, dir, files } of await records(paths.records)) {
     const sessions = []
+    const unreadable = []
     for (const file of files) {
       const r = await readJson(file).catch(() => null)
-      if (!r) continue
+      if (!r) { unreadable.push(file); continue }
       sessions.push({
         file,
         id: UUID.test(r.cliSessionId ?? '') ? r.cliSessionId : null,
@@ -211,8 +212,9 @@ export async function accounts(paths) {
     const email = emails.get(account) ?? null
     const orgName = orgs.get(org) ?? null
     const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
-    const stats = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | —'
-    out.push({ account, org, dir, email, orgName, sessions, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false })
+    const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | —'
+    const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}`
+    out.push({ account, org, dir, email, orgName, sessions, unreadable, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false })
   }
   const mine = out.filter((a) => a.account === cur.account)
   const chosen = mine.find((a) => a.org === cur.org) ?? mine.toSorted((a, b) => b.focusedAt - a.focusedAt)[0]
@@ -318,11 +320,25 @@ export function normalize(entries) {
   return { entries: entries.filter((_, line) => !drop.has(line)), replays, conflicts }
 }
 
+function sessionState(entries, sessionId, origin = new Map()) {
+  const replacements = []
+  let relocated = null
+  for (const e of entries) {
+    if (e.type === 'content-replacement' && e.sessionId === sessionId && Array.isArray(e.replacements)) {
+      for (const replacement of e.replacements) {
+        const copy = structuredClone(replacement)
+        if (typeof copy.uuid === 'string') copy.uuid = origin.get(copy.uuid) ?? copy.uuid
+        replacements.push(copy)
+      }
+    } else if (e.type === 'relocated' && e.sessionId === sessionId && typeof e.relocatedCwd === 'string' && e.relocatedCwd) relocated = e.relocatedCwd
+  }
+  return { replacements, suppressed: entries.some((e) => e.type === 'history-suppression'), relocated }
+}
+
 export function semantic(entries, sessionId, invalid = 0) {
   const normalized = normalize(entries)
   const rows = normalized.entries.filter(message).map((e) => sha(semanticShape(e)))
-  const replacements = entries.filter((e) => e.type === 'content-replacement' && e.sessionId === sessionId).map((e) => sha(stable(e.replacements)))
-  return sha(stable({ rows, replacements, suppressed: entries.some((e) => e.type === 'history-suppression'), invalid, conflicts: normalized.conflicts }))
+  return sha(stable({ rows, state: sessionState(entries, sessionId), invalid, conflicts: normalized.conflicts }))
 }
 
 function derive(entries) {
@@ -419,7 +435,7 @@ async function scanned(id, ctx, cwd = '') {
 
 async function sidecars(transcript, id) {
   const root = path.join(path.dirname(transcript), id)
-  try { return await manifest(root) } catch { return null }
+  return manifest(root)
 }
 
 async function origins(id, ctx, cwd = '') {
@@ -461,21 +477,6 @@ const lineageEvent = (entry) => {
 
 const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && ['stdout', 'stderr'].every((k) => !a[k] || a[k] === b[k])
 
-function lineageState(entries, sessionId, origin) {
-  const replacements = []
-  let relocated = null
-  for (const e of entries) {
-    if (e.type === 'content-replacement' && e.sessionId === sessionId && Array.isArray(e.replacements)) {
-      for (const replacement of e.replacements) {
-        const copy = structuredClone(replacement)
-        if (typeof copy.uuid === 'string') copy.uuid = origin.get(copy.uuid) ?? copy.uuid
-        replacements.push(copy)
-      }
-    } else if (e.type === 'relocated' && e.sessionId === sessionId && typeof e.relocatedCwd === 'string' && e.relocatedCwd) relocated = e.relocatedCwd
-  }
-  return sha(stable({ replacements, suppressed: entries.some((e) => e.type === 'history-suppression'), relocated }))
-}
-
 async function history(id, transcript, ctx, cwd = '') {
   const data = await load(transcript)
   const normalized = normalize(data.entries)
@@ -490,7 +491,7 @@ async function history(id, transcript, ctx, cwd = '') {
     else if (!eventIncluded(shape, prior)) conflicts++
   }
   const roots = new Set(events.keys())
-  const state = lineageState(data.entries, id, origin)
+  const state = sha(stable(sessionState(data.entries, id, origin)))
   const comparable = data.invalid === 0 && conflicts === 0 && roots.size > 0
   const historyKey = comparable ? sha(stable({ events: [...events].sort(([a], [b]) => a.localeCompare(b)), state })) : null
   return { roots, events, state, invalid: data.invalid, conflicts, comparable, historyKey, snapshot: semantic(data.entries, id, data.invalid) }
@@ -502,13 +503,16 @@ const included = (a, b) => historyIncluded(a, b) && carries(a, b)
 const within = (a, b) => included(a, b) && !included(b, a)
 const overlaps = (a, b) => !a.roots.isDisjointFrom(b.roots)
 
-export async function inventory(from, to, paths, skip = new Set()) {
+export async function inventory(from, to, paths) {
   const ctx = { index: await index(paths.pool), scans: new Map() }
   const seen = new Set()
   const missing = []
+  const unreadable = []
   const found = []
   let total = 0
   for (const account of from) {
+    total += account.unreadable?.length ?? 0
+    unreadable.push(...(account.unreadable ?? []).map((file) => ({ file, account })))
     for (const s of account.sessions) {
       total++
       if (!s.id) { missing.push(s); continue }
@@ -522,6 +526,7 @@ export async function inventory(from, to, paths, skip = new Set()) {
       found.push({ ...s, account, transcript, ...detail, forks: forked.size, sidecar: await sidecars(transcript, s.id) })
     }
   }
+  unreadable.push(...(to.unreadable ?? []).map((file) => ({ file, account: to, target: true })))
   const groups = Map.groupBy(found, (s) => s.historyKey ?? `file:${s.transcript}`)
   const picked = [...groups.values()].flatMap((g) => {
     const ordered = g.toSorted((a, b) => a.forks - b.forks || a.createdAt - b.createdAt)
@@ -533,7 +538,7 @@ export async function inventory(from, to, paths, skip = new Set()) {
   for (const [rep, g] of picked) for (const s of g) repOf.set(s.record.sessionId, reps.find((r) => r === rep || within(rep, r)) ?? rep)
   const targets = []
   for (const s of to.sessions) {
-    if (!s.id || skip.has(s.file)) continue
+    if (!s.id) continue
     const transcript = locate(ctx.index, s.id, s.cwd)
     const detail = transcript ? await history(s.id, transcript, ctx, s.cwd) : null
     if (detail?.roots.size) targets.push({ record: s.record.sessionId, ...detail, session: s, transcript, sidecar: await sidecars(transcript, s.id) })
@@ -547,7 +552,7 @@ export async function inventory(from, to, paths, skip = new Set()) {
     return rep ? { record: rep.record.sessionId, target: covering(rep) } : null
   }
   const apart = reps.filter((a) => reps.some((b) => a !== b && overlaps(a, b))).length
-  return { total, missing, twice: found.length - reps.length, apart, there, move, parent, targets, from: from.map((a) => a.label) }
+  return { total, missing, unreadable, twice: found.length - reps.length, apart, there, move, parent, targets, from: from.map((a) => a.label) }
 }
 
 async function one(s, to, targetId, now, journal) {
@@ -652,7 +657,7 @@ async function verify(rows) {
     if (!target || semantic(target.entries, r.targetId, target.invalid) !== r.targetSemantic) flag('provenance', r)
     if (r.linkedTo && (await readJson(r.record).catch(() => ({}))).forkedFromSessionId !== r.linkedTo) flag('lineage', r)
     const targetDir = r.targetDir ?? path.join(path.dirname(r.targetTranscript), r.targetId)
-    const sourceSidecars = await sidecars(r.transcript, r.id)
+    const sourceSidecars = await sidecars(r.transcript, r.id).catch(() => null)
     const targetSidecars = await manifest(targetDir).catch(() => null)
     if (!sourceSidecars || !targetSidecars || sourceSidecars.sha !== r.sidecars.sha || targetSidecars.sha !== r.sidecars.sha) flag('sidecars', r)
     const raw = await readFile(r.record, 'utf8').catch(() => null)
@@ -795,10 +800,11 @@ async function retire(inv, ours, receipt, paths, at, problems, save) {
     if (bad.has(row.targetId)) continue
     const s = inv.move.find((m) => m.id === row.id)
     if (!s) continue
-    const sourceSidecars = await sidecars(row.transcript, row.id)
+    const candidates = inv.targets.filter((target) => !plan.some((item) => item.id === target.session.id) && ours.has(target.session.id) && target.transcript && included(target, s))
+    if (!candidates.length) continue
+    const sourceSidecars = await sidecars(row.transcript, row.id).catch(() => null)
     if (await changed(row.transcript, row.id, sourceKnownOf(row)) || !sourceSidecars || sourceSidecars.sha !== row.sidecars.sha) continue
-    for (const t of inv.targets) {
-      if (plan.some((p) => p.id === t.session.id) || !ours.has(t.session.id) || !t.transcript || !included(t, s)) continue
+    for (const t of candidates) {
       if (await changed(t.transcript, t.session.id, ours.get(t.session.id))) continue
       const dest = path.join(paths.state, 'quarantine', at, 'superseded')
       const items = [t.transcript, path.join(path.dirname(t.transcript), t.session.id), t.session.file]
@@ -824,7 +830,8 @@ async function transfer(inv, to, paths, report) {
   const ours = await created(paths)
   const started = Date.now()
   const at = stamp()
-  const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: [], superseded: [], finalizing: true }
+  const unreadable = inv.unreadable.map((item) => ({ id: null, title: `${item.account.label} | ${path.basename(item.file)}`, error: 'unreadable Desktop record' }))
+  const receipt = { at, from: inv.from, to: to.label, sessions: [], failed: unreadable, superseded: [], finalizing: true }
   const file = path.join(paths.state, `${at}.json`)
   const save = () => saveJson(file, receipt)
   let events = 0
@@ -1118,8 +1125,8 @@ async function main(argv) {
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
     if (args.json) {
-      return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, activeAt }) => ({
-        account, org, email, orgName, label, stats, active, sessions: sessions.length, activeAt
+      return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, unreadable, activeAt }) => ({
+        account, org, email, orgName, label, stats, active, sessions: sessions.length, unreadable: unreadable.length, activeAt
       })))
     }
     if (!all.length) return out.write('no accounts found\n')
@@ -1143,6 +1150,7 @@ async function main(argv) {
   const summary = (inv) => report('inventory', [
     `${count(inv.total)} records`,
     inv.missing.length ? `${count(inv.missing.length)} without history` : null,
+    inv.unreadable.length ? `${count(inv.unreadable.length)} unreadable` : null,
     inv.twice ? `${count(inv.twice)} older versions skipped` : null,
     inv.apart ? `${count(inv.apart)} grew apart, all kept` : null,
     inv.there.length ? `${count(inv.there.length)} already there` : null,
@@ -1161,7 +1169,11 @@ async function main(argv) {
     }
     const inv = await inventory(from, to, paths)
     summary(inv)
-    return args.json ? emit({ done: true, ok: true, dry: true, moved: 0, planned: inv.move.length }) : out.write(inv.move.length ? '  dry run     nothing written\n' : '  nothing to move\n')
+    if (inv.unreadable.length) process.exitCode = 1
+    const failures = inv.unreadable.map((item) => ({ title: `${item.account.label} | ${path.basename(item.file)}`, error: 'unreadable Desktop record' }))
+    return args.json
+      ? emit({ done: true, ok: !failures.length, dry: true, moved: 0, planned: inv.move.length, failed: failures })
+      : out.write(inv.move.length ? '  dry run     nothing written\n' : failures.length ? '  dry run     unreadable records must be repaired\n' : '  nothing to move\n')
   }
   const result = await locked(paths, async () => {
     const reconciled = await reconcile(paths)
@@ -1171,7 +1183,7 @@ async function main(argv) {
     const currentTo = fresh(latest, to)
     const inv = await inventory(currentFrom, currentTo, paths)
     summary(inv)
-    return inv.move.length ? transfer(inv, currentTo, paths, report) : null
+    return inv.move.length || inv.unreadable.length ? transfer(inv, currentTo, paths, report) : null
   })
   if (!result) return args.json ? emit({ done: true, ok: true, moved: 0 }) : out.write('  nothing to move\n')
   const { file, receipt, checks, problems, ok } = result
