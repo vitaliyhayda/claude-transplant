@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import UserNotifications
 
@@ -41,6 +42,7 @@ struct Event: Decodable {
     let done: Bool?
     let ok: Bool?
     let moved: Int?
+    let retired: Int?
     let failed: [Failure]?
     let problems: [Problem]?
     let note: String?
@@ -49,7 +51,9 @@ struct Event: Decodable {
     let retry: Bool?
     let undone: String?
     let sessions: Int?
+    let restored: Int?
     let refused: [String]?
+    let reason: String?
     let nothing: Bool?
 }
 
@@ -70,6 +74,7 @@ final class Model: ObservableObject {
     @Published var restartAvailable = false
     let demo: Bool
     private let config: Config?
+    private var refreshing = false
 
     init(demo: Bool = false) {
         self.demo = demo
@@ -94,15 +99,31 @@ final class Model: ObservableObject {
     }
 
     func toggle(_ id: String) {
+        if from.isEmpty { clearResult() }
         if from.contains(id) { from.remove(id) } else { from.insert(id) }
         if to == id { to = nil }
         if remaining.count == 1 { to = remaining[0].id }
     }
 
+    func panelVisibility(_ visible: Bool) {
+        if visible { refresh() }
+        else if !running { clearResult() }
+    }
+
+    private func clearResult() {
+        lines = []
+        note = ""
+        restartAvailable = false
+    }
+
     func refresh() {
+        guard !refreshing else { return }
+        refreshing = true
         var text = ""
         run(["accounts", "--json"], line: { text += $0 }) { [weak self] _, _ in
-            guard let self, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
+            guard let self else { return }
+            refreshing = false
+            guard let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             from = from.filter { id in list.contains { $0.id == id } }
             if let current = to, !list.contains(where: { $0.id == current }) { to = nil }
@@ -151,8 +172,10 @@ final class Model: ObservableObject {
             }
             let problems = event.problems ?? []
             for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
+            let retired = event.retired ?? 0
+            let idle = retired == 0 ? "Nothing to move" : "\(retired) source entries retired"
             let movedText = moved == 0
-                ? (failed.isEmpty ? "Nothing to move" : "\(failed.count) failed")
+                ? (failed.isEmpty ? idle : "\(failed.count) failed")
                 : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")
             let summary = movedText + (problems.isEmpty ? "" : ", verification failed")
             restartAvailable = event.restart ?? false
@@ -161,9 +184,10 @@ final class Model: ObservableObject {
         } else if event.undone != nil {
             restartAvailable = event.restart ?? false
             note = restartAvailable ? "" : event.note ?? ""
-            notify("\(event.sessions ?? 0) sessions undone", event.note ?? "")
+            let restored = event.restored ?? 0
+            notify(restored > 0 ? "\(restored) source entries restored" : "\(event.sessions ?? 0) sessions undone", event.note ?? "")
         } else if let refused = event.refused {
-            note = "Undo refused, \(refused.count) sessions changed since the move"
+            note = event.reason ?? "Undo refused, \(refused.count) sessions changed since the move"
             restartAvailable = false
             lines = refused.map { ("kept", $0) }
         } else if event.nothing == true {
@@ -385,6 +409,11 @@ struct Panel: View {
         }
         .padding(18)
         .frame(width: 520)
+        .onAppear { if !model.demo { model.panelVisibility(true) } }
+        .onDisappear { if !model.demo { model.panelVisibility(false) } }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
+            if !model.demo, let window = note.object as? NSWindow { model.panelVisibility(window.occlusionState.contains(.visible)) }
+        }
     }
 
     private func block<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -473,7 +502,7 @@ struct Screen: View {
             }
             Cursor().offset(x: cursor.x, y: cursor.y)
         }
-        .frame(width: 760, height: 500, alignment: .topLeading)
+        .frame(width: 760, height: 530, alignment: .topLeading)
         .environment(\.colorScheme, .dark)
     }
 }
@@ -536,6 +565,8 @@ enum Demo {
         model.lines.append(("desktop", "305 records | 240 archived | 65 active"))
         snap(350)
         model.lines.append(("verify", "provenance ✓ | lineage ✓ | sidecars ✓ | desktop ✓ | sources unchanged ✓ | 38s"))
+        snap(350)
+        model.lines.append(("retired", "305 source records → quarantine | transcripts untouched"))
         snap(500)
         model.running = false
         model.from = []
