@@ -489,12 +489,7 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            if model.demo {
-                accountLists
-            } else {
-                ScrollView { accountLists }
-                    .frame(height: min(310, 48 + CGFloat(model.accounts.count) * 44))
-            }
+            accountLists
             if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
             ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -538,15 +533,24 @@ struct Panel: View {
 
     private var accountLists: some View {
         VStack(alignment: .leading, spacing: 14) {
-            accountBlock("From") {
-                ForEach(model.accounts) { account in
-                    AccountRow(account: account, selected: model.from.contains(account.id), radio: false) { model.toggle(account.id) }
-                }
-            }
-            accountBlock("To") {
-                ForEach(model.accounts) { account in
-                    AccountRow(account: account, selected: model.to == account.id, radio: true) { model.selectTarget(account.id) }
-                }
+            accountBlock("From") { accountList(radio: false) }
+            accountBlock("To") { accountList(radio: true) }
+        }
+    }
+
+    @ViewBuilder private func accountList(radio: Bool) -> some View {
+        if model.demo || model.accounts.count <= 5 {
+            accountRows(radio: radio)
+        } else {
+            ScrollView { accountRows(radio: radio) }
+                .frame(height: 140)
+        }
+    }
+
+    private func accountRows(radio: Bool) -> some View {
+        ForEach(model.accounts) { account in
+            AccountRow(account: account, selected: radio ? model.to == account.id : model.from.contains(account.id), radio: radio) {
+                radio ? model.selectTarget(account.id) : model.toggle(account.id)
             }
         }
     }
