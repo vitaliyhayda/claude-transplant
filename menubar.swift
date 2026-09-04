@@ -713,8 +713,12 @@ struct Panel: View {
 
 enum Snapshot {
     @MainActor
-    static func data(_ model: Model) -> Data? {
-        let renderer = ImageRenderer(content: Panel().environmentObject(model).background(Color(white: 0.11)).environment(\.colorScheme, .dark))
+    static func data(_ model: Model, size: CGSize? = nil) -> Data? {
+        let panel = Panel().environmentObject(model).environment(\.colorScheme, .dark)
+        let content = Group {
+            if let size { panel.frame(width: size.width, height: size.height, alignment: .top) } else { panel }
+        }.background(Color(white: 0.11))
+        let renderer = ImageRenderer(content: content)
         renderer.scale = 2
         guard let tiff = renderer.nsImage?.tiffRepresentation else { return nil }
         return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
@@ -741,8 +745,15 @@ enum Demo {
         let root = URL(fileURLWithPath: directory)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var durations: [Int] = []
+        model.lines = [("inventory", "308 records | 3 already there | 305 to move"), ("move", "305 ✓ | zero-copy"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
+        model.note = "305 sessions moved"
+        model.restartAvailable = true
+        let size = ImageRenderer(content: Panel().environmentObject(model).environment(\.colorScheme, .dark)).nsImage?.size
+        model.lines = []
+        model.note = ""
+        model.restartAvailable = false
         func snap(_ milliseconds: Int) {
-            guard let png = Snapshot.data(model) else { exit(1) }
+            guard let png = Snapshot.data(model, size: size) else { exit(1) }
             try? png.write(to: root.appendingPathComponent(String(format: "frame-%03d.png", durations.count)))
             durations.append(milliseconds)
         }
