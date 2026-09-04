@@ -84,7 +84,7 @@ final class Model: ObservableObject {
     @Published var accounts: [Account] = []
     @Published var from: Set<String> = []
     @Published var to: String?
-    @Published var manual = false
+    @Published var excluded: Set<String> = []
     @Published var lanes: [String: String] = [:]
     @Published var lines: [(String, String)] = []
     @Published var note = ""
@@ -154,8 +154,8 @@ final class Model: ObservableObject {
     func toggle(_ id: String) {
         guard let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
         clearResult()
-        manual = true
-        if from.contains(id) { from.remove(id) } else { from.insert(id) }
+        if from.contains(id) { excluded.insert(id) } else { excluded.remove(id) }
+        settle()
     }
 
     func selectTarget(_ id: String) {
@@ -179,8 +179,8 @@ final class Model: ObservableObject {
         var free = ids.filter { id in !next.values.contains(id) }.makeIterator()
         for id in ids where next[id] == nil { if let source = free.next() { next[id] = source } }
         lanes = next
-        let eligible = accounts.filter(canSource).map(\.id)
-        from = manual ? from.filter { eligible.contains($0) } : Set(eligible)
+        excluded = excluded.filter { ids.contains($0) }
+        from = Set(accounts.filter(canSource).map(\.id)).subtracting(excluded)
     }
 
     func panelVisibility(_ visible: Bool) {
@@ -366,7 +366,7 @@ final class Model: ObservableObject {
         badge = ""
         progressCompleted = nil
         progressTotal = nil
-        manual = false
+        excluded = []
         to = nil
         symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
         if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
