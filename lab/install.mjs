@@ -68,17 +68,19 @@ const script = path.join(app, 'Contents/Resources/transplant.js')
 await copyFile(path.join(ROOT, 'transplant.js'), script)
 await writeFile(path.join(state, 'menubar.json'), `${JSON.stringify({ node: process.execPath, script, state })}\n`)
 
+const sample = args.indexOf('--sample')
+const extra = sample >= 0 ? ['--sample', String(Number(args[sample + 1]) || 10)] : []
 const snapshot = args.indexOf('--snapshot')
 if (snapshot >= 0) {
   const out = path.resolve(args[snapshot + 1] ?? 'lab-panel.png')
-  const shot = spawnSync(binary, ['--snapshot', out], { encoding: 'utf8' })
+  const shot = spawnSync(binary, ['--snapshot', out, ...extra], { encoding: 'utf8' })
   if (shot.status !== 0) throw new Error(`snapshot failed\n${shot.stderr.trim()}`)
   console.log(`snapshot written | ${out}`)
   process.exit(0)
 }
 
 await mkdir(path.dirname(agent), { recursive: true })
-await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary], RunAtLoad: true }))
+await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary, ...extra], RunAtLoad: true }))
 const load = spawnSync('launchctl', ['bootstrap', domain, agent], { encoding: 'utf8' })
 if (load.status !== 0) throw new Error(`launchctl failed: ${(load.stderr || '').trim()}`)
 console.log(`lab menubar installed | starts at login | ${app}`)

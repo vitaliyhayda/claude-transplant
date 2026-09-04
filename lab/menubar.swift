@@ -94,18 +94,20 @@ final class Model: ObservableObject {
     @Published var progressCompleted: Int?
     @Published var progressTotal: Int?
     let snapshot: Bool
+    let sample: Int
     private let config: Config?
     private var refreshing = false
     private var pendingResult = false
 
-    init(snapshot: Bool = false) {
+    init(snapshot: Bool = false, sample: Int = 0) {
         self.snapshot = snapshot
+        self.sample = sample
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant-lab/menubar.json")
         config = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
         if snapshot {
             if let config {
                 let text = Model.capture(node(config.node), [config.script, "accounts", "--json"], state: config.state)
-                accounts = (try? JSONDecoder().decode([Account].self, from: Data(text.utf8))) ?? []
+                accounts = padded((try? JSONDecoder().decode([Account].self, from: Data(text.utf8))) ?? [])
             }
             settle()
             return
@@ -114,11 +116,22 @@ final class Model: ObservableObject {
         refresh()
     }
 
+    private func padded(_ real: [Account]) -> [Account] {
+        guard sample > real.count else { return real }
+        let plans = ["Personal", "Acme Inc.", "Northwind"]
+        let extra = (real.count..<sample).map { i in
+            Account(account: "sample-\(i)", org: "org-\(i % 3)", email: "person\(i)@example.com", orgName: plans[i % 3], label: "person\(i)@example.com · \(plans[i % 3])", active: false, sessions: (i * 37) % 120, activeAt: Double(1_700_000_000_000 - i * 86_400_000), pending: nil, pendingFailures: nil)
+        }
+        return real + extra
+    }
+
+    private func synthetic(_ id: String?) -> Bool { id?.hasPrefix("sample-") == true }
+
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
     var canKeepLocal: Bool { !running && pendingAccounts.contains { $0.pending == "cloud" } }
     var pendingReady: Bool { !running && activePendingAccount != nil && config != nil }
-    var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && config != nil }
+    var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && config != nil && !synthetic(to) && !from.contains(where: synthetic) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
         let labels = pendingAccounts.map(\.label).joined(separator: " or ")
@@ -179,7 +192,7 @@ final class Model: ObservableObject {
             guard let self else { return }
             refreshing = false
             guard let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
-            accounts = list
+            accounts = padded(list)
             settle()
         }
     }
@@ -433,7 +446,7 @@ struct Row: View {
                 Image(systemName: selected ? (radio ? "largecircle.fill.circle" : "checkmark.circle.fill") : "circle")
                     .font(.system(size: 15))
                     .foregroundStyle(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 0) {
                     Text(account.name).font(.system(size: 13, weight: selected ? .semibold : .medium)).lineLimit(1).truncationMode(.middle)
                     HStack(spacing: 6) {
                         Text(account.plan).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
@@ -443,7 +456,7 @@ struct Row: View {
                 }
                 Spacer(minLength: 0)
             }
-            .frame(height: 40)
+            .frame(height: 34)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -504,8 +517,8 @@ struct Bundle: Shape {
             let c2 = CGPoint(x: end.x - span * 0.45, y: end.y)
             path.move(to: start)
             path.addCurve(to: end, control1: c1, control2: c2)
-            let mid = Bundle.point(start, c1, c2, end)
-            let tangent = Bundle.tangent(start, c1, c2, end)
+            let mid = Bundle.point(start, c1, c2, end, 0.45)
+            let tangent = Bundle.tangent(start, c1, c2, end, 0.45)
             let length = max(0.001, hypot(tangent.x, tangent.y))
             let u = CGPoint(x: tangent.x / length, y: tangent.y / length)
             let n = CGPoint(x: -u.y, y: u.x)
@@ -519,12 +532,16 @@ struct Bundle: Shape {
         return path
     }
 
-    private static func point(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint) -> CGPoint {
-        CGPoint(x: (p0.x + 3 * p1.x + 3 * p2.x + p3.x) / 8, y: (p0.y + 3 * p1.y + 3 * p2.y + p3.y) / 8)
+    private static func point(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: Double) -> CGPoint {
+        let u = 1 - t
+        let a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t
+        return CGPoint(x: a * p0.x + b * p1.x + c * p2.x + d * p3.x, y: a * p0.y + b * p1.y + c * p2.y + d * p3.y)
     }
 
-    private static func tangent(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint) -> CGPoint {
-        CGPoint(x: 0.75 * (p1.x - p0.x) + 1.5 * (p2.x - p1.x) + 0.75 * (p3.x - p2.x), y: 0.75 * (p1.y - p0.y) + 1.5 * (p2.y - p1.y) + 0.75 * (p3.y - p2.y))
+    private static func tangent(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: Double) -> CGPoint {
+        let u = 1 - t
+        let a = 3 * u * u, b = 6 * u * t, c = 3 * t * t
+        return CGPoint(x: a * (p1.x - p0.x) + b * (p2.x - p1.x) + c * (p3.x - p2.x), y: a * (p1.y - p0.y) + b * (p2.y - p1.y) + c * (p3.y - p2.y))
     }
 }
 
@@ -610,10 +627,11 @@ struct Panel: View {
     @EnvironmentObject private var model: Model
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text("Claude Transplant").font(.system(.title3, design: .rounded, weight: .semibold))
                 Tag(text: "lab", color: .purple)
+                if model.sample > 0 { Tag(text: "sample accounts", color: .orange) }
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
@@ -647,8 +665,8 @@ struct Panel: View {
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
         }
-        .padding(18)
-        .frame(width: 640)
+        .padding(16)
+        .frame(width: 2 * columnWidth + Panel.gap + 32)
         .onAppear { if !model.snapshot { model.panelVisibility(true) } }
         .onDisappear { if !model.snapshot { model.panelVisibility(false) } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
@@ -665,7 +683,7 @@ struct Panel: View {
                 }
             }
             .frame(width: width, alignment: .leading)
-            Spacer(minLength: 72)
+            Spacer(minLength: Panel.gap)
             column("To") {
                 ForEach(model.accounts) { account in
                     Row(account: account, radio: true, selected: model.to == account.id, muted: false) { model.selectTarget(account.id) }
@@ -685,12 +703,14 @@ struct Panel: View {
             let tags = CGFloat((account.active == true ? 48 : 0) + (account.pending != nil ? 54 : 0))
             return max((account.name as NSString).size(withAttributes: name).width, (account.plan as NSString).size(withAttributes: plan).width + tags)
         }.max() ?? 0
-        return min(266, max(180, 44 + ceil(widest)))
+        return min(300, max(180, 44 + ceil(widest)))
     }
 
+    static let gap: CGFloat = 150
+
     private func column<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title.uppercased()).font(.caption2.weight(.semibold)).tracking(0.8).foregroundStyle(.secondary).padding(.bottom, 2)
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title.uppercased()).font(.caption2.weight(.semibold)).tracking(0.8).foregroundStyle(.secondary).padding(.bottom, 4)
             content()
         }
     }
@@ -713,13 +733,14 @@ struct TransplantLabApp: App {
 
     init() {
         let args = CommandLine.arguments
+        let sample = args.firstIndex(of: "--sample").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 0
         if let index = args.firstIndex(of: "--snapshot"), index + 1 < args.count {
-            let model = Model(snapshot: true)
+            let model = Model(snapshot: true, sample: sample)
             _model = StateObject(wrappedValue: model)
             let file = args[index + 1]
             DispatchQueue.main.async { Snapshot.write(model, to: file) }
         } else {
-            _model = StateObject(wrappedValue: Model())
+            _model = StateObject(wrappedValue: Model(sample: sample))
         }
     }
 
