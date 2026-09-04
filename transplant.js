@@ -2431,7 +2431,7 @@ export function keepLocal(paths) {
     }
     const to = (await accounts(paths)).find((account) => sameAccount(account, receipt.toAccount))
     const existing = (receipt.superseded ?? []).filter((row) => row.source && !receipt.sessions.some((session) => session.targetId === row.by))
-    refused.push(...await restoreProblems(existing, path.join(paths.state, 'quarantine')))
+    refused.push(...await restoreProblems(receipt.superseded ?? [], path.join(paths.state, 'quarantine')))
     const sourceSessions = []
     for (const source of existing) {
       const file = source.moved?.[0]?.[1]
@@ -2718,7 +2718,7 @@ async function main(argv) {
     if (result.nothing) return out.write('nothing pending\n')
     if (result.recoveryRequired) return out.write('  refused     recovery must finish before cloud checks can be cancelled\n')
     if (result.refused) return out.write(`  refused     ${result.refused.join('\n              ')}\n`)
-    return out.write(`  kept local  ${result.cancelled} cloud checks cancelled\n`)
+    return out.write(`  kept local  ${quantity(result.cancelled, 'cloud check')} cancelled\n`)
   }
   if (args.cmd === 'finish') {
     const report = reporter(args.json)

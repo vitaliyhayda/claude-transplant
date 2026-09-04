@@ -239,16 +239,16 @@ final class Model: ObservableObject {
             for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
             let retired = event.retired ?? 0
             var outcomes: [String] = []
-            if moved - rescued > 0 { outcomes.append("\(moved - rescued) sessions moved") }
-            if rescued > 0 { outcomes.append("\(rescued) remote branches rescued") }
-            if cloudArchived > 0 { outcomes.append("\(cloudArchived) cloud mirrors archived") }
-            if cloudChecked > 0 { outcomes.append("\(cloudChecked) cloud source checked") }
-            if cloudRestored > 0 { outcomes.append("\(cloudRestored) cloud mirrors restored") }
-            if newerCloud > 0 { outcomes.append("\(newerCloud) newer cloud sessions left for next move") }
-            if pendingCloud > 0 { outcomes.append("\(pendingCloud) cloud \(pendingCloud == 1 ? "check" : "checks") pending") }
+            if moved - rescued > 0 { outcomes.append(quantity(moved - rescued, "session moved", "sessions moved")) }
+            if rescued > 0 { outcomes.append(quantity(rescued, "remote branch rescued", "remote branches rescued")) }
+            if cloudArchived > 0 { outcomes.append(quantity(cloudArchived, "cloud mirror archived", "cloud mirrors archived")) }
+            if cloudChecked > 0 { outcomes.append(quantity(cloudChecked, "cloud source checked", "cloud sources checked")) }
+            if cloudRestored > 0 { outcomes.append(quantity(cloudRestored, "cloud mirror restored", "cloud mirrors restored")) }
+            if newerCloud > 0 { outcomes.append(quantity(newerCloud, "newer cloud session left for next move", "newer cloud sessions left for next move")) }
+            if pendingCloud > 0 { outcomes.append(quantity(pendingCloud, "cloud check pending", "cloud checks pending")) }
             if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
-            if keptLocal > 0 { outcomes.append("Local move kept, \(keptLocal) cloud checks cancelled") }
-            if moved == 0, retired > 0 { outcomes.append("\(retired) source entries retired") }
+            if keptLocal > 0 { outcomes.append("Local move kept, " + quantity(keptLocal, "cloud check cancelled", "cloud checks cancelled")) }
+            if moved == 0, retired > 0 { outcomes.append(quantity(retired, "source entry retired", "source entries retired")) }
             if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
             if !problems.isEmpty { outcomes.append("verification failed") }
             let summary = outcomes.isEmpty ? "Nothing to move" : outcomes.joined(separator: ", ")
@@ -260,7 +260,7 @@ final class Model: ObservableObject {
             note = restartAvailable ? "" : event.note ?? ""
             let restored = event.restored ?? 0
             let cloudRestored = event.cloudRestored ?? 0
-            notify(cloudRestored > 0 ? "\(cloudRestored) cloud mirrors restored" : restored > 0 ? "\(restored) source entries restored" : "\(event.sessions ?? 0) sessions undone", event.note ?? "")
+            notify(cloudRestored > 0 ? quantity(cloudRestored, "cloud mirror restored", "cloud mirrors restored") : restored > 0 ? quantity(restored, "source entry restored", "source entries restored") : quantity(event.sessions ?? 0, "session undone", "sessions undone"), event.note ?? "")
         } else if let refused = event.refused {
             note = event.reason ?? "Undo refused, \(refused.count) sessions changed since the move"
             restartAvailable = false
@@ -273,6 +273,10 @@ final class Model: ObservableObject {
 
     private func identity(_ title: String?, _ id: String?) -> String {
         [title, id.map { String($0.prefix(8)) }].compactMap { $0 }.joined(separator: " | ")
+    }
+
+    private func quantity(_ value: Int, _ singular: String, _ plural: String) -> String {
+        "\(value) \(value == 1 ? singular : plural)"
     }
 
     func restartDesktop() {

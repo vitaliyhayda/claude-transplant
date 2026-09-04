@@ -1279,6 +1279,22 @@ test('Keep local rejects a quarantined source record changed after retirement', 
   assert.equal(kept.receipt.cloudChecks[0].status, 'pending')
 })
 
+test('Keep local validates quarantine for a source rehomed by this move', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 46, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Moved quarantine source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  const parked = moved.receipt.superseded.find((row) => row.source).moved[0][1]
+  await writeFile(parked, `${await readFile(parked, 'utf8')} `)
+  const kept = await keepLocal(h.paths)
+
+  assert.match(kept.refused[0], /recovery artifact changed/)
+  assert.equal(kept.receipt.cloudChecks[0].status, 'pending')
+})
+
 test('a source cloud outage never blocks its eligible local move', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
