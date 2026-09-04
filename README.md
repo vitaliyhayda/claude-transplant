@@ -6,7 +6,7 @@
 
 ## What it does
 
-Claude Desktop lists each Claude Code session under the account and organization that created it. Switch accounts and the history stays behind. claude-transplant moves every eligible local Desktop record immediately, regardless of which account is signed in. The transcript and sidecars stay where they are, the session keeps its id, nothing is copied. Remote Control checks run for the active source and stay pending for the others until you sign into one and click Finish pending. No model runs and no artifact is recreated. `undo` restores completed work and cancels unchecked cloud sources as one logical move. macOS only.
+Claude Desktop lists each Claude Code session under the account and organization that created it. Switch accounts and the history stays behind. claude-transplant moves every eligible local Desktop record immediately, regardless of which account is signed in. The transcript and sidecars stay where they are, the session keeps its id, nothing is copied. Remote Control checks run for the active source and stay pending for the others until you sign into one and click Finish pending. No model runs and no artifact is recreated. `undo` restores completed work and cancels unfinished cloud sources as one logical move. macOS only.
 
 ## Install
 
@@ -19,7 +19,7 @@ npx claude-transplant
 
 To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v2.2.0` or a commit hash to pin.
 
-The menubar app shows one account list with FROM and TO controls, starts at login, shows progress in the icon, and posts a notification when done. Click a TO account first and every other account becomes a source, then click Move. Manual FROM choices stay intact when the destination changes, except the destination itself is removed from FROM. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one of them is active. The app bundles its own copy of the CLI, so run the menubar command again after upgrading. `menubar --remove` uninstalls. The animation above is rendered by the app itself with `--demo <dir>`.
+The menubar app shows one account list with FROM and TO controls, starts at login, shows progress in the icon, and posts a notification when done. Click a TO account first and every other account becomes a source, then click Move. Manual FROM choices stay intact when the destination changes, except the destination itself is removed from FROM. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one of them is active. Keep local abandons pending or failed cloud work without reversing successful local movement. The app bundles its own copy of the CLI, so run the menubar command again after upgrading. `menubar --remove` uninstalls. The animation above is rendered by the app itself with `--demo <dir>`.
 
 ```
 From  ↑↓ move · space select · enter next
@@ -49,10 +49,10 @@ To    ↑↓ move · enter confirm
 | Command | Effect |
 |---|---|
 | `claude-transplant` | pick From and To, move, print a receipt |
-| `claude-transplant --dry-run` | plan only and write nothing, refuses pending recovery, with `--cloud` it reads remote metadata and history |
+| `claude-transplant --dry-run` | plan only and write nothing, refuses crash recovery or an open move, with `--cloud` it reads remote metadata and history |
 | `claude-transplant undo` | quarantine the last move, restore the source entries, refused if a target changed or a source cannot be restored |
 | `claude-transplant finish` | check the active pending source, retry its failures, or continue a staged cloud Undo |
-| `claude-transplant keep-local` | cancel unchecked cloud sources without reversing completed local movement |
+| `claude-transplant keep-local` | cancel pending or failed cloud sources without reversing completed local movement |
 | `claude-transplant accounts` | list accounts |
 | `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
@@ -73,8 +73,9 @@ To    ↑↓ move · enter confirm
 - cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads, with no model call
 - cloud blocked: no unambiguous local anchor, an unsupported payload, a connected worker, changed history, or an account mismatch, left active and named
 - cloud checks pending: sources that still need their own authenticated Remote Control inventory, including zero-record sources
+- newer cloud sessions: rows created after Move, named and left for the next move
 
-Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, and Desktop's agent-mode records. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, session count, last activity, and most common project folder.
+Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, and Desktop's agent-mode records. Known login pairs appear even before their Desktop record directory exists. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, session count, last activity, and most common project folder.
 
 ## How it works
 
@@ -82,7 +83,7 @@ A session is three files that can disagree: the transcript in `~/.claude/project
 
 Remote Control adds a fourth, server-owned layer. With `--cloud`, claude-transplant reads whichever selected source is active through Claude Desktop's authenticated session and hashes durable user and assistant message shapes. Every other selected source becomes a pending cloud check on the same receipt while its eligible local records still move. Sign into a pending source and run `finish`, or click Finish pending, to inspect it without repeating the local move. A failed source keeps its remote session active and remains retryable. If one local target contains the remote history, that record becomes the destination. A bridge id links the remote row to its local session when available. Otherwise, one same-title target must share eight consecutive exact remote messages before it can anchor a separate companion whose supported remote message payloads are copied exactly into a new local transcript. The anchor supplies local project metadata and a narrow allowlist of project, display, and model settings because the remote endpoint does not expose a local working directory. Anchor-only prompt, browser, permission, spawn, and runtime state is discarded, and permission mode resets to default. The tool checks that the remote worker is disconnected and unchanged before archiving its source mirror. Cookies are decrypted in memory through macOS Keychain, sent only to `claude.ai`, and never printed or stored.
 
-One receipt owns the local move, completed cloud checks, failures, retries, and unchecked sources. A delayed check includes only Remote Control sessions created no later than that original Move, so it never sweeps later work into an older instruction. Another move cannot start until that receipt is complete, kept local, or undone. Keep local cancels the unchecked cloud work without reversing completed local movement. Undo cancels unchecked cloud sources and reverses the whole move. If several source accounts already archived cloud mirrors, Undo restores the mirrors available under the current login and asks for each remaining source login before reversing the local records. No completed layer is silently abandoned.
+One receipt owns the local move, completed cloud checks, failures, retries, and unfinished sources. A delayed check includes only Remote Control sessions created no later than that original Move, so it never sweeps later work into an older instruction. Rows created later are named and left for the next move. Another move cannot start until that receipt is complete, kept local, or undone. Keep local cancels pending or failed cloud work without reversing completed local movement. Undo cancels unfinished cloud sources and reverses the whole move. If several source accounts already archived cloud mirrors, Undo restores the mirrors available under the current login and asks for each remaining source login before reversing the local records. No completed layer is silently abandoned.
 
 A move is eligible when the history is a single comparable version, the record filename and identity are valid, no scheduled task, notification route, or running worker owns it, the parent record is already in the target or moves first in the same batch, and the target has no id collision. Everything else is refused with a named reason.
 
@@ -100,6 +101,7 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 - Remote rescue copies supported payloads exactly. It does not ask a model to reconstruct history.
 - Local transcripts stay local. Remote Control reconciliation uses Claude Desktop's current `claude.ai` session only when `--cloud` is present, with no credential persistence.
 - Pending cloud checks never run automatically. The user signs into the named source and clicks Finish pending.
+- Keep local cancels pending or failed checks only after completed local targets still verify.
 - One JavaScript file, no dependencies, Node 22. The menubar is one Swift file.
 
 ## Not done, and why

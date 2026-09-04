@@ -38,6 +38,7 @@ const remoteState = (status, extra = {}) => ({
   ...extra
 })
 const remoteRows = (entries) => entries.map((payload, sequence_num) => ({ event_type: payload.type, payload, sequence_num, created_at: payload.timestamp }))
+const remoteSession = (extra = {}) => ({ created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active', ...extra })
 const branchEntries = (count, session, start) => Array.from({ length: count }, (_, index) => entry(index % 2 ? 'assistant' : 'user', start + index, index ? start + index - 1 : null, session))
 const cli = (home, args) => promisify(execFile)(process.execPath, [path.join(here, 'transplant.js'), ...args], {
   env: { ...process.env, HOME: home },
@@ -206,7 +207,7 @@ test('human CLI names staged Undo instead of printing false success', async () =
   await writeFile(path.join(h.paths.state, `${at}.json`), JSON.stringify(receipt))
   const result = await cli(h.root, ['undo'])
 
-  assert.equal(result.code, 0)
+  assert.equal(result.code, 1)
   assert.match(result.stdout, /pending.*t@example.com · Team T/i)
   assert.doesNotMatch(result.stdout, /quarantine\s+undefined/)
   assert.doesNotMatch(result.stdout, /shared transcripts unchanged/)
@@ -507,6 +508,8 @@ test('a target without a Desktop record id never covers and retires a valid sour
   assert.equal(inv.there.length, 0)
   assert.equal(inv.move.length, 0)
   assert.match(inv.blocked[0].error, /target session id collision/)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
 })
 
@@ -1002,6 +1005,22 @@ async function home() {
   return { root, paths, project, acct, org, dir, record, write }
 }
 
+test('accounts includes a known login organization with no Desktop directory', async () => {
+  const h = await home()
+  const account = id(920)
+  const org = id(921)
+  const profile = path.join(h.root, '.claude-known')
+  await mkdir(profile)
+  await writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress: 'known@example.com', organizationName: 'Known Team', organizationType: 'team' }
+  }))
+  const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
+
+  assert.equal(row.label, 'known@example.com · Known Team')
+  assert.equal(row.sessions.length, 0)
+  assert.equal(await stat(row.dir).then(() => true, () => false), false)
+})
+
 test('same-account organization moves rehome one record without copying history', async () => {
   const h = await home()
   const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
@@ -1178,6 +1197,22 @@ test('Keep local cancels pending cloud checks without reversing completed local 
   assert.equal(moved.file, kept.file)
 })
 
+test('Keep local refuses when a moved destination record disappeared', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Vanished local target' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  await unlink(path.join(h.dir('Z'), `local_${SOURCE}.json`))
+  const result = await keepLocal(h.paths)
+
+  assert.match(result.refused[0], /desktop record changed/)
+  assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+  assert.equal((await undo(h.paths)).changed.length > 0, true)
+})
+
 test('a source cloud outage never blocks its eligible local move', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -1235,7 +1270,7 @@ test('Finish pending closes the same logical receipt under the matching source l
   const deferredCloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_deferred', title: 'Second deferred source', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_deferred', title: 'Second deferred source', status })],
     eventRows: async () => remoteRows(secondEntries),
     session: async () => remoteState(status, { id: 'cse_deferred' }),
     archive: async () => { status = 'archived' },
@@ -1270,7 +1305,7 @@ test('Finish pending preserves a record-only bridge identity after local rehome'
   const cloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_record_only', title: 'Renamed remote title', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_record_only', title: 'Renamed remote title', status })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState(status, { id: 'cse_record_only' }),
     archive: async () => { status = 'archived' },
@@ -1301,7 +1336,7 @@ test('Finish pending preserves a record-only bridge identity when history was al
   const cloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_existing_record_only', title: 'Renamed remote title', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_existing_record_only', title: 'Renamed remote title', status })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState(status, { id: 'cse_existing_record_only' }),
     archive: async () => { status = 'archived' },
@@ -1333,7 +1368,7 @@ test('duplicate owners keep record-only bridge identities scoped to each source 
   const cloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_second_owner', title: 'Renamed second owner', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_second_owner', title: 'Renamed second owner', status })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState(status, { id: 'cse_second_owner' }),
     archive: async () => { status = 'archived' },
@@ -1360,7 +1395,7 @@ test('Finish pending never sweeps in a Remote Control session created after Move
   const cloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_created_later', title: 'Later remote source', created_at: new Date(Date.parse(moved.receipt.startedAt) + 60_000).toISOString(), environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_created_later', title: 'Later remote source', created_at: new Date(Date.parse(moved.receipt.startedAt) + 60_000).toISOString() })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState('active', { id: 'cse_created_later' }),
     archive: async () => { archived = true },
@@ -1372,6 +1407,8 @@ test('Finish pending never sweeps in a Remote Control session created after Move
   assert.equal(finished.complete, true)
   assert.equal(finished.pendingCloud, 0)
   assert.equal(finished.receipt.remote.length, 0)
+  assert.equal(finished.newerCloud, 1)
+  assert.equal(finished.receipt.cloudChecks[0].later[0].title, 'Later remote source')
   assert.equal(archived, false)
 })
 
@@ -1387,7 +1424,7 @@ test('the first cloud attempt uses the same creation cutoff as its retry', async
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_after_click', title: 'Cutoff source', created_at: new Date(Date.parse(requestedAt) + 60_000).toISOString(), environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_after_click', title: 'Cutoff source', created_at: new Date(Date.parse(requestedAt) + 60_000).toISOString() })],
     eventRows: async () => remoteRows([entry('user', 40, null, 'cse_after_click')]),
     session: async () => remoteState('active'),
     archive: async () => { archived = true },
@@ -1398,6 +1435,7 @@ test('the first cloud attempt uses the same creation cutoff as its retry', async
   assert.equal(result.ok, true)
   assert.equal(result.pendingCloud, 0)
   assert.equal(result.receipt.remote.length, 0)
+  assert.equal(result.newerCloud, 1)
   assert.equal(archived, false)
 })
 
@@ -1411,7 +1449,7 @@ test('Finish pending refuses an undated remote row instead of widening the move'
   const cloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_undated', title: 'Undated remote', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_undated', title: 'Undated remote', created_at: undefined })],
     eventRows: async () => [],
     session: async () => remoteState('active'),
     archive: async () => { archived = true },
@@ -1450,7 +1488,7 @@ test('a failed deferred cloud session remains explicit and retryable', async () 
   const cloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_retryable', title: 'Retryable cloud source', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_retryable', title: 'Retryable cloud source', status })],
     eventRows: async () => {
       if (!supported) throw new Error('Remote Control history contains an unsupported content block')
       return remoteRows(remote)
@@ -1493,7 +1531,7 @@ test('a deferred rescue verification failure can be retried after harmless recor
   const cloud = {
     account: h.acct.T,
     org: h.org.T,
-    list: async () => [{ id: 'cse_verify_retry', title: 'Verification retry remote', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_verify_retry', title: 'Verification retry remote', status })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState(status, { id: 'cse_verify_retry' }),
     archive: async () => { status = 'archived' },
@@ -1535,7 +1573,7 @@ test('Undo cancels unchecked cloud sources and completes across source logins', 
   const makeCloud = (account, org, key, remote, title, entries) => ({
     account,
     org,
-    list: async () => [{ id: remote, title, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: states[key] }],
+    list: async () => [remoteSession({ id: remote, title, status: states[key] })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(states[key], { id: remote }),
     archive: async () => { states[key] = 'archived' },
@@ -1578,7 +1616,7 @@ test('a verified target archives its source Remote Control mirror and Undo resto
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_fixture', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_fixture', title: `Session ${SOURCE.slice(-3)}`, status })],
     eventRows: async () => remoteRows(entries.map((row) => ({
       type: row.type,
       uuid: id(Number(row.uuid.slice(-12)) + 100),
@@ -1630,7 +1668,7 @@ test('attachment prompts and tiny ordering drift prove semantic Remote Control c
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_equivalent', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_equivalent', title: `Session ${SOURCE.slice(-3)}` })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState('active'),
     archive: async () => {},
@@ -1676,7 +1714,7 @@ test('a divergent Remote Control history becomes a separate verified local sessi
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_rescue', title: `Session ${SOURCE.slice(-3)}`, created_at: createdAtSeconds, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_rescue', title: `Session ${SOURCE.slice(-3)}`, created_at: createdAtSeconds, status })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState(status, { last_event_at: lastEventSeconds }),
     archive: async () => { status = 'archived' },
@@ -1730,7 +1768,7 @@ test('an unrelated same-title local session cannot anchor a remote rescue', asyn
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_unrelated', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_unrelated', title: `Session ${SOURCE.slice(-3)}` })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState('active'),
     archive: async () => { archived = true },
@@ -1759,7 +1797,7 @@ test('an exact bridge id anchors a renamed divergent remote session', async () =
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_exact', title: 'Remote renamed session', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_exact', title: 'Remote renamed session', status })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived' },
@@ -1787,7 +1825,7 @@ test('a rescue anchor changing after inventory keeps the remote source active', 
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_anchor_drift', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_anchor_drift', title: `Session ${SOURCE.slice(-3)}` })],
     eventRows: async () => {
       eventRowCalls++
       if (eventRowCalls === 2) await appendFile(path.join(h.project, `${SOURCE}.jsonl`), `${JSON.stringify(entry('assistant', 39, 38, SOURCE))}\n`)
@@ -1817,7 +1855,7 @@ test('a short remote history is not matched to a differently titled local sessio
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_short', title: 'Different remote title', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_short', title: 'Different remote title' })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState('active'),
     archive: async () => {},
@@ -1844,7 +1882,7 @@ test('an unsupported remote content block is never rescued or archived', async (
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_unsupported', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_unsupported', title: `Session ${SOURCE.slice(-3)}` })],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState('active'),
     archive: async () => { archived = true },
@@ -1874,7 +1912,7 @@ test('missing Remote Control readiness fields fail closed', async () => {
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_unknown', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_unknown', title: `Session ${SOURCE.slice(-3)}` })],
     eventRows: async () => remoteRows(entries),
     session: async () => ({ status: 'active', last_event_at: '2026-09-01T00:01:00.000Z' }),
     archive: async () => { archived = true },
@@ -1900,7 +1938,7 @@ test('a Remote Control mirror stays active when no local target shares its title
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_other', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_other', title: `Session ${SOURCE.slice(-3)}` })],
     eventRows: async () => remoteRows([entry('user', 9, null, 'cse_other', { message: { role: 'user', content: 'different history' } })]),
     session: async () => remoteState(archived ? 'archived' : 'active', { id: 'cse_other' }),
     archive: async () => { archived = true },
@@ -1930,7 +1968,7 @@ test('a local move lands before its matching Remote Control mirror archives', as
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_move', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-repl'], status }],
+    list: async () => [remoteSession({ id: 'cse_move', title: `Session ${SOURCE.slice(-3)}`, tags: ['remote-control-repl'], status })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status, { id: 'cse_move' }),
     archive: async () => { assert.ok(await readFile(targetRecord)); status = 'archived' },
@@ -1963,7 +2001,7 @@ test('a local verification failure keeps its Remote Control source active', asyn
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_verify', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_verify', title: `Session ${SOURCE.slice(-3)}`, status })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { archived = true; status = 'archived' },
@@ -1994,7 +2032,7 @@ test('Undo stages the matching cloud identity before changing local records', as
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_identity', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_identity', title: `Session ${SOURCE.slice(-3)}`, status })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived' },
@@ -2022,7 +2060,7 @@ test('Undo checks an activated target before restoring its cloud mirror', async 
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_changed', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_changed', title: `Session ${SOURCE.slice(-3)}`, status })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived' },
@@ -2052,7 +2090,7 @@ test('interrupted target activation restoration resumes when the prior state is 
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_activation_resume', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_activation_resume', title: `Session ${SOURCE.slice(-3)}`, status })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived' },
@@ -2084,7 +2122,7 @@ test('a connected Remote Control session is never archived or locally activated'
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_busy', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    list: async () => [remoteSession({ id: 'cse_busy', title: `Session ${SOURCE.slice(-3)}` })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState('active', { connection_status: 'connected' }),
     archive: async () => { archived = true },
@@ -2110,7 +2148,7 @@ test('an interrupted Remote Control archive is recovered from server state', asy
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_interrupted', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_interrupted', title: `Session ${SOURCE.slice(-3)}`, status })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived'; if (first) { first = false; throw new Error('connection lost after archive') } },
@@ -2144,7 +2182,7 @@ test('an interrupted unapplied archive leaves a tagged failure that retry clears
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_unapplied', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    list: async () => [remoteSession({ id: 'cse_unapplied', title: `Session ${SOURCE.slice(-3)}`, status })],
     eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status, { id: 'cse_unapplied' }),
     archive: async () => {

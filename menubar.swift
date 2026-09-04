@@ -51,6 +51,7 @@ struct Event: Decodable {
     let cloudArchived: Int?
     let cloudChecked: Int?
     let cloudRestored: Int?
+    let newerCloud: Int?
     let keptLocal: Int?
     let pendingCloud: Int?
     let pendingUndo: [String]?
@@ -225,6 +226,7 @@ final class Model: ObservableObject {
             let cloudArchived = event.cloudArchived ?? 0
             let cloudChecked = event.cloudChecked ?? 0
             let cloudRestored = event.cloudRestored ?? 0
+            let newerCloud = event.newerCloud ?? 0
             let pendingCloud = event.pendingCloud ?? 0
             let pendingUndo = event.pendingUndo ?? []
             let keptLocal = event.keptLocal ?? 0
@@ -242,6 +244,7 @@ final class Model: ObservableObject {
             if cloudArchived > 0 { outcomes.append("\(cloudArchived) cloud mirrors archived") }
             if cloudChecked > 0 { outcomes.append("\(cloudChecked) cloud source checked") }
             if cloudRestored > 0 { outcomes.append("\(cloudRestored) cloud mirrors restored") }
+            if newerCloud > 0 { outcomes.append("\(newerCloud) newer cloud sessions left for next move") }
             if pendingCloud > 0 { outcomes.append("\(pendingCloud) cloud checks pending") }
             if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
             if keptLocal > 0 { outcomes.append("Local move kept, \(keptLocal) cloud checks cancelled") }
@@ -305,7 +308,7 @@ final class Model: ObservableObject {
         progressTotal = nil
         from = []
         to = nil
-        symbol = status == 0 ? (pendingResult ? "clock.arrow.circlepath" : "checkmark") : "exclamationmark.triangle"
+        symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
         if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.symbol = "arrow.left.arrow.right" }
         refresh()
@@ -533,7 +536,7 @@ struct Panel: View {
                 } else {
                     Pill(title: "Finish pending", prominent: true, enabled: model.pendingReady) { model.finishPending() }
                     if model.canKeepLocal {
-                        Pill(title: "Keep local", prominent: false, enabled: true) { model.keepLocal() }
+                        Pill(title: "Keep local", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() }
                     }
                 }
                 Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
@@ -673,7 +676,7 @@ enum Demo {
         snap(1100)
         glide(to: CGPoint(x: 205, y: 220), frames: 8)
         model.begin()
-        model.lines = [("inventory", "333 records | 4 without history | 3 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 2 cloud checks pending | 305 to move")]
+        model.lines = [("inventory", "310 records | 1 without history | 1 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 2 cloud checks pending | 305 to move")]
         snap(250)
         glide(to: CGPoint(x: 150, y: 420), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
@@ -707,7 +710,7 @@ enum Demo {
         model.accounts = [
             Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "0 | -", active: false, pending: "cloud", pendingFailures: []),
             Account(account: "john", org: "team", label: "john@example.com · Team", stats: "0 | -", active: false, pending: "cloud", pendingFailures: []),
-            Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "333 | now | notes", active: false, pending: nil, pendingFailures: nil),
+            Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "341 | now | notes", active: false, pending: nil, pendingFailures: nil),
             Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "0 | -", active: true, pending: nil, pendingFailures: nil)
         ]
         model.symbol = "clock.arrow.circlepath"
