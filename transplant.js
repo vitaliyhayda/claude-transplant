@@ -22,11 +22,8 @@ const CACHE_VERSION = 6
 const ACTIVE_WINDOW = 10 * 60 * 1000
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
+const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents']
 const REMOTE_TAGS = new Set(['remote-control-sdk', 'remote-control-repl'])
-const REMOTE_OPEN = new Set(['active', 'paused'])
-const OAUTH_SCOPE = 'user:sessions:claude_code'
-const OAUTH_CLIENT = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-const OAUTH_TOKEN = 'https://platform.claude.com/v1/oauth/token'
 const HELP = `claude-transplant   move Claude Code history between accounts
 
   claude-transplant             pick from → to, move, retire the source entries, print receipt
@@ -38,7 +35,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant menubar     install the menubar app, starts at login, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
-  --cloud                       reconcile the active source and queue the others
+  --cloud                       reconcile active source, queue only local work left
   --json                        machine-readable output
   --version
 `
@@ -54,8 +51,8 @@ const exists = (p) => stat(p).then(() => true, () => false)
 const readJson = async (p) => JSON.parse(await readFile(p, 'utf8'))
 const stamp = () => new Date().toISOString().slice(0, 23).replace(/[:.]/g, '-')
 const accountRef = ({ account, org, label }) => ({ account, org, label })
-const accountKey = ({ account, org }) => `${account}/${org}`
 const sameAccount = (a, b) => Boolean(a && b && a.account === b.account && a.org === b.org)
+const localCloudPending = (account, retiring = new Set()) => Boolean(account && (account.unreadable.length || account.sessions.some((session) => !session.archived && !retiring.has(session.file))))
 const accountLabel = (row) => row.accountLabel ?? row.label ?? `${short(row.account)} · ${short(row.org)}`
 const openCloudChecks = (receipt) => (receipt.cloudChecks ?? []).filter((check) => !['complete', 'cancelled'].includes(check.status))
 const cloudCheckLabels = (receipt) => [...new Set(openCloudChecks(receipt).map((check) => check.label))]
@@ -285,29 +282,17 @@ async function logins(paths) {
   const emails = new Map()
   const orgs = new Map()
   const pairs = new Map()
-  const profiles = new Map()
-  const take = async (file, configDir = null) => {
+  const take = async (file) => {
     const a = (await readJson(file).catch(() => ({}))).oauthAccount
     if (a?.accountUuid && a.emailAddress) emails.set(a.accountUuid, a.emailAddress)
     if (a?.organizationUuid && a.organizationName) orgs.set(a.organizationUuid, a.organizationType && !/team|enterprise/.test(a.organizationType) ? 'Personal' : a.organizationName)
-    if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) {
-      const key = accountKey({ account: a.accountUuid, org: a.organizationUuid })
-      pairs.set(key, { account: a.accountUuid, org: a.organizationUuid })
-      if (configDir) {
-        const native = path.join(os.userInfo().homedir, '.claude')
-        const service = configDir === native ? 'Claude Code-credentials' : `Claude Code-credentials-${sha(configDir).slice(0, 8)}`
-        profiles.set(key, [...new Set([...(profiles.get(key) ?? []), service])])
-      }
-    }
+    if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) pairs.set(`${a.accountUuid}/${a.organizationUuid}`, { account: a.accountUuid, org: a.organizationUuid })
   }
-  for (const e of (await readdir(paths.home, { withFileTypes: true }).catch(() => [])).toSorted((a, b) => a.name.localeCompare(b.name))) {
-    if (e.name.startsWith('.claude')) {
-      const configDir = e.isDirectory() ? path.join(paths.home, e.name) : e.name === '.claude.json' ? path.join(paths.home, '.claude') : null
-      await take(e.isDirectory() ? path.join(configDir, '.claude.json') : path.join(paths.home, e.name), configDir)
-    }
+  for (const e of await readdir(paths.home, { withFileTypes: true }).catch(() => [])) {
+    if (e.name.startsWith('.claude')) await take(e.isDirectory() ? path.join(paths.home, e.name, '.claude.json') : path.join(paths.home, e.name))
   }
   for (const f of await readdir(paths.backups).catch(() => [])) if (f.startsWith('.claude.json.backup')) await take(path.join(paths.backups, f))
-  await take(paths.login, path.join(paths.home, '.claude'))
+  await take(paths.login)
   for (const { account, org, files } of await records(paths.agentSessions)) {
     if (UUID.test(account) && UUID.test(org)) pairs.set(`${account}/${org}`, { account, org })
     for (const file of files) {
@@ -316,7 +301,7 @@ async function logins(paths) {
       if (r.emailAddress) emails.set(account, r.emailAddress)
     }
   }
-  return { emails, orgs, pairs, profiles }
+  return { emails, orgs, pairs }
 }
 
 function ago(ms) {
@@ -410,82 +395,6 @@ const wireRemoteId = (id) => {
 
 const remoteId = (id) => {
   try { return wireRemoteId(id) } catch { return null }
-}
-
-const keychainCredential = (service) => {
-  const result = spawnSync('/usr/bin/security', ['find-generic-password', '-w', '-s', service], { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 })
-  if (result.error || result.status !== 0) return null
-  try { return JSON.parse(result.stdout.trim()) } catch { return null }
-}
-
-const saveKeychainCredential = (service, value) => {
-  const text = JSON.stringify(value)
-  const result = spawnSync('/usr/bin/security', ['add-generic-password', '-a', os.userInfo().username, '-s', service, '-U', '-w'], { input: `${text}\n${text}\n`, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 })
-  if (result.error || result.status !== 0) throw new Error('Claude Code credential refresh could not be saved')
-}
-
-async function profileAccessToken(service, options) {
-  const now = options.now ?? Date.now()
-  const read = options.readCredential ?? keychainCredential
-  const write = options.writeCredential ?? saveKeychainCredential
-  const request = options.request ?? fetch
-  let stored = await read(service)
-  let oauth = stored?.claudeAiOauth
-  if (!oauth?.scopes?.includes(OAUTH_SCOPE) || typeof oauth.accessToken !== 'string') return null
-  if (Number(oauth.expiresAt) > now + 60_000) return oauth.accessToken
-  if (!options.refresh || typeof oauth.refreshToken !== 'string' || Number(oauth.refreshTokenExpiresAt) <= now) return null
-  const fingerprint = sha(stable(oauth))
-  await write(service, stored)
-  if (sha(stable((await read(service))?.claudeAiOauth)) !== fingerprint) return null
-  const response = await request(OAUTH_TOKEN, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'anthropic-beta': 'oauth-2025-04-20', 'user-agent': 'claude-transplant' },
-    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oauth.refreshToken, client_id: OAUTH_CLIENT, scope: oauth.scopes.join(' ') }),
-    signal: AbortSignal.timeout(15_000)
-  })
-  if (!response.ok) return null
-  const token = await response.json()
-  if (typeof token?.access_token !== 'string' || !Number.isFinite(token.expires_in) || token.expires_in <= 0) return null
-  const current = await read(service)
-  if (sha(stable(current?.claudeAiOauth)) !== fingerprint) {
-    return Number(current?.claudeAiOauth?.expiresAt) > now + 60_000 ? current.claudeAiOauth.accessToken : null
-  }
-  const scopes = typeof token.scope === 'string' ? token.scope.split(/\s+/).filter(Boolean) : oauth.scopes
-  if (!scopes.includes(OAUTH_SCOPE)) return null
-  const refreshed = {
-    ...oauth,
-    accessToken: token.access_token,
-    refreshToken: token.refresh_token ?? oauth.refreshToken,
-    expiresAt: now + token.expires_in * 1000,
-    refreshTokenExpiresAt: Number.isFinite(token.refresh_token_expires_in) ? now + token.refresh_token_expires_in * 1000 : oauth.refreshTokenExpiresAt,
-    scopes
-  }
-  await write(service, { ...stored, claudeAiOauth: refreshed })
-  return (await read(service))?.claudeAiOauth?.accessToken === refreshed.accessToken ? refreshed.accessToken : null
-}
-
-export async function profileRemoteEvidence(from, options = {}) {
-  const evidence = new Map()
-  const request = options.request ?? fetch
-  for (const account of from) {
-    for (const service of account.profileServices ?? []) {
-      try {
-        const token = await profileAccessToken(service, options)
-        if (!token) continue
-        const authorization = { authorization: `Bearer ${token}` }
-        const validation = await request('https://api.anthropic.com/api/oauth/validate', { method: 'POST', headers: { ...authorization, 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000) })
-        const identity = validation.ok ? await validation.json() : null
-        if (identity?.valid !== true || identity.account_uuid !== account.account || identity.organization_uuid !== account.org || !identity.scopes?.includes(OAUTH_SCOPE)) continue
-        const response = await request('https://api.anthropic.com/v1/code/sessions?limit=100&statuses=active&statuses=paused', { headers: { ...authorization, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20' }, signal: AbortSignal.timeout(15_000) })
-        const body = response.ok ? await response.json() : null
-        if (response.headers.get('anthropic-organization-id') !== account.org || !Array.isArray(body?.data) || body.data.length >= 100 || body.data.some((session) => !session || typeof session !== 'object' || typeof session.environment_kind !== 'string' || !Array.isArray(session.tags) || typeof session.status !== 'string')) continue
-        const relevant = body.data.filter((session) => session?.environment_kind === 'bridge' && Array.isArray(session.tags) && session.tags.some((tag) => REMOTE_TAGS.has(tag)) && REMOTE_OPEN.has(session.status))
-        evidence.set(accountKey(account), relevant.length)
-        break
-      } catch {}
-    }
-  }
-  return evidence
 }
 
 export async function cloudClient(paths, expected = null) {
@@ -590,7 +499,7 @@ const desktopSession = (file, record) => ({
 })
 
 export async function accounts(paths) {
-  const { emails, orgs, pairs, profiles } = await logins(paths)
+  const { emails, orgs, pairs } = await logins(paths)
   const cur = await current(paths)
   const out = []
   const stored = await records(paths.records)
@@ -613,7 +522,7 @@ export async function accounts(paths) {
     const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, profileServices: profiles.get(accountKey({ account, org })) ?? [] })
+    out.push({ account, org, dir, email, orgName, sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false })
   }
   const mine = out.filter((a) => a.account === cur.account)
   const focused = mine.toSorted((a, b) => b.focusedAt - a.focusedAt)[0]
@@ -677,10 +586,8 @@ const without = (entry, keys) => {
   return copy
 }
 
-const recordSemantic = (record) => sha(stable(without(record, [
-  'lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark',
-  'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents'
-])))
+const recordSemantic = (record) => sha(stable(without(record, RECORD_RUNTIME_KEYS)))
+const keepRecordSemantic = (record) => sha(stable(without(record, [...RECORD_RUNTIME_KEYS, 'title', 'titleSource'])))
 
 const semanticShape = (entry) => stable(without(entry, RUNTIME_KEYS))
 
@@ -1189,12 +1096,10 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   const cloudCutoff = options.cloudCutoff ?? (cloudRequested ? requestedAt : null)
   const cloudPlan = await cloudInventory(options.cloud, from, targets, options.cloudTargetOnly ? [] : move, cache, report, cloudCutoff)
   const retiring = new Set([...move, ...there].flatMap((row) => (row.members ?? [row]).map((member) => member.file)))
-  const cloudCheckAccounts = options.remoteEvidence instanceof Map ? from.filter((account) => {
+  const cloudCheckAccounts = from.filter((account) => {
     if (cloudPlan.checked && sameAccount(account, cloudPlan)) return true
-    const observed = options.remoteEvidence.get(accountKey(account))
-    if (observed !== undefined) return observed > 0
-    return account.sessions.some((session) => !session.archived && !retiring.has(session.file))
-  }).map(accountRef) : from.map(accountRef)
+    return localCloudPending(account, retiring)
+  }).map(accountRef)
   await saveAnalysisCache(cache)
   return {
     total,
@@ -1274,6 +1179,7 @@ async function rehomeOne(s, to, journal, guard) {
     record,
     recordSha,
     recordSemantic: recordSemantic(placed),
+    recordKeepSemantic: keepRecordSemantic(placed),
     targetRecordId: current.sessionId,
     taskFile: to.taskFile,
     taskOwned: false,
@@ -1352,9 +1258,8 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
   if (currentRecord) {
     try {
       const record = JSON.parse(currentRecord)
-      recordChanged = row.strategy === 'rehome' && allowRecordDrift
-        ? record.cliSessionId !== row.targetId || !validDesktopRecord({ file: row.record, record })
-        : row.recordSemantic ? recordSemantic(record) !== row.recordSemantic : sha(currentRecord) !== row.recordSha
+      if (row.strategy === 'rehome' && allowRecordDrift && row.recordKeepSemantic) recordChanged = keepRecordSemantic(record) !== row.recordKeepSemantic
+      else recordChanged = row.recordSemantic ? recordSemantic(record) !== row.recordSemantic : sha(currentRecord) !== row.recordSha
     } catch { recordChanged = true }
   }
   if (recordChanged) changes.push('desktop record')
@@ -1651,7 +1556,8 @@ async function reconcile(paths, options = {}) {
         return { title: row.title, error: 'interrupted Remote Control archive completed' }
       }
       if (['active', 'paused'].includes(current.status)) {
-        await rollbackActivation(row.activation)
+        const target = receipt.sessions?.find((session) => session.record === row.activation?.record)
+        await rollbackActivation(row.activation, target)
         addCloudFailure(receipt, row, { id: row.id, title: row.title, error: 'interrupted Remote Control archive not applied' })
         delete receipt.remotePending
         await saveJson(p.file, receipt)
@@ -1896,6 +1802,7 @@ async function retire(inv, receipt, paths, at, problems, save, report = () => {}
   await save()
 }
 
+const REMOTE_OPEN = new Set(['active', 'paused'])
 const REMOTE_IDLE = new Set([
   'WORKER_STATUS_UNSPECIFIED', 'WORKER_STATUS_IDLE', 'WORKER_STATUS_DISCONNECTED',
   'idle', 'disconnected', 'stopped'
@@ -2103,6 +2010,7 @@ async function applyActivation(activation, row) {
   if (sha(await readFile(activation.record)) !== activation.afterSha) throw new Error('local target activation verification failed')
   row.recordSha = activation.afterSha
   row.recordSemantic = activation.afterSemantic
+  row.recordKeepSemantic = keepRecordSemantic(activation.after)
   row.archived = false
   if (row.session) {
     row.session.record = activation.after
@@ -2138,15 +2046,26 @@ async function restoreActivations(receipt) {
   }
 }
 
-async function rollbackActivation(activation) {
+async function rollbackActivation(activation, row = null) {
   if (!activation) return
   const raw = await readFile(activation.record).catch(() => null)
   let current = null
   try { if (raw) current = JSON.parse(raw) } catch {}
   const semantic = current ? recordSemantic(current) : null
-  if (semantic === activation.beforeSemantic) return
-  if (semantic !== activation.afterSemantic) throw new Error('activated target record changed during recovery')
-  await saveJson(activation.record, { ...current, isArchived: true })
+  if (![activation.beforeSemantic, activation.afterSemantic].includes(semantic)) throw new Error('activated target record changed during recovery')
+  const restored = semantic === activation.afterSemantic ? { ...current, isArchived: true } : current
+  const text = semantic === activation.afterSemantic ? jsonText(restored) : raw
+  if (semantic === activation.afterSemantic) await saveText(activation.record, text)
+  if (row) {
+    row.recordSha = sha(text)
+    row.recordSemantic = recordSemantic(restored)
+    row.recordKeepSemantic = keepRecordSemantic(restored)
+    row.archived = true
+    if (row.session) {
+      row.session.record = restored
+      row.session.archived = true
+    }
+  }
 }
 
 function receiptCloudCheck(receipt, cloud) {
@@ -2253,7 +2172,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       let rolledBack = false
       if (!attempted) {
         try {
-          await rollbackActivation(pending.activation)
+          await rollbackActivation(pending.activation, row)
           delete receipt.remotePending
           rolledBack = true
         } catch {}
@@ -2411,6 +2330,12 @@ async function transfer(inv, to, paths, report) {
   receipt.verification = { ok, problems: recordedProblems }
   await save()
   await retire(inv, receipt, paths, at, problems, save, report)
+  if (inv.cloudRequested) {
+    const current = await accounts(paths)
+    const actual = receipt.fromAccounts.filter((source) => localCloudPending(current.find((account) => sameAccount(account, source))))
+    receipt.cloudChecks = receipt.cloudChecks.filter((check) => inv.cloud?.checked && sameAccount(check, inv.cloud) || actual.some((source) => sameAccount(check, source)))
+    for (const source of actual) if (!receipt.cloudChecks.some((check) => sameAccount(check, source))) receipt.cloudChecks.push({ ...source, status: 'pending' })
+  }
   receipt.finalizing = false
   await save()
   await archiveCloud(inv, receipt, save, report)
@@ -3008,8 +2933,7 @@ async function main(argv) {
       process.exitCode = 1
       return args.json ? emit({ done: true, ok: false, dry: true, recoveryRequired: true, planned: null }) : out.write('  dry run     plan unavailable until the next move reconciles this state\n')
     }
-    const remoteEvidence = args.cloud ? await profileRemoteEvidence(from) : null
-    const inv = await inventory(from, to, paths, report, { cloud, cloudRequested: args.cloud, cloudError, remoteEvidence })
+    const inv = await inventory(from, to, paths, report, { cloud, cloudRequested: args.cloud, cloudError })
     summary(inv)
     const retiring = owners(inv.sources, carrying(inv, inv.move.map((history) => ({ history })))).filter(({ s, owner }) => !retirementOwnership(inv, s, owner)).length
     if (retiring) report('retire', `${count(retiring)} source records once the target records verify`)
@@ -3025,8 +2949,7 @@ async function main(argv) {
     const latest = await accounts(paths)
     const currentFrom = from.map((account) => fresh(latest, account))
     const currentTo = fresh(latest, to)
-    const remoteEvidence = args.cloud ? await profileRemoteEvidence(currentFrom, { refresh: true }) : null
-    const inv = await inventory(currentFrom, currentTo, paths, report, { writeCache: true, cloud, cloudRequested: args.cloud, cloudError, remoteEvidence })
+    const inv = await inventory(currentFrom, currentTo, paths, report, { writeCache: true, cloud, cloudRequested: args.cloud, cloudError })
     summary(inv)
     return inv.move.length || inv.there.length || inv.cloud.matches.length || inventoryFailures(inv).length || inv.cloudRequested ? transfer(inv, currentTo, paths, report) : null
   })

@@ -489,12 +489,7 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            if model.demo {
-                accountLists
-            } else {
-                ScrollView { accountLists }
-                    .frame(height: min(310, 48 + CGFloat(model.accounts.count) * 44))
-            }
+            accountLists
             if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
             ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -538,14 +533,26 @@ struct Panel: View {
 
     private var accountLists: some View {
         VStack(alignment: .leading, spacing: 14) {
-            accountBlock("From") {
-                ForEach(model.accounts) { account in
-                    AccountRow(account: account, selected: model.from.contains(account.id), radio: false) { model.toggle(account.id) }
-                }
-            }
-            accountBlock("To") {
-                ForEach(model.accounts) { account in
-                    AccountRow(account: account, selected: model.to == account.id, radio: true) { model.selectTarget(account.id) }
+            accountBlock("From") { accountList(radio: false) }
+            accountBlock("To") { accountList(radio: true) }
+        }
+    }
+
+    @ViewBuilder private func accountList(radio: Bool) -> some View {
+        if model.demo || model.accounts.count <= 5 {
+            accountRows(radio: radio)
+        } else {
+            ScrollView { accountRows(radio: radio) }
+                .frame(height: 140)
+        }
+    }
+
+    private func accountRows(radio: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(model.accounts) { account in
+                AccountRow(account: account, selected: radio ? model.to == account.id : model.from.contains(account.id), radio: radio) {
+                    if radio { model.selectTarget(account.id) }
+                    else { model.toggle(account.id) }
                 }
             }
         }
@@ -644,7 +651,7 @@ struct Screen: View {
 
 enum Demo {
     static let accounts = [
-        Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "86 | 2h ago | api", active: false, pending: nil, pendingFailures: nil),
+        Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "84 | 2h ago | api", active: false, pending: nil, pendingFailures: nil),
         Account(account: "john", org: "team", label: "john@example.com · Team", stats: "212 | 3d ago | api", active: false, pending: nil, pendingFailures: nil),
         Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "35 | 5d ago | notes", active: false, pending: nil, pendingFailures: nil),
         Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "12 | 4m ago | notes", active: true, pending: nil, pendingFailures: nil)
@@ -681,7 +688,7 @@ enum Demo {
         snap(1100)
         glide(to: CGPoint(x: 205, y: 328), frames: 8)
         model.begin()
-        model.lines = [("inventory", "310 records | 1 without history | 1 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 2 cloud checks pending | 305 to move")]
+        model.lines = [("inventory", "308 records | 3 already there | 5 cloud mirrors | 1 cloud rescue | 305 to move")]
         snap(250)
         glide(to: CGPoint(x: 190, y: 371), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
@@ -707,19 +714,18 @@ enum Demo {
         snap(350)
         model.lines.append(("retired", "308 source records → quarantine | transcripts untouched"))
         model.lines.append(("cloud", "5 source mirrors archived"))
-        model.lines.append(("pending", "2 source cloud checks"))
         snap(500)
         model.running = false
         model.from = []
         model.to = nil
         model.accounts = [
-            Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "0 | -", active: false, pending: "cloud", pendingFailures: []),
-            Account(account: "john", org: "team", label: "john@example.com · Team", stats: "0 | -", active: false, pending: "cloud", pendingFailures: []),
+            Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "0 | -", active: false, pending: nil, pendingFailures: nil),
+            Account(account: "john", org: "team", label: "john@example.com · Team", stats: "0 | -", active: false, pending: nil, pendingFailures: nil),
             Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "341 | now | notes", active: false, pending: nil, pendingFailures: nil),
             Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "0 | -", active: true, pending: nil, pendingFailures: nil)
         ]
-        model.symbol = "clock.arrow.circlepath"
-        model.note = "305 sessions moved, 1 remote branch rescued, 5 cloud mirrors archived, 2 cloud checks pending"
+        model.symbol = "checkmark"
+        model.note = "305 sessions moved, 1 remote branch rescued, 5 cloud mirrors archived"
         model.restartAvailable = true
         snap(2800)
         try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))
