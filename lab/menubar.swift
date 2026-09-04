@@ -85,6 +85,7 @@ final class Model: ObservableObject {
     @Published var from: Set<String> = []
     @Published var to: String?
     @Published var manual = false
+    @Published var lanes: [String: String] = [:]
     @Published var lines: [(String, String)] = []
     @Published var note = ""
     @Published var badge = ""
@@ -159,6 +160,10 @@ final class Model: ObservableObject {
 
     func selectTarget(_ id: String) {
         clearResult()
+        if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
+            lanes[vacated] = id
+            lanes[taken] = old
+        }
         to = id
         settle()
     }
@@ -169,6 +174,11 @@ final class Model: ObservableObject {
             let current = accounts.first { $0.active == true } ?? recent.first
             to = recent.first { $0.id != current?.id }?.id
         }
+        let ids = accounts.map(\.id)
+        var next = lanes.filter { ids.contains($0.key) && ids.contains($0.value) }
+        var free = ids.filter { id in !next.values.contains(id) }.makeIterator()
+        for id in ids where next[id] == nil { if let source = free.next() { next[id] = source } }
+        lanes = next
         let eligible = accounts.filter(canSource).map(\.id)
         from = manual ? from.filter { eligible.contains($0) } : Set(eligible)
     }
@@ -479,56 +489,33 @@ struct Tag: View {
     }
 }
 
-struct AnimatableVector: VectorArithmetic {
-    var values: [Double]
+struct Arrow: Shape {
+    var start: CGPoint
+    var end: CGPoint
 
-    static var zero: AnimatableVector { AnimatableVector(values: []) }
-    static func + (lhs: AnimatableVector, rhs: AnimatableVector) -> AnimatableVector { combine(lhs, rhs, +) }
-    static func - (lhs: AnimatableVector, rhs: AnimatableVector) -> AnimatableVector { combine(lhs, rhs, -) }
-    mutating func scale(by rhs: Double) { values = values.map { $0 * rhs } }
-    var magnitudeSquared: Double { values.reduce(0) { $0 + $1 * $1 } }
-
-    private static func combine(_ a: AnimatableVector, _ b: AnimatableVector, _ op: (Double, Double) -> Double) -> AnimatableVector {
-        let count = max(a.values.count, b.values.count)
-        return AnimatableVector(values: (0..<count).map { op($0 < a.values.count ? a.values[$0] : 0, $0 < b.values.count ? b.values[$0] : 0) })
-    }
-}
-
-struct Bundle: Shape {
-    var vector: AnimatableVector
-    var animatableData: AnimatableVector {
-        get { vector }
-        set { vector = newValue }
+    var animatableData: AnimatablePair<CGPoint.AnimatableData, CGPoint.AnimatableData> {
+        get { AnimatablePair(start.animatableData, end.animatableData) }
+        set { start.animatableData = newValue.first; end.animatableData = newValue.second }
     }
 
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        let v = vector.values
-        var i = 0
-        while i + 4 < v.count {
-            let anchor = CGPoint(x: v[i], y: v[i + 1])
-            let end = CGPoint(x: v[i + 2], y: v[i + 3])
-            let presence = min(1, max(0, v[i + 4]))
-            i += 5
-            guard presence > 0.01 else { continue }
-            let start = CGPoint(x: end.x + (anchor.x - end.x) * presence, y: end.y + (anchor.y - end.y) * presence)
-            let span = end.x - start.x
-            let c1 = CGPoint(x: start.x + span * 0.55, y: start.y)
-            let c2 = CGPoint(x: end.x - span * 0.45, y: end.y)
-            path.move(to: start)
-            path.addCurve(to: end, control1: c1, control2: c2)
-            let mid = Bundle.point(start, c1, c2, end, 0.45)
-            let tangent = Bundle.tangent(start, c1, c2, end, 0.45)
-            let length = max(0.001, hypot(tangent.x, tangent.y))
-            let u = CGPoint(x: tangent.x / length, y: tangent.y / length)
-            let n = CGPoint(x: -u.y, y: u.x)
-            let size = 4.6 * presence
-            let tip = CGPoint(x: mid.x + u.x * size * 0.7, y: mid.y + u.y * size * 0.7)
-            let back = CGPoint(x: mid.x - u.x * size * 0.7, y: mid.y - u.y * size * 0.7)
-            path.move(to: CGPoint(x: back.x + n.x * size, y: back.y + n.y * size))
-            path.addLine(to: tip)
-            path.addLine(to: CGPoint(x: back.x - n.x * size, y: back.y - n.y * size))
-        }
+        let span = end.x - start.x
+        let c1 = CGPoint(x: start.x + span * 0.55, y: start.y)
+        let c2 = CGPoint(x: end.x - span * 0.45, y: end.y)
+        path.move(to: start)
+        path.addCurve(to: end, control1: c1, control2: c2)
+        let mark = Arrow.point(start, c1, c2, end, 0.15)
+        let tangent = Arrow.tangent(start, c1, c2, end, 0.15)
+        let length = max(0.001, hypot(tangent.x, tangent.y))
+        let u = CGPoint(x: tangent.x / length, y: tangent.y / length)
+        let n = CGPoint(x: -u.y, y: u.x)
+        let size = 4.6
+        let tip = CGPoint(x: mark.x + u.x * size * 0.7, y: mark.y + u.y * size * 0.7)
+        let back = CGPoint(x: mark.x - u.x * size * 0.7, y: mark.y - u.y * size * 0.7)
+        path.move(to: CGPoint(x: back.x + n.x * size, y: back.y + n.y * size))
+        path.addLine(to: tip)
+        path.addLine(to: CGPoint(x: back.x - n.x * size, y: back.y - n.y * size))
         return path
     }
 
@@ -546,24 +533,25 @@ struct Bundle: Shape {
 }
 
 struct Arrows: View {
+    @EnvironmentObject private var model: Model
     let anchors: [String: Anchor<CGRect>]
-    let accounts: [Account]
-    let sources: Set<String>
-    let target: String?
 
     var body: some View {
         GeometryReader { proxy in
-            let end = target.flatMap { anchors["to/" + $0] }.map { proxy[$0] }.map { CGPoint(x: $0.minX - 10, y: $0.midY) }
-            let vector = AnimatableVector(values: accounts.flatMap { account -> [Double] in
-                guard let rect = anchors["from/" + account.id].map({ proxy[$0] }) else { return [0, 0, 0, 0, 0] }
-                let start = CGPoint(x: rect.maxX + 10, y: rect.midY)
-                let finish = end ?? start
-                let present = end != nil && sources.contains(account.id) && account.id != target
-                return [start.x, start.y, finish.x, finish.y, present ? 1 : 0]
-            })
-            Bundle(vector: vector)
-                .stroke(Color.accentColor.opacity(0.9), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
-                .animation(.spring(response: 0.45, dampingFraction: 0.86), value: vector)
+            let end = model.to.flatMap { anchors["to/" + $0] }.map { proxy[$0] }.map { CGPoint(x: $0.minX - 10, y: $0.midY) }
+            ForEach(model.accounts) { lane in
+                let source = model.lanes[lane.id] ?? lane.id
+                if let rect = anchors["from/" + source].map({ proxy[$0] }) {
+                    let start = CGPoint(x: rect.maxX + 10, y: rect.midY)
+                    let visible = end != nil && source != model.to && model.from.contains(source)
+                    Arrow(start: start, end: end ?? start)
+                        .stroke(Color.accentColor.opacity(0.9), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+                        .animation(.spring(response: 0.45, dampingFraction: 0.86), value: start)
+                        .animation(.spring(response: 0.45, dampingFraction: 0.86), value: end)
+                        .opacity(visible ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.22), value: visible)
+                }
+            }
         }
         .allowsHitTesting(false)
     }
@@ -692,7 +680,7 @@ struct Panel: View {
             .frame(width: width, alignment: .leading)
         }
         .overlayPreferenceValue(RowKey.self) { anchors in
-            Arrows(anchors: anchors, accounts: model.accounts, sources: model.from, target: model.to)
+            Arrows(anchors: anchors)
         }
     }
 
