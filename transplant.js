@@ -35,7 +35,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant menubar     install the menubar app, starts at login, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
-  --cloud                       reconcile the active source and queue the others
+  --cloud                       reconcile active source, queue only local work left
   --json                        machine-readable output
   --version
 `
@@ -52,6 +52,7 @@ const readJson = async (p) => JSON.parse(await readFile(p, 'utf8'))
 const stamp = () => new Date().toISOString().slice(0, 23).replace(/[:.]/g, '-')
 const accountRef = ({ account, org, label }) => ({ account, org, label })
 const sameAccount = (a, b) => Boolean(a && b && a.account === b.account && a.org === b.org)
+const localCloudPending = (account, retiring = new Set()) => Boolean(account && (account.unreadable.length || account.sessions.some((session) => !session.archived && !retiring.has(session.file))))
 const accountLabel = (row) => row.accountLabel ?? row.label ?? `${short(row.account)} · ${short(row.org)}`
 const openCloudChecks = (receipt) => (receipt.cloudChecks ?? []).filter((check) => !['complete', 'cancelled'].includes(check.status))
 const cloudCheckLabels = (receipt) => [...new Set(openCloudChecks(receipt).map((check) => check.label))]
@@ -1095,8 +1096,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   const retiring = new Set([...move, ...there].flatMap((row) => (row.members ?? [row]).map((member) => member.file)))
   const cloudCheckAccounts = from.filter((account) => {
     if (cloudPlan.checked && sameAccount(account, cloudPlan)) return true
-    if (Array.isArray(options.cloudAccounts)) return options.cloudAccounts.some((candidate) => sameAccount(account, candidate))
-    return account.unreadable.length > 0 || account.sessions.some((session) => !session.archived && !retiring.has(session.file))
+    return localCloudPending(account, retiring)
   }).map(accountRef)
   await saveAnalysisCache(cache)
   return {
@@ -1256,9 +1256,8 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
   if (currentRecord) {
     try {
       const record = JSON.parse(currentRecord)
-      recordChanged = row.strategy === 'rehome' && allowRecordDrift
-        ? row.recordKeepSemantic ? keepRecordSemantic(record) !== row.recordKeepSemantic : record.cliSessionId !== row.targetId || !validDesktopRecord({ file: row.record, record })
-        : row.recordSemantic ? recordSemantic(record) !== row.recordSemantic : sha(currentRecord) !== row.recordSha
+      if (row.strategy === 'rehome' && allowRecordDrift && row.recordKeepSemantic) recordChanged = keepRecordSemantic(record) !== row.recordKeepSemantic
+      else recordChanged = row.recordSemantic ? recordSemantic(record) !== row.recordSemantic : sha(currentRecord) !== row.recordSha
     } catch { recordChanged = true }
   }
   if (recordChanged) changes.push('desktop record')
@@ -2008,6 +2007,7 @@ async function applyActivation(activation, row) {
   if (sha(await readFile(activation.record)) !== activation.afterSha) throw new Error('local target activation verification failed')
   row.recordSha = activation.afterSha
   row.recordSemantic = activation.afterSemantic
+  row.recordKeepSemantic = keepRecordSemantic(activation.after)
   row.archived = false
   if (row.session) {
     row.session.record = activation.after
@@ -2316,6 +2316,12 @@ async function transfer(inv, to, paths, report) {
   receipt.verification = { ok, problems: recordedProblems }
   await save()
   await retire(inv, receipt, paths, at, problems, save, report)
+  if (inv.cloudRequested) {
+    const current = await accounts(paths)
+    const actual = receipt.fromAccounts.filter((source) => localCloudPending(current.find((account) => sameAccount(account, source))))
+    receipt.cloudChecks = receipt.cloudChecks.filter((check) => inv.cloud?.checked && sameAccount(check, inv.cloud) || actual.some((source) => sameAccount(check, source)))
+    for (const source of actual) if (!receipt.cloudChecks.some((check) => sameAccount(check, source))) receipt.cloudChecks.push({ ...source, status: 'pending' })
+  }
   receipt.finalizing = false
   await save()
   await archiveCloud(inv, receipt, save, report)

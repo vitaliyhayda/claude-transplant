@@ -49,6 +49,16 @@ const cloudFixture = (h, extra = {}) => ({
   unarchive: async () => {},
   ...extra
 })
+async function moveWithPending(h, from, to, cloud = null) {
+  const pending = id(997)
+  await h.record('T', pending, rehomeRecord({ title: 'Pending local source' }))
+  const current = await accounts(h.paths)
+  const source = from.map((row) => current.find((account) => account.account === row.account && account.org === row.org))
+  const target = current.find((account) => account.account === to.account && account.org === to.org)
+  const result = await move(await inventory(source, target, h.paths, () => {}, { cloud, cloudRequested: true }), target, h.paths)
+  await unlink(path.join(h.dir('T'), `local_${pending}.json`))
+  return result
+}
 const branchEntries = (count, session, start) => Array.from({ length: count }, (_, index) => entry(index % 2 ? 'assistant' : 'user', start + index, index ? start + index - 1 : null, session))
 const cli = (home, args) => promisify(execFile)(process.execPath, [path.join(here, 'transplant.js'), ...args], {
   env: { ...process.env, HOME: home },
@@ -1206,6 +1216,38 @@ test('completed local movement suppresses speculative pending', async () => {
   assert.deepEqual(result.receipt.cloudChecks, [])
 })
 
+test('a late move failure restores the source cloud check', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true })
+  await appendFile(path.join(h.project, `${SOURCE}.jsonl`), `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.ok, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+})
+
+test('a refused retirement restores the source cloud check', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ scheduledTaskId: 'task_fixture' }))
+  await h.record('Z', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true })
+  assert.equal(inv.cloudCheckAccounts.length, 0)
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.pendingCloud, 1)
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+})
+
 test('an unreadable source record prevents an empty-source assumption', async () => {
   const h = await home()
   await writeFile(path.join(h.dir('T'), `local_${SOURCE}.json`), '{')
@@ -1224,7 +1266,7 @@ test('Keep local retains a verified bridge rehome while its remote check is unav
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   const kept = await keepLocal(h.paths)
 
   assert.equal(kept.cancelled, 1)
@@ -1269,6 +1311,23 @@ test('Keep local refuses structural rehome record drift', async () => {
   assert.match(kept.refused[0], /desktop record changed/)
 })
 
+test('Keep local keeps strict validation for older receipts', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ cwd: '/tmp/original' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  delete receipt.sessions[0].recordKeepSemantic
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const record = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), cwd: '/tmp/changed' }))
+
+  assert.match((await keepLocal(h.paths)).refused[0], /desktop record changed/)
+})
+
 test('Keep local refuses when a moved destination record disappeared', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -1276,7 +1335,7 @@ test('Keep local refuses when a moved destination record disappeared', async () 
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  await moveWithPending(h, [from], to)
   await unlink(path.join(h.dir('Z'), `local_${SOURCE}.json`))
   const result = await keepLocal(h.paths)
 
@@ -1296,7 +1355,7 @@ test('Keep local refuses when an existing carrier no longer contains the retired
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   assert.equal(moved.receipt.sessions.length, 0)
   await h.write(target, [entry('user', 43, null, target, { message: { role: 'user', content: 'unrelated replacement' } })])
   const kept = await keepLocal(h.paths)
@@ -1316,7 +1375,7 @@ test('Keep local rejects a quarantined source record changed after retirement', 
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   await h.write(target, [entry('user', 45, null, target, { message: { role: 'user', content: 'replacement history' } })])
   const sourcePlan = moved.receipt.superseded.find((row) => row.source)
   const parkedRecord = sourcePlan.moved[0][1]
@@ -1335,7 +1394,7 @@ test('Keep local validates quarantine for a source rehomed by this move', async 
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   const parked = moved.receipt.superseded.find((row) => row.source).moved[0][1]
   await writeFile(parked, `${await readFile(parked, 'utf8')} `)
   const kept = await keepLocal(h.paths)
@@ -1382,7 +1441,7 @@ test('Finish pending closes the same logical receipt under the matching source l
     all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   ]
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory(from, to, h.paths, () => {}, { cloud: emptyCloud, cloudRequested: true, cloudAccounts: [from[1]] }), to, h.paths)
+  const moved = await moveWithPending(h, from, to, emptyCloud)
   let status = 'active'
   const deferredCloud = cloudFixture(h, {
     account: h.acct.T,
@@ -1417,7 +1476,7 @@ test('Finish pending preserves a record-only bridge identity after local rehome'
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   let status = 'active'
   const cloud = cloudFixture(h, {
     account: h.acct.T,
@@ -1447,7 +1506,7 @@ test('Finish pending preserves a record-only bridge identity when history was al
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   assert.equal(moved.receipt.sessions.length, 0)
   let status = 'active'
   const cloud = cloudFixture(h, {
@@ -1479,7 +1538,7 @@ test('duplicate owners keep record-only bridge identities scoped to each source 
     all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   ]
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory(from, to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from[1]] }), to, h.paths)
+  const moved = await moveWithPending(h, from, to)
   assert.equal(moved.receipt.cloudLinks.some((row) => row.account === h.acct.T && row.bridgeIds.includes('session_second_owner')), true)
   let status = 'active'
   const cloud = cloudFixture(h, {
@@ -1507,7 +1566,7 @@ test('Finish pending never sweeps in a Remote Control session created after Move
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   let archived = false
   const cloud = cloudFixture(h, {
     account: h.acct.T,
@@ -1559,7 +1618,7 @@ test('Finish pending refuses an undated remote row instead of widening the move'
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  await moveWithPending(h, [from], to)
   let archived = false
   const cloud = cloudFixture(h, {
     account: h.acct.T,
@@ -1588,7 +1647,7 @@ test('a failed deferred cloud session remains explicit and retryable', async () 
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  const moved = await moveWithPending(h, [from], to)
   let supported = false
   let status = 'active'
   const remote = [
@@ -1641,7 +1700,7 @@ test('a deferred rescue verification failure can be retried after harmless recor
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudAccounts: [from] }), to, h.paths)
+  await moveWithPending(h, [from], to)
   let status = 'active'
   const cloud = cloudFixture(h, {
     account: h.acct.T,
@@ -1702,7 +1761,7 @@ test('Undo cancels unchecked cloud sources and completes across source logins', 
     all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   ]
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  await move(await inventory(from, to, h.paths, () => {}, { cloud: firstCloud, cloudRequested: true, cloudAccounts: [from[1]] }), to, h.paths)
+  await moveWithPending(h, from, to, firstCloud)
   await finishPending(h.paths, { cloud: secondCloud })
   assert.deepEqual(states, { first: 'archived', second: 'archived' })
 
@@ -2098,6 +2157,32 @@ test('a local move lands before its matching Remote Control mirror archives', as
   assert.ok((await undo(h.paths, { cloud })).dest)
   assert.equal(status, 'active')
   assert.equal(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
+})
+
+test('Keep local accepts a rehome target activated by cloud archival', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_keep_activation', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  })
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, from, to, cloud)
+
+  assert.equal(moved.pendingCloud, 1)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, false)
+  assert.equal((await keepLocal(h.paths)).ok, true)
 })
 
 test('a local verification failure keeps its Remote Control source active', async () => {
