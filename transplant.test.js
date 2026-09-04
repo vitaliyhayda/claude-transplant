@@ -1281,14 +1281,14 @@ test('Keep local retains a verified bridge rehome while its remote check is unav
 test('Keep local accepts a valid rehome record used after the move', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
-  await h.record('T', SOURCE, rehomeRecord({ title: 'Original title' }))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Original title', titleSource: 'auto' }))
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
   const cloud = cloudFixture(h, { account: h.acct.T, org: h.org.T, list: async () => { throw new Error('offline') } })
   await move(await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true }), to, h.paths)
   const record = path.join(h.dir('Z'), `local_${SOURCE}.json`)
-  await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), title: 'Continued title', completedTurns: 2 }))
+  await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), title: 'Continued title', titleSource: 'user', completedTurns: 2 }))
   const kept = await keepLocal(h.paths)
 
   assert.equal(kept.ok, true)
@@ -2183,6 +2183,32 @@ test('Keep local accepts a rehome target activated by cloud archival', async () 
   assert.equal(moved.pendingCloud, 1)
   assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, false)
   assert.equal((await keepLocal(h.paths)).ok, true)
+})
+
+test('activation rollback restores receipt hashes for Keep local and Undo', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ isArchived: true }))
+  let reads = 0
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_rollback', title: `Session ${SOURCE.slice(-3)}` })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState('active', { last_event_at: ++reads >= 6 ? 'changed' : 'stable' }),
+    archive: async () => { throw new Error('archive should not run') }
+  })
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, from, to, cloud)
+  const target = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+
+  assert.equal(JSON.parse(await readFile(target, 'utf8')).isArchived, true)
+  assert.equal((await keepLocal(h.paths)).ok, true)
+  assert.ok((await undo(h.paths, { cloud })).dest)
 })
 
 test('a local verification failure keeps its Remote Control source active', async () => {

@@ -585,7 +585,7 @@ const without = (entry, keys) => {
 }
 
 const recordSemantic = (record) => sha(stable(without(record, RECORD_RUNTIME_KEYS)))
-const keepRecordSemantic = (record) => sha(stable(without(record, [...RECORD_RUNTIME_KEYS, 'title'])))
+const keepRecordSemantic = (record) => sha(stable(without(record, [...RECORD_RUNTIME_KEYS, 'title', 'titleSource'])))
 
 const semanticShape = (entry) => stable(without(entry, RUNTIME_KEYS))
 
@@ -1554,7 +1554,8 @@ async function reconcile(paths, options = {}) {
         return { title: row.title, error: 'interrupted Remote Control archive completed' }
       }
       if (['active', 'paused'].includes(current.status)) {
-        await rollbackActivation(row.activation)
+        const target = receipt.sessions?.find((session) => session.record === row.activation?.record)
+        await rollbackActivation(row.activation, target)
         addCloudFailure(receipt, row, { id: row.id, title: row.title, error: 'interrupted Remote Control archive not applied' })
         delete receipt.remotePending
         await saveJson(p.file, receipt)
@@ -2043,15 +2044,26 @@ async function restoreActivations(receipt) {
   }
 }
 
-async function rollbackActivation(activation) {
+async function rollbackActivation(activation, row = null) {
   if (!activation) return
   const raw = await readFile(activation.record).catch(() => null)
   let current = null
   try { if (raw) current = JSON.parse(raw) } catch {}
   const semantic = current ? recordSemantic(current) : null
-  if (semantic === activation.beforeSemantic) return
-  if (semantic !== activation.afterSemantic) throw new Error('activated target record changed during recovery')
-  await saveJson(activation.record, { ...current, isArchived: true })
+  if (![activation.beforeSemantic, activation.afterSemantic].includes(semantic)) throw new Error('activated target record changed during recovery')
+  const restored = semantic === activation.afterSemantic ? { ...current, isArchived: true } : current
+  const text = semantic === activation.afterSemantic ? jsonText(restored) : raw
+  if (semantic === activation.afterSemantic) await saveText(activation.record, text)
+  if (row) {
+    row.recordSha = sha(text)
+    row.recordSemantic = recordSemantic(restored)
+    row.recordKeepSemantic = keepRecordSemantic(restored)
+    row.archived = true
+    if (row.session) {
+      row.session.record = restored
+      row.session.archived = true
+    }
+  }
 }
 
 function receiptCloudCheck(receipt, cloud) {
@@ -2158,7 +2170,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       let rolledBack = false
       if (!attempted) {
         try {
-          await rollbackActivation(pending.activation)
+          await rollbackActivation(pending.activation, row)
           delete receipt.remotePending
           rolledBack = true
         } catch {}
