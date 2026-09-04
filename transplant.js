@@ -481,6 +481,18 @@ export async function cloudClient(paths, expected = null) {
   }
 }
 
+const desktopSession = (file, record) => ({
+  file,
+  id: UUID.test(record.cliSessionId ?? '') ? record.cliSessionId : null,
+  cwd: record.cwd ?? '',
+  title: record.title ?? '',
+  archived: record.isArchived === true,
+  createdAt: record.createdAt ?? 0,
+  activeAt: record.lastActivityAt ?? 0,
+  focusedAt: record.lastFocusedAt ?? 0,
+  record
+})
+
 export async function accounts(paths) {
   const { emails, orgs, pairs } = await logins(paths)
   const cur = await current(paths)
@@ -493,17 +505,7 @@ export async function accounts(paths) {
     for (const file of files) {
       const r = await readJson(file).catch(() => null)
       if (!r) { unreadable.push(file); continue }
-      sessions.push({
-        file,
-        id: UUID.test(r.cliSessionId ?? '') ? r.cliSessionId : null,
-        cwd: r.cwd ?? '',
-        title: r.title ?? '',
-        archived: r.isArchived === true,
-        createdAt: r.createdAt ?? 0,
-        activeAt: r.lastActivityAt ?? 0,
-        focusedAt: r.lastFocusedAt ?? 0,
-        record: r
-      })
+      sessions.push(desktopSession(file, r))
     }
     const activeAt = Math.max(0, ...sessions.map((s) => s.activeAt))
     const email = emails.get(account) ?? null
@@ -825,13 +827,13 @@ const carries = (a, b) => Boolean(a.sidecar && b.sidecar && a.sidecar.set.isSubs
 const included = (a, b) => historyIncluded(a, b) && carries(a, b)
 const overlaps = (a, b) => !a.roots.isDisjointFrom(b.roots)
 const progress = (report, stage, completed, total) => report(stage, `${completed}/${total}`, { live: true, completed, total })
+const desktopRecordOf = (row) => row.session?.record ?? row.record ?? {}
+const desktopFileOf = (row) => row.session?.file ?? row.file
 const bridgeIdsOf = (row) => [row, ...(row.members ?? [])].flatMap((member) => {
-  const record = member.session?.record ?? (member.record && typeof member.record === 'object' ? member.record : {})
+  const record = desktopRecordOf(member)
   return [...(member.bridgeIds ?? []), ...(record.bridgeSessionIds ?? [])]
 })
 const remoteIdsOf = (row) => [...new Set(bridgeIdsOf(row).map(remoteId).filter(Boolean))]
-const desktopRecordOf = (row) => row.session?.record ?? row.record ?? {}
-const desktopFileOf = (row) => row.session?.file ?? row.file
 const validDesktopRecord = (row) => {
   const record = desktopRecordOf(row)
   const file = desktopFileOf(row)
@@ -923,7 +925,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
         if (sha(stable(currentConversation)) !== sha(stable(remoteConversation))) throw new Error('Remote Control history changed since cached analysis')
       }
       rescuePayloads(rows)
-      const record = base.row.session?.record ?? base.row.record ?? {}
+      const record = desktopRecordOf(base.row)
       if (base.row.taskOwned || base.row.worker || record.scheduledTaskId || record.notifySessionId) return { blocked: { id: session.id, title: session.title, account, error: 'local rescue target owns a task, notification, or running worker' } }
       return { match: { session, target: { kind: 'rescue', base, id: null, title: session.title, matchMode: 'rescue' }, conversationSha: sha(stable(remoteConversation)), account } }
     } catch (error) {
@@ -948,8 +950,6 @@ const rehomeReason = (source, to, targetIds, targetNames) => {
   if (source.invalid) return `${source.invalid} unparseable lines`
   if (source.conflicts) return `${source.conflicts} conflicting duplicate uuids`
   if (!source.comparable) return 'history cannot be compared safely'
-  if (!LOCAL_RECORD.test(source.record.sessionId ?? '')) return 'Desktop record id is not a local UUID'
-  if (path.basename(source.file) !== `${source.record.sessionId}.json`) return 'Desktop record filename does not match its id'
   if (source.record.scheduledTaskId) return 'scheduled task owns the Desktop record'
   if (source.record.notifySessionId) return 'notification route owns the Desktop record'
   if (source.taskOwned) return 'scheduled task registry owns the Desktop record'
@@ -992,7 +992,9 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
             analyzed.set(transcript, detail)
           }
           if (!detail.roots.size && !detail.invalid) { missing.push(s); continue }
-          found.push({ ...s, account, transcript, ...detail, taskOwned: account.taskSessions.has(s.record.sessionId), worker: ctx.workers.has(s.id.toLowerCase()), recordSha: sha(await readFile(s.file)), recordSemantic: recordSemantic(s.record) })
+          const source = { ...s, account, transcript, ...detail, taskOwned: account.taskSessions.has(s.record.sessionId), worker: ctx.workers.has(s.id.toLowerCase()), recordSha: sha(await readFile(s.file)), recordSemantic: recordSemantic(s.record) }
+          if (validDesktopRecord(source)) found.push(source)
+          else rejected.push({ id: s.id, title: s.title, account, error: 'Desktop record identity is invalid' })
         } catch (error) {
           rejected.push({ id: s.id, title: s.title, account, error: error.message })
         }
@@ -1128,7 +1130,7 @@ async function rehomeOne(s, to, journal, guard) {
   const sourceSidecars = { ...s.sidecar, fingerprint: sidecarFingerprint }
   const sourceRecord = await readFile(s.file, 'utf8')
   const current = JSON.parse(sourceRecord)
-  if (current.cliSessionId !== s.id || !LOCAL_RECORD.test(current.sessionId ?? '') || path.basename(s.file) !== `${current.sessionId}.json`) throw new Error('source Desktop record changed identity')
+  if (current.cliSessionId !== s.id || !validDesktopRecord({ file: s.file, record: current })) throw new Error('source Desktop record changed identity')
   if (recordSemantic(current) !== s.recordSemantic) throw new Error('source Desktop record changed since inventory')
   if (current.forkedFromSessionId !== s.record.forkedFromSessionId) throw new Error('source Desktop lineage changed since inventory')
   if (current.scheduledTaskId || current.notifySessionId) throw new Error('source Desktop ownership changed since inventory')
@@ -1187,7 +1189,7 @@ const knownOf = (row) => ({
 const artifacts = (row) => row.strategy === 'rehome' ? [row.record] : [row.targetTranscript, row.targetDir, row.record].filter(Boolean)
 const retiredCount = (receipt) => (receipt.superseded ?? []).filter((p) => p.source).length
 const ownership = (row, liveWorkers, bridges = true) => {
-  const record = row.session?.record ?? row.record ?? {}
+  const record = desktopRecordOf(row)
   return [
     bridges && record.bridgeSessionIds?.length ? 'Remote Control bridge' : null,
     bridges && row.bridge ? 'transcript bridge' : null,
@@ -1363,7 +1365,7 @@ const saveText = async (file, text) => {
 
 const saveJson = (file, value, spacing = 2) => saveText(file, jsonText(value, spacing))
 
-async function pending(paths) {
+async function recoveryPending(paths) {
   const latest = await latestReceipt(paths)
   if (!latest || latest.corrupt) return latest
   const { name, file, receipt } = latest
@@ -1511,7 +1513,7 @@ async function rollbackTarget(row, dest, liveWorkers = workers()) {
 }
 
 async function reconcile(paths, options = {}) {
-  const p = await pending(paths)
+  const p = await recoveryPending(paths)
   if (!p) return null
   if (p.corrupt) {
     await rename(p.file, `${p.file}.corrupt`)
@@ -1626,12 +1628,12 @@ async function witnessed(row, liveWorkers, checkShared = true) {
       fingerprint(row.transcript).catch(() => null),
       treeFingerprint(sidecarRoot).catch(() => null)
     ])
-    const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has((row.session?.record ?? row.record).sessionId) === row.taskOwned
+    const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has(desktopRecordOf(row).sessionId) === row.taskOwned
     const shared = Boolean(currentTranscript) && (!expectedSidecars.count || await exists(sidecarRoot)) && (!checkShared || (currentTranscript === row.transcriptFingerprint && currentSidecars?.fingerprint === expectedSidecars.fingerprint))
     return shared && sameTask && !liveWorkers?.has(row.id.toLowerCase())
   }
   const now = await sidecars(row.transcript, row.id).catch(() => null)
-  const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has((row.session?.record ?? row.record).sessionId) === row.taskOwned
+  const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has(desktopRecordOf(row).sessionId) === row.taskOwned
   if (!now || now.sha !== row.sidecar.sha || !sameTask || liveWorkers?.has(row.id.toLowerCase())) return false
   return await exists(row.transcript) && !(await changed(row.transcript, row.id, { semantic: row.snapshot, semanticVersion: SEMANTIC_VERSION, bridge: row.bridge }))
 }
@@ -2336,7 +2338,7 @@ async function transfer(inv, to, paths, report) {
 export function finishPending(paths, options = {}) {
   const report = options.report ?? (() => {})
   return locked(paths, async () => {
-    const recovery = await pending(paths)
+    const recovery = await recoveryPending(paths)
     if (recovery) {
       const reconciled = await reconcile(paths, { cloud: options.cloud })
       if (reconciled?.undo) return { ...reconciled.undo, ok: true, complete: true, pendingCloud: 0, pendingUndo: [] }
@@ -2412,7 +2414,7 @@ export function finishPending(paths, options = {}) {
 
 export function keepLocal(paths) {
   return locked(paths, async () => {
-    const recovery = await pending(paths)
+    const recovery = await recoveryPending(paths)
     if (recovery) return { recoveryRequired: true, recovery }
     const latest = await latestReceipt(paths)
     if (!latest) return { nothing: true }
@@ -2427,13 +2429,21 @@ export function keepLocal(paths) {
       if (changes.length) refused.push(`${row.title} | ${changes.join(', ')} changed`)
     }
     const to = (await accounts(paths)).find((account) => sameAccount(account, receipt.toAccount))
-    const visible = new Map((to?.sessions ?? []).filter(validDesktopRecord).map((session) => [session.id, session]))
-    const pool = await index(paths.pool)
-    for (const source of (receipt.superseded ?? []).filter((row) => row.source && !receipt.sessions.some((session) => session.targetId === row.by))) {
-      const target = visible.get(source.by)
-      if (!target) refused.push(`${source.title} | destination record missing`)
-      else if (!locate(pool, target.id, target.cwd)) refused.push(`${source.title} | destination transcript missing`)
+    const existing = (receipt.superseded ?? []).filter((row) => row.source && !receipt.sessions.some((session) => session.targetId === row.by))
+    const sourceSessions = []
+    for (const source of existing) {
+      const file = source.moved?.[0]?.[1]
+      const record = file ? await readJson(file).catch(() => null) : null
+      if (record) sourceSessions.push(desktopSession(file, record))
+      else refused.push(`${source.title} | source recovery record missing`)
     }
+    if (sourceSessions.length && to) {
+      const auditSource = { account: 'retired', org: 'retired', label: 'retired sources', sessions: sourceSessions, unreadable: [], taskFile: path.join(paths.state, 'keep-local-audit-tasks.json'), taskSessions: new Set(), taskError: null }
+      const audit = await inventory([auditSource], to, paths)
+      const covered = new Set(audit.there.flatMap((source) => (source.members ?? [source]).map((member) => member.file)))
+      for (const source of sourceSessions) if (!covered.has(source.file)) refused.push(`${source.title} | destination no longer contains source history`)
+    }
+    if (sourceSessions.length && !to) refused.push(`${receipt.to} | destination account missing`)
     if (refused.length) return { file, receipt, refused }
     cancelCloudChecks(receipt)
     receipt.failed = (receipt.failed ?? []).filter((failure) => !checks.some((check) => cloudTagged(failure, check)))
@@ -2707,7 +2717,7 @@ async function main(argv) {
   if (args.cmd === 'finish') {
     const report = reporter(args.json)
     const result = await finishPending(paths, { report })
-    if (result.recoveryRequired || result.restoreProblems?.length || result.failed?.length) process.exitCode = 1
+    if (result.recoveryRequired || result.restoreProblems?.length || result.failed?.length || result.pendingUndo?.length) process.exitCode = 1
     if (args.json) {
       if (result.nothing) return emit({ nothing: true })
       if (result.reconciled) return emit({ done: true, ok: false, recoveryRequired: true, reconciled: result.reconciled })
@@ -2876,7 +2886,7 @@ async function main(argv) {
     if (inv.cloudError) report('cloud', `deferred | ${inv.cloudError}`)
   }
   if (args.dry) {
-    const p = await pending(paths)
+    const p = await recoveryPending(paths)
     if (p) {
       let text = `${p.receipt?.sessions?.length ?? 0} sessions | interrupted finalization, reconciled on the next move`
       if (p.corrupt) text = `${p.name} | corrupt receipt, set aside on the next move`

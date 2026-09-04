@@ -23,21 +23,21 @@ The menubar app shows one account list with FROM and TO controls, starts at logi
 
 ```
 From  ↑↓ move · space select · enter next
-  ❯ ◉ you@work.com · Acme Inc.    161 | 2h ago | acme-api
+  ❯ ◉ you@work.com · Acme Inc.    161 | 2h ago | acme-api | active
     ◉ you@work.com · Personal     157 | 1d ago | acme-api
-    ○ you@home.com · Personal       3 | 5d ago | notes | active
+    ○ you@home.com · Personal       3 | 5d ago | notes
 
 To    ↑↓ move · enter confirm
-  ❯ ● you@home.com · Personal       3 | 5d ago | notes | active
+  ❯ ● you@home.com · Personal       3 | 5d ago | notes
 
-  inventory   318 records | 6 without history | 2 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 2 cloud checks pending | 307 to move
+  inventory   318 records | 6 without history | 2 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 1 cloud check pending | 307 to move
   move        308 ✓ | 73,902 events | 307 zero-copy | 1 rescued
   sidecars    890 files | unchanged ✓
   desktop     308 records | 251 archived | 57 active
   verify      transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓ | 2s
   retired     310 source records → quarantine | transcripts untouched
   cloud       5 source mirrors archived
-  pending     2 source cloud checks
+  pending     1 source cloud check
 
   receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11-208.json
   undo        npx claude-transplant undo
