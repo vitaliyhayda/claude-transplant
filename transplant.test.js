@@ -38,6 +38,7 @@ const remoteState = (status, extra = {}) => ({
   ...extra
 })
 const remoteRows = (entries) => entries.map((payload, sequence_num) => ({ event_type: payload.type, payload, sequence_num, created_at: payload.timestamp }))
+const branchEntries = (count, session, start) => Array.from({ length: count }, (_, index) => entry(index % 2 ? 'assistant' : 'user', start + index, index ? start + index - 1 : null, session))
 const cli = (home, args) => promisify(execFile)(process.execPath, [path.join(here, 'transplant.js'), ...args], {
   env: { ...process.env, HOME: home },
   cwd: here
@@ -1025,12 +1026,12 @@ test('a verified target archives its source Remote Control mirror and Undo resto
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_fixture', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
-    events: async () => entries.map((row) => ({
+    eventRows: async () => remoteRows(entries.map((row) => ({
       type: row.type,
       uuid: id(Number(row.uuid.slice(-12)) + 100),
       session_id: 'cse_fixture',
       message: row.type === 'assistant' ? { ...row.message, usage: { output_tokens: 999 }, stop_reason: null } : row.message
-    })),
+    }))),
     session: async () => remoteState(status, { id: 'cse_fixture' }),
     archive: async () => { calls.push('archive'); status = 'archived' },
     unarchive: async () => { calls.push('unarchive'); status = 'active' }
@@ -1077,7 +1078,7 @@ test('attachment prompts and tiny ordering drift prove semantic Remote Control c
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_equivalent', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
-    events: async () => remote,
+    eventRows: async () => remoteRows(remote),
     session: async () => remoteState('active'),
     archive: async () => {},
     unarchive: async () => {}
@@ -1093,20 +1094,38 @@ test('attachment prompts and tiny ordering drift prove semantic Remote Control c
 
 test('a divergent Remote Control history becomes a separate verified local session', async () => {
   const h = await home()
-  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
-  await h.record('Z', SOURCE, rehomeRecord())
+  const sharedLocal = branchEntries(8, SOURCE, 20)
+  const localPrelude = [entry('user', 6, null, SOURCE), entry('assistant', 7, 6, SOURCE)]
+  await h.write(SOURCE, [...localPrelude, ...sharedLocal, entry('user', 28, 27, SOURCE, { message: { role: 'user', content: 'local branch' } })])
+  await h.record('Z', SOURCE, rehomeRecord({
+    alwaysAllowedReasons: ['anchor-only'],
+    chromeTabGroupId: 'anchor-tab',
+    chromePermissionMode: 'skip_all_permission_checks',
+    enabledMcpTools: ['anchor-only'],
+    lastSpawnRootDetected: '/anchor-only',
+    permissionMode: 'bypassPermissions',
+    promptAppendSnapshot: { append: 'anchor prompt' },
+    remoteMcpServersConfig: [{ name: 'anchor-only' }],
+    sessionPermissionUpdates: [{ tool: 'anchor-only' }],
+    sessionSettings: { safe: true },
+    spawnSeed: { anchor: true }
+  }))
   const remote = [
-    entry('user', 10, null, 'cse_rescue', { message: { role: 'user', content: 'remote branch question\u2028with separator' } }),
-    entry('assistant', 11, 10, 'cse_rescue', { message: { role: 'assistant', content: [{ type: 'text', text: 'remote branch answer' }] } })
+    ...branchEntries(8, 'cse_rescue', 20),
+    entry('user', 28, 27, 'cse_rescue', { message: { role: 'user', content: 'remote branch question\u2028with separator' } }),
+    entry('assistant', 29, 28, 'cse_rescue', { message: { role: 'assistant', content: [{ type: 'text', text: 'remote branch answer' }] } }),
+    entry('user', 30, 29, 'cse_rescue', { message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool_fixture', content: [{ type: 'tool_reference', tool_name: 'Read' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGk=' } }] }] } }),
+    { type: 'system', subtype: 'worker_shutting_down', reason: 'fixture', timestamp: '2026-09-01T00:00:14.000Z' }
   ]
   let status = 'active'
+  const createdAtSeconds = 1_788_000_000
+  const lastEventSeconds = 1_788_000_060
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_rescue', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
-    events: async () => remote,
+    list: async () => [{ id: 'cse_rescue', title: `Session ${SOURCE.slice(-3)}`, created_at: createdAtSeconds, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
     eventRows: async () => remoteRows(remote),
-    session: async () => remoteState(status),
+    session: async () => remoteState(status, { last_event_at: lastEventSeconds }),
     archive: async () => { status = 'archived' },
     unarchive: async () => { status = 'active' }
   }
@@ -1124,8 +1143,21 @@ test('a divergent Remote Control history becomes a separate verified local sessi
   const rescued = result.receipt.sessions[0]
   assert.match(await readFile(rescued.targetTranscript, 'utf8'), /\\u2028/)
   const rescuedEntries = lines(await readFile(rescued.targetTranscript, 'utf8'))
-  assert.deepEqual(rescuedEntries.filter((row) => row.message).map((row) => row.message), remote.map((row) => row.message))
-  assert.equal(JSON.parse(await readFile(rescued.record, 'utf8')).title, `Session ${SOURCE.slice(-3)}`)
+  assert.deepEqual(rescuedEntries.filter((row) => row.message).map((row) => row.message), remote.filter((row) => ['user', 'assistant'].includes(row.type)).map((row) => row.message))
+  assert.equal(rescuedEntries.some((row) => row.type === 'system'), false)
+  assert.equal(rescued.rescueAnchorId, SOURCE)
+  assert.match(rescued.remoteMessageSha, /^[0-9a-f]{64}$/)
+  const rescuedRecord = JSON.parse(await readFile(rescued.record, 'utf8'))
+  assert.equal(rescuedRecord.title, `Session ${SOURCE.slice(-3)}`)
+  assert.equal(rescuedRecord.createdAt, createdAtSeconds * 1000)
+  assert.equal(rescuedRecord.lastActivityAt, lastEventSeconds * 1000)
+  assert.equal(rescuedRecord.permissionMode, 'default')
+  assert.deepEqual(rescuedRecord.alwaysAllowedReasons, [])
+  assert.deepEqual(rescuedRecord.remoteMcpServersConfig, [{ name: 'anchor-only' }])
+  assert.deepEqual(rescuedRecord.sessionPermissionUpdates, [])
+  assert.deepEqual(rescuedRecord.sessionSettings, { safe: true })
+  for (const key of ['chromePermissionMode', 'chromeTabGroupId', 'enabledMcpTools', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'spawnSeed']) assert.equal(rescuedRecord[key], undefined)
+  await writeFile(rescued.record, JSON.stringify({ ...rescuedRecord, lastSpawnRootDetected: true, promptAppendSnapshot: { append: '', cliVersion: 'fixture' } }))
   assert.ok((await undo(h.paths, { cloud })).dest)
   assert.equal(status, 'active')
   assert.equal(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8').then(() => true), true)
@@ -1133,17 +1165,19 @@ test('a divergent Remote Control history becomes a separate verified local sessi
   assert.equal(await readFile(rescued.record).then(() => true, () => false), false)
 })
 
-test('an unsupported remote content block is never rescued or archived', async () => {
+test('an unrelated same-title local session cannot anchor a remote rescue', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
   await h.record('Z', SOURCE, rehomeRecord())
-  const remote = [entry('user', 10, null, 'cse_unsupported', { message: { role: 'user', content: [{ type: 'server-only-artifact', id: 'artifact_fixture' }] } })]
+  const remote = [
+    entry('user', 10, null, 'cse_unrelated', { message: { role: 'user', content: 'unrelated question' } }),
+    entry('assistant', 11, 10, 'cse_unrelated', { message: { role: 'assistant', content: 'unrelated answer' } })
+  ]
   let archived = false
   const cloud = {
     account: h.acct.P,
     org: h.org.P,
-    list: async () => [{ id: 'cse_unsupported', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
-    events: async () => remote,
+    list: async () => [{ id: 'cse_unrelated', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState('active'),
     archive: async () => { archived = true },
@@ -1152,7 +1186,124 @@ test('an unsupported remote content block is never rescued or archived', async (
   const all = await accounts(h.paths)
   const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
   const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
-  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.match(inv.cloud.blocked[0].error, /does not share a branch segment/)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.equal(archived, false)
+})
+
+test('an exact bridge id anchors a renamed divergent remote session', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_exact' }])
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Renamed local session' }))
+  const remote = [
+    entry('user', 10, null, 'cse_exact', { message: { role: 'user', content: 'remote-only question' } }),
+    entry('assistant', 11, 10, 'cse_exact', { message: { role: 'assistant', content: 'remote-only answer' } })
+  ]
+  let status = 'active'
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_exact', title: 'Remote renamed session', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches[0].target.kind, 'rescue')
+  assert.equal(inv.cloud.matches[0].target.base.id, SOURCE)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.equal(status, 'archived')
+})
+
+test('a rescue anchor changing after inventory keeps the remote source active', async () => {
+  const h = await home()
+  const shared = branchEntries(8, SOURCE, 30)
+  await h.write(SOURCE, [...shared, entry('user', 38, 37, SOURCE, { message: { role: 'user', content: 'local branch' } })])
+  await h.record('Z', SOURCE, rehomeRecord())
+  const remote = [...branchEntries(8, 'cse_anchor_drift', 30), entry('user', 38, 37, 'cse_anchor_drift', { message: { role: 'user', content: 'remote branch' } })]
+  let archived = false
+  let eventRowCalls = 0
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_anchor_drift', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    eventRows: async () => {
+      eventRowCalls++
+      if (eventRowCalls === 2) await appendFile(path.join(h.project, `${SOURCE}.jsonl`), `${JSON.stringify(entry('assistant', 39, 38, SOURCE))}\n`)
+      return remoteRows(remote)
+    },
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches[0].target.kind, 'rescue')
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.equal(archived, false)
+  assert.equal(eventRowCalls, 2)
+  assert.match(result.receipt.failed[0].error, /anchor changed/)
+})
+
+test('a short remote history is not matched to a differently titled local session', async () => {
+  const h = await home()
+  const remote = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, remote)
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Renamed local session' }))
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_short', title: 'Different remote title', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState('active'),
+    archive: async () => {},
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.match(inv.cloud.blocked[0].error, /too short to match a renamed local target/)
+})
+
+test('an unsupported remote content block is never rescued or archived', async () => {
+  const h = await home()
+  const shared = branchEntries(8, SOURCE, 40)
+  await h.write(SOURCE, [...shared, entry('user', 48, 47, SOURCE, { message: { role: 'user', content: 'local branch' } })])
+  await h.record('Z', SOURCE, rehomeRecord())
+  const remote = [
+    ...shared,
+    entry('user', 48, 47, 'cse_unsupported', { message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool_fixture', content: [{ type: 'image', source: { type: 'text', media_type: 'text/plain', data: 'not an image' } }] }] } })
+  ]
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_unsupported', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.match(inv.cloud.blocked[0].error, /unsupported content block/)
+  const result = await move(inv, to, h.paths)
   assert.equal(result.ok, false)
   assert.equal(result.validationOnly, true)
   assert.equal(archived, false)
@@ -1170,7 +1321,7 @@ test('missing Remote Control readiness fields fail closed', async () => {
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_unknown', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
-    events: async () => entries,
+    eventRows: async () => remoteRows(entries),
     session: async () => ({ status: 'active', last_event_at: '2026-09-01T00:01:00.000Z' }),
     archive: async () => { archived = true },
     unarchive: async () => {}
@@ -1178,7 +1329,10 @@ test('missing Remote Control readiness fields fail closed', async () => {
   const all = await accounts(h.paths)
   const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
   const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
-  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.match(inv.cloud.blocked[0].error, /not proven disconnected and idle/)
+  const result = await move(inv, to, h.paths)
   assert.equal(result.ok, false)
   assert.equal(archived, false)
   assert.match(result.receipt.failed[0].error, /not proven disconnected and idle/)
@@ -1193,7 +1347,7 @@ test('a Remote Control mirror stays active when no local target shares its title
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_other', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
-    events: async () => [entry('user', 9, null, 'cse_other', { message: { role: 'user', content: 'different history' } })],
+    eventRows: async () => remoteRows([entry('user', 9, null, 'cse_other', { message: { role: 'user', content: 'different history' } })]),
     session: async () => remoteState(archived ? 'archived' : 'active', { id: 'cse_other' }),
     archive: async () => { archived = true },
     unarchive: async () => { archived = false }
@@ -1204,7 +1358,7 @@ test('a Remote Control mirror stays active when no local target shares its title
   const inv = await inventory([from], to, h.paths, () => {}, { cloud })
   assert.equal(inv.cloud.matches.length, 0)
   assert.equal(inv.cloud.blocked.length, 1)
-  assert.match(inv.cloud.blocked[0].error, /no local target with the same title/)
+  assert.match(inv.cloud.blocked[0].error, /no linked or same-title local target/)
   const result = await move(inv, to, h.paths)
   assert.equal(result.ok, false)
   assert.equal(result.validationOnly, true)
@@ -1222,7 +1376,7 @@ test('a local move lands before its matching Remote Control mirror archives', as
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_move', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-repl'], status }],
-    events: async () => entries,
+    eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status, { id: 'cse_move' }),
     archive: async () => { assert.ok(await readFile(targetRecord)); status = 'archived' },
     unarchive: async () => { status = 'active' }
@@ -1244,6 +1398,38 @@ test('a local move lands before its matching Remote Control mirror archives', as
   assert.equal(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
 })
 
+test('a local verification failure keeps its Remote Control source active', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord())
+  let status = 'active'
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_verify', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { archived = true; status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const targetRecord = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const report = (stage, _text, progress) => {
+    if (stage !== 'verify' || progress?.completed !== 0) return
+    const record = JSON.parse(readFileSync(targetRecord, 'utf8'))
+    writeFileSync(targetRecord, JSON.stringify({ ...record, lastFocusedAt: Date.now() }))
+  }
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths, report)
+  assert.equal(result.ok, false)
+  assert.equal(archived, false)
+  assert.match(result.receipt.failed.at(-1).error, /failed verification/)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
 test('Undo refuses the wrong cloud identity before changing local records', async () => {
   const h = await home()
   const entries = [entry('user', 1, null, SOURCE)]
@@ -1254,7 +1440,7 @@ test('Undo refuses the wrong cloud identity before changing local records', asyn
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_identity', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
-    events: async () => entries,
+    eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived' },
     unarchive: async () => { status = 'active' }
@@ -1282,7 +1468,7 @@ test('Undo checks an activated target before restoring its cloud mirror', async 
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_changed', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
-    events: async () => entries,
+    eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived' },
     unarchive: async () => { unarchived = true; status = 'active' }
@@ -1312,7 +1498,7 @@ test('interrupted target activation restoration resumes when the prior state is 
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_activation_resume', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
-    events: async () => entries,
+    eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived' },
     unarchive: async () => { status = 'active' }
@@ -1344,7 +1530,7 @@ test('a connected Remote Control session is never archived or locally activated'
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_busy', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
-    events: async () => entries,
+    eventRows: async () => remoteRows(entries),
     session: async () => remoteState('active', { connection_status: 'connected' }),
     archive: async () => { archived = true },
     unarchive: async () => {}
@@ -1370,7 +1556,7 @@ test('an interrupted Remote Control archive is recovered from server state', asy
     account: h.acct.P,
     org: h.org.P,
     list: async () => [{ id: 'cse_interrupted', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
-    events: async () => entries,
+    eventRows: async () => remoteRows(entries),
     session: async () => remoteState(status),
     archive: async () => { status = 'archived'; if (first) { first = false; throw new Error('connection lost after archive') } },
     unarchive: async () => { status = 'active' }
@@ -1501,6 +1687,18 @@ test('dry-run and real move agree that bridges rehome across logins', async () =
   assert.ok((await undo(h.paths)).dest)
   const restored = JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8'))
   assert.deepEqual(restored.bridgeSessionIds, ['session_fixture'])
+})
+
+test('a bridge marker without a recognized id remains conservatively bridged', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), { type: 'bridge-session', sessionId: SOURCE }])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.move[0].bridge, true)
+  assert.deepEqual(inv.move[0].bridgeIds, [])
 })
 
 test('the planning cache skips unchanged analysis but never authorizes a move', async () => {

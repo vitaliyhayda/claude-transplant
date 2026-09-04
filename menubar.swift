@@ -184,13 +184,7 @@ final class Model: ObservableObject {
             let cloudArchived = event.cloudArchived ?? 0
             let failed = event.failed ?? []
             if !failed.isEmpty {
-                if failed.count == 1 {
-                    lines.append(("failed", identity(failed[0].title, failed[0].id) + " | " + failed[0].error))
-                } else {
-                    var reasons: [String] = []
-                    for failure in failed where !reasons.contains(failure.error) { reasons.append(failure.error) }
-                    lines.append(("failed", reasons.map { reason in "\(failed.filter { $0.error == reason }.count) sessions | \(reason)" }.joined(separator: "\n")))
-                }
+                lines.append(("failed", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n")))
             }
             let problems = event.problems ?? []
             for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
@@ -199,7 +193,7 @@ final class Model: ObservableObject {
             if moved - rescued > 0 { outcomes.append("\(moved - rescued) sessions moved") }
             if rescued > 0 { outcomes.append("\(rescued) remote branches rescued") }
             if cloudArchived > 0 { outcomes.append("\(cloudArchived) cloud mirrors archived") }
-            else if moved == 0, retired > 0 { outcomes.append("\(retired) source entries retired") }
+            if moved == 0, retired > 0 { outcomes.append("\(retired) source entries retired") }
             if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
             if !problems.isEmpty { outcomes.append("verification failed") }
             let summary = outcomes.isEmpty ? "Nothing to move" : outcomes.joined(separator: ", ")

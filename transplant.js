@@ -18,11 +18,12 @@ const ORG_URL = new RegExp(`/(?:organizations|bootstrap)/(${UUID_PATTERN})(?:[/?
 const NOTE = 'restart Claude Desktop to see them'
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 5
+const CACHE_VERSION = 6
 const ACTIVE_WINDOW = 10 * 60 * 1000
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
+const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const REMOTE_TAGS = new Set(['remote-control-sdk', 'remote-control-repl'])
-const HELP = `claude-transplant   move Claude Code history between accounts, transcripts untouched
+const HELP = `claude-transplant   move Claude Code history between accounts
 
   claude-transplant             pick from → to, move, retire the source entries, print receipt
   claude-transplant --dry-run   plan only, write nothing, refuses while recovery is pending
@@ -39,11 +40,16 @@ const HELP = `claude-transplant   move Claude Code history between accounts, tra
 const sha = (data) => createHash('sha256').update(data).digest('hex')
 const sortKeys = (v) => Array.isArray(v) ? v.map(sortKeys) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v
 const stable = (v) => JSON.stringify(sortKeys(v))
+const jsonText = (value, spacing = 2) => `${JSON.stringify(value, null, spacing || undefined)}\n`
 const short = (id) => id.slice(0, 8)
 const count = (v) => v.toLocaleString('en-US')
 const exists = (p) => stat(p).then(() => true, () => false)
 const readJson = async (p) => JSON.parse(await readFile(p, 'utf8'))
 const stamp = () => new Date().toISOString().slice(0, 23).replace(/[:.]/g, '-')
+const milliseconds = (value) => {
+  const raw = typeof value === 'number' ? value : Date.parse(value ?? '')
+  return Number.isFinite(raw) ? (raw < 1e12 ? raw * 1000 : raw) : -1
+}
 const typed = (e) => e && typeof e === 'object' && TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain
 const message = (e) => typed(e) && e.type !== 'progress'
 const recent = (time) => Date.now() - time >= 0 && Date.now() - time <= ACTIVE_WINDOW
@@ -293,16 +299,12 @@ function mode(values) {
 async function current(paths) {
   const desktop = await readJson(paths.desktop).catch(() => ({}))
   const samples = (await readJson(paths.usage).catch(() => ({}))).samples ?? []
-  const clock = (value) => {
-    const raw = typeof value === 'number' ? value : Date.parse(value ?? '')
-    return Number.isFinite(raw) ? (raw < 1e12 ? raw * 1000 : raw) : -1
-  }
-  const latest = samples.reduce((best, sample) => clock(sample?.t) > best.time ? { org: sample.org, time: clock(sample.t) } : best, { org: null, time: -1 })
+  const latest = samples.reduce((best, sample) => milliseconds(sample?.t) > best.time ? { org: sample.org, time: milliseconds(sample.t) } : best, { org: null, time: -1 })
   const breadcrumbs = (await readJson(paths.scope).catch(() => ({}))).scope?.breadcrumbs ?? []
   const seen = breadcrumbs.reduce((best, crumb) => {
     const url = crumb?.data?.url
     const match = typeof url === 'string' ? url.match(ORG_URL) : null
-    const time = clock(crumb?.timestamp)
+    const time = milliseconds(crumb?.timestamp)
     return match && Number.isFinite(time) && time > best.time ? { org: match[1], time } : best
   }, { org: null, time: -1 })
   return { account: desktop.lastKnownAccountUuid ?? null, org: recent(seen.time) ? seen.org : recent(latest.time) ? latest.org : null }
@@ -370,6 +372,10 @@ const wireRemoteId = (id) => {
   return id.replace(/^cse_/, 'session_')
 }
 
+const remoteId = (id) => {
+  try { return wireRemoteId(id) } catch { return null }
+}
+
 export async function cloudClient(paths, expected = null) {
   const cookies = desktopCookies(paths)
   const cookie = [...cookies].map(([name, value]) => `${name}=${value}`).join('; ')
@@ -417,6 +423,7 @@ export async function cloudClient(paths, expected = null) {
   const eventRows = async (id) => {
     const out = []
     let cursor = null
+    let lastSequence = null
     const seen = new Set()
     for (let page = 0; page < 20; page++) {
       const query = new URLSearchParams({ limit: '500', sort_order: 'asc' })
@@ -425,6 +432,13 @@ export async function cloudClient(paths, expected = null) {
       if (!Array.isArray(body?.data)) throw new Error('Remote Control history response changed')
       const data = body.data
       if (data.some((event) => !event || typeof event !== 'object' || typeof event.event_type !== 'string' || !event.payload || typeof event.payload !== 'object')) throw new Error('Remote Control event response changed')
+      for (const event of data) {
+        const sequence = typeof event.sequence_num === 'number' && Number.isSafeInteger(event.sequence_num) && event.sequence_num >= 0
+          ? BigInt(event.sequence_num)
+          : typeof event.sequence_num === 'string' && /^\d+$/.test(event.sequence_num) ? BigInt(event.sequence_num) : null
+        if (sequence === null || (lastSequence !== null && sequence <= lastSequence)) throw new Error('Remote Control event sequence changed')
+        lastSequence = sequence
+      }
       out.push(...data)
       if (data.length < 500) return out
       cursor = body?.resume_cursor
@@ -445,7 +459,6 @@ export async function cloudClient(paths, expected = null) {
       return body.data
     },
     eventRows,
-    events: async (id) => (await eventRows(id)).filter((event) => ['user', 'assistant'].includes(event.event_type)).map((event) => event.payload),
     session,
     archive: (id) => request(`/v1/code/sessions/${wireRemoteId(id)}/archive`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }),
     unarchive: (id) => request(`/v1/code/sessions/${wireRemoteId(id)}/unarchive`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
@@ -675,17 +688,15 @@ const lineageEvent = (entry) => {
 
 const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && ['stdout', 'stderr'].every((k) => !a[k] || a[k] === b[k])
 
-const messageHash = (type, value) => {
-  const message = structuredClone(value)
-  for (const key of ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']) delete message[key]
-  return sha(stable({ type, message }))
-}
+const messageHash = (type, value) => sha(stable({ type, message: without(value, MESSAGE_RUNTIME_KEYS) }))
 
 const conversation = (entries) => entries.flatMap((entry) => {
   if (entry && ['user', 'assistant'].includes(entry.type) && entry.message) return [messageHash(entry.type, entry.message)]
   if (entry?.type === 'attachment' && typeof entry.attachment?.prompt === 'string') return [messageHash('user', { role: 'user', content: entry.attachment.prompt })]
   return []
 })
+
+const conversationFromRows = (rows) => conversation(rows.filter((row) => ['user', 'assistant'].includes(row.event_type)).map((row) => row.payload))
 
 const orderedConversation = (source, target) => {
   if (!Array.isArray(source) || !Array.isArray(target) || !source.length) return false
@@ -713,6 +724,15 @@ const conversationLcs = (source, target) => {
     prior = next
   }
   return prior[target.length]
+}
+
+const conversationAnchored = (source, target, needed) => {
+  if (source.length < needed || target.length < needed) return false
+  outer: for (let start = target.indexOf(source[0]); start >= 0; start = target.indexOf(source[0], start + 1)) {
+    for (let at = 1; at < needed; at++) if (source[at] !== target[start + at]) continue outer
+    return true
+  }
+  return false
 }
 
 const conversationMatch = (source, target) => {
@@ -768,7 +788,9 @@ async function history(id, transcript, ctx, cwd = '') {
   const roots = new Set(events.keys())
   const state = sha(stable(sessionState(data.entries, id, origin)))
   const comparable = data.invalid === 0 && conflicts === 0 && roots.size > 0
-  const result = { roots, events, conversation: ctx.cloud ? conversation(normalized.entries) : undefined, forks: ctx.scans.get(transcript)?.forked.size ?? 0, state, bridge: data.entries.some((entry) => entry.type === 'bridge-session'), invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
+  const bridges = data.entries.filter((entry) => entry.type === 'bridge-session')
+  const bridgeIds = [...new Set(bridges.map((entry) => entry.bridgeSessionId ?? entry.bridge_session_id).filter((value) => typeof value === 'string'))]
+  const result = { roots, events, conversation: ctx.cloud ? conversation(normalized.entries) : undefined, forks: ctx.scans.get(transcript)?.forked.size ?? 0, state, bridge: bridges.length > 0, bridgeIds, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
   if (ctx.cache) {
     const encoded = { ...result, roots: undefined, events: [...events] }
     cacheStore(ctx.cache, 'histories', cacheKey, sha(stable(dependencyRows)), { dependencies: dependencyRows, result: encoded })
@@ -790,14 +812,23 @@ async function cloudInventory(cloud, from, targets, move, cache, report) {
   if (!cloud) return { checked: false, matches: [], blocked: [], client: null }
   const account = from.find((candidate) => candidate.account === cloud.account && candidate.org === cloud.org)
   if (!account) return { checked: false, matches: [], blocked: [], client: cloud }
+  const candidate = (kind, row, title) => {
+    const members = [row, ...(row.members ?? [])]
+    const ids = members.flatMap((member) => {
+      const record = member.session?.record ?? (member.record && typeof member.record === 'object' ? member.record : {})
+      return [...(member.bridgeIds ?? []), ...(record.bridgeSessionIds ?? [])]
+    })
+    const remoteIds = new Set(ids.map(remoteId).filter(Boolean))
+    return { kind, id: row.id, title, conversation: row.conversation, remoteIds, row }
+  }
   const candidates = [
-    ...targets.map((target) => ({ kind: 'existing', id: target.id, title: target.session.title, conversation: target.conversation, row: target })),
-    ...move.map((source) => ({ kind: 'move', id: source.id, title: source.title, conversation: source.conversation, row: source }))
+    ...targets.map((target) => candidate('existing', target, target.session.title)),
+    ...move.map((source) => candidate('move', source, source.title))
   ]
   const sessions = (await cloud.list()).filter((session) =>
     session?.environment_kind === 'bridge' &&
     Array.isArray(session.tags) && session.tags.some((tag) => REMOTE_TAGS.has(tag)) &&
-    ['active', 'paused'].includes(session.status)
+    REMOTE_OPEN.has(session.status)
   )
   const matches = []
   const blocked = from.filter((candidate) => candidate !== account).map((candidate) => ({
@@ -810,23 +841,40 @@ async function cloudInventory(cloud, from, targets, move, cache, report) {
   if (sessions.length) progress(report, 'cloud scan', completed, sessions.length)
   const analyze = async (session) => {
     try {
+      const sessionId = wireRemoteId(session.id)
       const named = candidates.filter((candidate) => candidate.title === session.title)
-      const signature = sha(stable({ id: session.id, updatedAt: session.updated_at, lastEventAt: session.last_event_at, status: session.status }))
+      const linked = candidates.filter((candidate) => candidate.remoteIds.has(sessionId))
+      if (linked.length > 1) return { blocked: { id: session.id, title: session.title, account, error: 'multiple local targets carry the Remote Control id' } }
+      const detail = await cloud.session(session.id)
+      assertRemoteIdle(detail)
+      const signature = sha(stable({ id: session.id, updatedAt: session.updated_at, lastEventAt: detail.last_event_at, status: detail.status }))
       let remoteConversation = cacheLookup(cache, 'remote', session.id, signature)?.conversation
+      let rows = null
       if (!remoteConversation) {
-        remoteConversation = conversation(await cloud.events(session.id))
+        rows = (await stableRemoteRows(cloud, session.id)).rows
+        remoteConversation = conversationFromRows(rows)
         cacheStore(cache, 'remote', session.id, signature, { conversation: remoteConversation })
       }
       const findCovered = (items) => items.flatMap((candidate) => {
         const matchMode = conversationMatch(remoteConversation, candidate.conversation)
         return matchMode ? [{ ...candidate, matchMode }] : []
       })
-      const namedCovered = findCovered(named)
-      const covered = namedCovered.length ? namedCovered : findCovered(candidates)
+      const eligible = remoteConversation.length >= 4 ? candidates : [...new Set([...named, ...linked])]
+      const covered = findCovered(eligible)
       if (covered.length > 1) return { blocked: { id: session.id, title: session.title, account, error: 'multiple verified local target histories' } }
       if (covered.length === 1) return { match: { session, target: covered[0], conversationSha: sha(stable(remoteConversation)), account } }
-      if (named.length !== 1) return { blocked: { id: session.id, title: session.title, account, error: named.length ? 'multiple divergent local targets' : 'no local target with the same title' } }
-      const base = named[0]
+      if (remoteConversation.length < 4 && findCovered(candidates.filter((candidate) => !eligible.includes(candidate))).length) return { blocked: { id: session.id, title: session.title, account, error: 'remote history is too short to match a renamed local target' } }
+      const anchors = linked.length ? linked : named
+      if (anchors.length !== 1) return { blocked: { id: session.id, title: session.title, account, error: anchors.length ? 'multiple divergent local targets' : 'no linked or same-title local target' } }
+      const base = anchors[0]
+      const minimumAnchor = 8
+      if (!linked.length && !conversationAnchored(remoteConversation, base.conversation, minimumAnchor)) return { blocked: { id: session.id, title: session.title, account, error: 'same-title local target does not share a branch segment' } }
+      if (!rows) {
+        rows = (await stableRemoteRows(cloud, session.id)).rows
+        const currentConversation = conversationFromRows(rows)
+        if (sha(stable(currentConversation)) !== sha(stable(remoteConversation))) throw new Error('Remote Control history changed since cached analysis')
+      }
+      rescuePayloads(rows)
       const record = base.row.session?.record ?? base.row.record ?? {}
       if (base.row.taskOwned || base.row.worker || record.scheduledTaskId || record.notifySessionId) return { blocked: { id: session.id, title: session.title, account, error: 'local rescue target owns a task, notification, or running worker' } }
       return { match: { session, target: { kind: 'rescue', base, id: null, title: session.title, matchMode: 'rescue' }, conversationSha: sha(stable(remoteConversation)), account } }
@@ -1006,7 +1054,7 @@ async function rehomeOne(s, to, journal, guard) {
   const record = path.join(to.dir, path.basename(s.file))
   const sourceRecordSha = sha(sourceRecord)
   const placed = { ...current, bridgeSessionIds: [] }
-  const recordText = `${JSON.stringify(placed, null, 2)}\n`
+  const recordText = jsonText(placed)
   const recordSha = sha(recordText)
   await journal({ strategy: 'rehome', recordSha })
   await writeNew(record, recordText)
@@ -1202,7 +1250,7 @@ const saveText = async (file, text) => {
   }
 }
 
-const saveJson = (file, value, spacing = 2) => saveText(file, `${JSON.stringify(value, null, spacing || undefined)}\n`)
+const saveJson = (file, value, spacing = 2) => saveText(file, jsonText(value, spacing))
 
 async function pending(paths) {
   const name = (await receipts(paths)).at(-1)
@@ -1413,11 +1461,8 @@ async function reconcile(paths, options = {}) {
       ? await readFile(made[0]).then((raw) => Boolean(receipt.pending.recordSha && sha(raw) !== receipt.pending.recordSha), () => false)
       : await changed(made[0], targetId, knownOf(receipt.pending))
     if (!used) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-    const error = used
-      ? strategy === 'rehome'
-        ? 'interrupted, target record changed since, left in place'
-        : 'interrupted, legacy copy changed since, left in place'
-      : 'interrupted'
+    const changedCopy = strategy === 'rehome' ? 'target record' : strategy === 'remote' ? 'remote rescue' : 'legacy copy'
+    const error = used ? `interrupted, ${changedCopy} changed since, left in place` : 'interrupted'
     receipt.failed.push({ id, title, targetId, artifacts: made, retained: used, error })
     if (used) receipt.retained = [...(receipt.retained ?? []), { id, title, targetId, artifacts: made }]
     receipt.pending = null
@@ -1630,6 +1675,7 @@ async function retire(inv, receipt, paths, at, problems, save, report = () => {}
   await save()
 }
 
+const REMOTE_OPEN = new Set(['active', 'paused'])
 const REMOTE_IDLE = new Set([
   'WORKER_STATUS_UNSPECIFIED', 'WORKER_STATUS_IDLE', 'WORKER_STATUS_DISCONNECTED',
   'idle', 'disconnected', 'stopped'
@@ -1638,8 +1684,55 @@ const remoteBusy = (session) => session?.connection_status !== 'disconnected' ||
   !Array.isArray(session?.client_presence) || session.client_presence.length > 0 ||
   !REMOTE_IDLE.has(session?.worker_status)
 
-const REMOTE_BLOCKS = new Set(['text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'image', 'document'])
+function assertRemoteIdle(session) {
+  if (!REMOTE_OPEN.has(session?.status)) throw new Error(`Remote Control status changed to ${session?.status ?? 'unknown'}`)
+  if (remoteBusy(session)) throw new Error('Remote Control session is not proven disconnected and idle')
+  if (!['string', 'number'].includes(typeof session.last_event_at)) throw new Error('Remote Control event marker is missing')
+  return session.last_event_at
+}
+
+async function stableRemoteRows(cloud, id) {
+  const before = await cloud.session(id)
+  const marker = assertRemoteIdle(before)
+  const rows = await cloud.eventRows(id)
+  const after = await cloud.session(id)
+  assertRemoteIdle(after)
+  if (after.last_event_at !== marker) throw new Error('Remote Control history changed while reading')
+  return { rows, marker, session: after }
+}
+
+const REMOTE_BLOCKS = new Set(['text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'tool_reference', 'image', 'document'])
+const REMOTE_RESULT_BLOCKS = new Set(['text', 'tool_reference', 'image', 'document'])
+const RESCUE_RECORD_KEYS = [
+  'classifierSummaryEnabled', 'effort', 'model', 'originCwd', 'remoteMcpServersConfig', 'sessionSettings'
+]
 const jsonLine = (value) => JSON.stringify(value).replace(/\u0085/g, '\\u0085').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+
+const supportedRemoteSource = (source, blockType) => {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return false
+  if (source.type === 'base64') {
+    const media = typeof source.media_type === 'string' && (blockType === 'image' ? source.media_type.startsWith('image/') : source.media_type === 'application/pdf')
+    return media && typeof source.data === 'string' && source.data.length > 0 && source.data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(source.data)
+  }
+  if (source.type === 'url') {
+    try { return ['http:', 'https:'].includes(new URL(source.url).protocol) } catch { return false }
+  }
+  if (source.type === 'text') return blockType === 'document' && source.media_type === 'text/plain' && typeof source.data === 'string'
+  return false
+}
+
+const supportedRemoteBlock = (block) => {
+  if (!block || typeof block !== 'object' || !REMOTE_BLOCKS.has(block.type)) return false
+  if (block.type === 'text') return typeof block.text === 'string'
+  if (block.type === 'thinking') return typeof block.thinking === 'string'
+  if (block.type === 'redacted_thinking') return typeof block.data === 'string'
+  if (block.type === 'tool_use') return typeof block.id === 'string' && typeof block.name === 'string' && block.input && typeof block.input === 'object' && !Array.isArray(block.input)
+  if (block.type === 'tool_reference') return typeof block.tool_name === 'string'
+  if (block.type === 'image' || block.type === 'document') return supportedRemoteSource(block.source, block.type)
+  if (typeof block.tool_use_id !== 'string') return false
+  if (typeof block.content === 'string') return true
+  return Array.isArray(block.content) && block.content.every((nested) => REMOTE_RESULT_BLOCKS.has(nested?.type) && supportedRemoteBlock(nested))
+}
 
 function rescuePayloads(rows) {
   const messages = rows.filter((row) => ['user', 'assistant'].includes(row.event_type))
@@ -1649,23 +1742,20 @@ function rescuePayloads(rows) {
     if (payload.type !== row.event_type || !payload.message || typeof payload.message !== 'object' || payload.message.role !== row.event_type) throw new Error('Remote Control message response changed')
     const content = payload.message.content
     if (typeof content !== 'string' && !Array.isArray(content)) throw new Error('Remote Control message content changed')
-    if (Array.isArray(content) && content.some((block) => !block || typeof block !== 'object' || !REMOTE_BLOCKS.has(block.type))) throw new Error('Remote Control history contains an unsupported content block')
+    if (Array.isArray(content) && content.some((block) => !supportedRemoteBlock(block))) throw new Error('Remote Control history contains an unsupported content block')
   }
   return messages
 }
 
 async function rescueRemote(match, to, cloud, journal) {
   const base = match.target.base.row
-  const before = await cloud.session(match.session.id)
-  if (!['active', 'paused'].includes(before.status) || remoteBusy(before)) throw new Error('Remote Control session is not proven disconnected and idle')
-  if (!['string', 'number'].includes(typeof before.last_event_at)) throw new Error('Remote Control event marker is missing')
-  const rows = await cloud.eventRows(match.session.id)
+  if (!(await untouched(base, workers()))) throw new Error('local rescue anchor changed since inventory')
+  const { rows, session: after } = await stableRemoteRows(cloud, match.session.id)
+  if (!(await untouched(base, workers()))) throw new Error('local rescue anchor changed while reading remote history')
   const messages = rescuePayloads(rows)
-  const after = await cloud.session(match.session.id)
-  if (!['active', 'paused'].includes(after.status) || remoteBusy(after)) throw new Error('Remote Control session is not proven disconnected and idle')
-  if (after.last_event_at !== before.last_event_at) throw new Error('Remote Control history changed while preparing rescue')
-  const remoteConversation = conversation(messages.map((row) => row.payload))
-  if (sha(stable(remoteConversation)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
+  const remoteHistory = conversationFromRows(messages)
+  const remoteMessageSha = sha(stable(messages.map((row) => row.payload.message)))
+  if (sha(stable(remoteHistory)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
 
   const baseRecordFile = base.session?.file ?? base.file
   const baseRecord = await readJson(baseRecordFile)
@@ -1686,7 +1776,7 @@ async function rescueRemote(match, to, cloud, journal) {
   }
   const entries = []
   let parentUuid = null
-  for (const row of rows.filter((event) => ['user', 'assistant', 'system'].includes(event.event_type))) {
+  for (const row of messages) {
     const payload = row.payload
     const uuid = randomUUID()
     const entry = {
@@ -1701,21 +1791,19 @@ async function rescueRemote(match, to, cloud, journal) {
     if (payload.request_id !== undefined) entry.requestId = payload.request_id
     if (payload.tool_use_result !== undefined) entry.toolUseResult = structuredClone(payload.tool_use_result)
     if (payload.tool_use_meta !== undefined) entry.toolUseMeta = structuredClone(payload.tool_use_meta)
-    if (row.event_type === 'system') {
-      for (const [key, value] of Object.entries(payload)) if (!['session_id', 'type', 'uuid', 'timestamp'].includes(key)) entry[key] = structuredClone(value)
-    }
     entries.push(entry)
     parentUuid = uuid
   }
+  if (sha(stable(entries.filter((entry) => ['user', 'assistant'].includes(entry.type)).map((entry) => entry.message))) !== remoteMessageSha) throw new Error('rescued transcript does not preserve exact remote message payloads')
   if (sha(stable(conversation(entries))) !== match.conversationSha) throw new Error('rescued transcript does not contain the remote message history')
   const now = new Date().toISOString()
   entries.push({ type: 'custom-title', customTitle: match.session.title, sessionId: targetId, uuid: randomUUID(), timestamp: now })
   const transcriptText = `${entries.map(jsonLine).join('\n')}\n`
-  const createdAt = Date.parse(match.session.created_at)
-  const lastActivityAt = Date.parse(after.last_event_at)
-  const placed = { ...baseRecord, sessionId: `local_${targetId}`, cliSessionId: targetId, title: match.session.title, titleSource: 'user', isArchived: false, bridgeSessionIds: [], createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(), lastActivityAt: Number.isFinite(lastActivityAt) ? lastActivityAt : Date.now(), lastFocusedAt: Number.isFinite(lastActivityAt) ? lastActivityAt : Date.now(), completedTurns: rows.reduce((turns, row) => Math.max(turns, Number(row.payload?.num_turns) || 0), 0) }
-  for (const key of ['forkedFromSessionId', 'notifySessionId', 'scheduledTaskId']) delete placed[key]
-  const recordText = `${JSON.stringify(placed, null, 2)}\n`
+  const createdAt = milliseconds(match.session.created_at)
+  const lastActivityAt = milliseconds(after.last_event_at)
+  const settings = Object.fromEntries(RESCUE_RECORD_KEYS.filter((key) => baseRecord[key] !== undefined).map((key) => [key, structuredClone(baseRecord[key])]))
+  const placed = { ...settings, sessionId: `local_${targetId}`, cliSessionId: targetId, cwd: baseRecord.cwd, title: match.session.title, titleSource: 'user', permissionMode: 'default', alwaysAllowedReasons: [], sessionPermissionUpdates: [], isArchived: false, bridgeSessionIds: [], createdAt: createdAt >= 0 ? createdAt : Date.now(), lastActivityAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), lastFocusedAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), completedTurns: rows.reduce((turns, row) => Math.max(turns, Number(row.payload?.num_turns) || 0), 0) }
+  const recordText = jsonText(placed)
   const made = [targetTranscript, record]
   const targetSemantic = semantic(entries, targetId)
   await journal({ strategy: 'remote', id: targetId, targetId, made, targetSha: sha(transcriptText), targetSemantic, targetSemanticVersion: SEMANTIC_VERSION })
@@ -1728,6 +1816,8 @@ async function rescueRemote(match, to, cloud, journal) {
     strategy: 'remote',
     id: targetId,
     remoteId: match.session.id,
+    rescueAnchorId: base.id,
+    remoteMessageSha,
     targetId,
     title: match.session.title,
     archived: false,
@@ -1745,7 +1835,7 @@ async function rescueRemote(match, to, cloud, journal) {
     targetSemanticVersion: SEMANTIC_VERSION,
     targetSha: sha(transcriptText),
     sidecars: { count: 0, bytes: 0, sha: sha(stable([])), fingerprint: sidecarFingerprint },
-    events: remoteConversation.length,
+    events: remoteHistory.length,
     remoteEvents: rows.length,
     remoteEventSha
   }
@@ -1765,6 +1855,7 @@ const remoteReceipt = (match) => ({
   id: match.session.id,
   title: match.session.title,
   account: match.account.account,
+  accountLabel: match.account.label,
   org: match.account.org,
   status: match.session.status,
   conversationSha: match.conversationSha,
@@ -1781,14 +1872,14 @@ async function targetActivation(row) {
   if (recordSemantic(current) !== row.recordSemantic) throw new Error('local target record changed before Remote Control archival')
   if (current.isArchived !== true) return null
   const after = { ...current, isArchived: false }
-  const afterText = `${JSON.stringify(after, null, 2)}\n`
+  const afterText = jsonText(after)
   return { record, beforeSha: sha(raw), beforeSemantic: recordSemantic(current), afterSha: sha(afterText), afterSemantic: recordSemantic(after), after }
 }
 
 async function applyActivation(activation, row) {
   if (!activation) return
   if (sha(await readFile(activation.record)) !== activation.beforeSha) throw new Error('local target record changed before activation')
-  await saveText(activation.record, `${JSON.stringify(activation.after, null, 2)}\n`)
+  await saveText(activation.record, jsonText(activation.after))
   if (sha(await readFile(activation.record)) !== activation.afterSha) throw new Error('local target activation verification failed')
   row.recordSha = activation.afterSha
   row.recordSemantic = activation.afterSemantic
@@ -1842,12 +1933,18 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
   const matches = (inv.cloud?.matches ?? []).filter((match) => !match.target.failed)
   if (!matches.length) return
   const cloud = inv.cloud.client
+  const failedVerification = new Set(receipt.verification?.problems?.map((problem) => problem.id) ?? [])
   let archived = 0
   progress(report, 'cloud', archived, matches.length)
   for (const [index, match] of matches.entries()) {
     const row = match.target.kind === 'existing'
       ? match.target.row
       : receipt.sessions.find((session) => session.targetId === match.target.id)
+    if (failedVerification.has(row?.targetId ?? match.target.id)) {
+      receipt.failed.push({ id: match.session.id, title: match.session.title, error: 'local target failed verification, Remote Control source kept' })
+      progress(report, 'cloud', ++archived, matches.length)
+      continue
+    }
     const liveWorkers = workers()
     const targetOkay = row?.targetId
       ? !(await targetChanges(row, liveWorkers, true)).length
@@ -1859,17 +1956,10 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
     }
     let lastEventAt = null
     try {
-      const before = await cloud.session(match.session.id)
-      if (!['active', 'paused'].includes(before.status)) throw new Error(`Remote Control status changed to ${before.status ?? 'unknown'}`)
-      if (remoteBusy(before)) throw new Error('Remote Control session is not proven disconnected and idle')
-      if (!['string', 'number'].includes(typeof before.last_event_at)) throw new Error('Remote Control event marker is missing')
-      lastEventAt = before.last_event_at
-      const currentConversation = conversation(await cloud.events(match.session.id))
+      const current = await stableRemoteRows(cloud, match.session.id)
+      lastEventAt = current.marker
+      const currentConversation = conversationFromRows(current.rows)
       if (sha(stable(currentConversation)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
-      const after = await cloud.session(match.session.id)
-      if (!['active', 'paused'].includes(after.status)) throw new Error(`Remote Control status changed to ${after.status ?? 'unknown'}`)
-      if (remoteBusy(after)) throw new Error('Remote Control session is not proven disconnected and idle')
-      if (after.last_event_at !== lastEventAt) throw new Error('Remote Control history changed while verifying')
     } catch (error) {
       receipt.failed.push({ id: match.session.id, title: match.session.title, error: error.message })
       progress(report, 'cloud', ++archived, matches.length)
@@ -1891,8 +1981,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       await applyActivation(pending.activation, row)
       await save()
       const current = await cloud.session(pending.id)
-      if (!['active', 'paused'].includes(current.status)) throw new Error(`Remote Control status changed to ${current.status ?? 'unknown'}`)
-      if (remoteBusy(current)) throw new Error('Remote Control session is not proven disconnected and idle')
+      assertRemoteIdle(current)
       if (current.last_event_at !== pending.lastEventAt) throw new Error('Remote Control history changed before archival')
       attempted = true
       await cloud.archive(pending.id)
@@ -1927,7 +2016,7 @@ async function receiptCloud(receipt, paths, supplied) {
   const row = receipt.remotePending ?? receipt.remoteUndoing?.[0] ?? receipt.remote?.[0]
   if (!row) return null
   const cloud = supplied ?? await cloudClient(paths)
-  if (cloud.account !== row.account || cloud.org !== row.org) throw new Error(`sign Claude Desktop into the source account ${row.account.slice(0, 8)} · ${row.org.slice(0, 8)}`)
+  if (cloud.account !== row.account || cloud.org !== row.org) throw new Error(`sign Claude Desktop into the source account ${row.accountLabel ?? `${row.account.slice(0, 8)} · ${row.org.slice(0, 8)}`}`)
   return cloud
 }
 
@@ -1941,7 +2030,7 @@ async function restoreRemote(receipt, file, paths, supplied) {
       const current = await cloud.session(row.id)
       if (current.status === 'archived') await cloud.unarchive(row.id)
       const after = await waitRemote(cloud, row.id, ['active', 'paused'])
-      if (!['active', 'paused'].includes(after.status)) return [`${row.title} | Remote Control unarchive verification returned ${after.status ?? 'unknown'}`]
+      if (!REMOTE_OPEN.has(after.status)) return [`${row.title} | Remote Control unarchive verification returned ${after.status ?? 'unknown'}`]
       receipt.remoteUndoing.shift()
       await saveJson(file, receipt)
     } catch (error) {

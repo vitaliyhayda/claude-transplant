@@ -17,9 +17,9 @@ npx claude-transplant menubar
 npx claude-transplant
 ```
 
-To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v2.1.0` or a commit hash to pin.
+To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v2.1.1` or a commit hash to pin.
 
-The menubar app asks From and To, starts at login, shows progress in the icon, and posts a notification when done. Sign Claude Desktop into From before moving so Remote Control mirrors can be reconciled. The active account is tagged. When one account is left unpicked it becomes the destination. The app bundles its own copy of the CLI, so run the menubar command again after upgrading. `menubar --remove` uninstalls. The animation above is rendered by the app itself with `--demo <dir>`.
+The menubar app asks From and To, starts at login, shows progress in the icon, and posts a notification when done. Sign Claude Desktop into one From account before moving. The menubar stops before any local change if that source login cannot be verified, since silently skipping Remote Control would leave duplicate rows. The active account is tagged. When one account is left unpicked it becomes the destination. The app bundles its own copy of the CLI, so run the menubar command again after upgrading. `menubar --remove` uninstalls. The animation above is rendered by the app itself with `--demo <dir>`.
 
 ```
 From  ↑↓ move · space select · enter next
@@ -48,12 +48,12 @@ To    ↑↓ move · enter confirm
 | Command | Effect |
 |---|---|
 | `claude-transplant` | pick From and To, move, print a receipt |
-| `claude-transplant --dry-run` | plan only, write nothing, refused while an interrupted run awaits reconciliation |
+| `claude-transplant --dry-run` | plan only and write nothing, refuses pending recovery, with `--cloud` it reads remote metadata and history |
 | `claude-transplant undo` | quarantine the last move, restore the source entries, refused if a target changed or a source cannot be restored |
 | `claude-transplant accounts` | list accounts |
 | `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
-| `--cloud` | reconcile active source Remote Control mirrors, source must be signed in |
+| `--cloud` | reconcile active source Remote Control mirrors and materialize verified divergent branches, source must be signed in |
 | `--json` | one event per line |
 | `--version` | print the version |
 
@@ -76,7 +76,7 @@ Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile di
 
 A session is three files that can disagree: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. The transcript pool is shared by every account on the Mac, so a move writes the same record into the target organization with the same `cliSessionId`, verifies the transcript, sidecars, and both records are unchanged, then parks the source record in quarantine. Ten round trips keep one transcript.
 
-Remote Control adds a fourth, server-owned layer. With `--cloud`, claude-transplant reads the active source account through Claude Desktop's authenticated session and hashes durable user and assistant message shapes. If one local target contains them, that record becomes the destination. If exactly one same-title local target exists but the histories diverged, it anchors a separate companion whose supported remote message payloads are copied exactly into a new local transcript. The tool checks that the remote worker is disconnected and unchanged before archiving its source mirror. Cookies are decrypted in memory through macOS Keychain, sent only to `claude.ai`, and never printed or stored. A receipt journals the remote id, local companion, target activation, and prior state so interrupted archival reconciles from server state and Undo can unarchive the source.
+Remote Control adds a fourth, server-owned layer. With `--cloud`, claude-transplant reads the active source account through Claude Desktop's authenticated session and hashes durable user and assistant message shapes. If one local target contains them, that record becomes the destination. A bridge id links the remote row to its local session when available. Otherwise, one same-title target must share eight consecutive exact remote messages before it can anchor a separate companion whose supported remote message payloads are copied exactly into a new local transcript. The anchor supplies local project metadata and a narrow allowlist of project, display, and model settings because the remote endpoint does not expose a local working directory. Anchor-only prompt, browser, permission, spawn, and runtime state is discarded, and permission mode resets to default. The tool checks that the remote worker is disconnected and unchanged before archiving its source mirror. Cookies are decrypted in memory through macOS Keychain, sent only to `claude.ai`, and never printed or stored. A receipt journals the remote id, local companion, anchor id, target activation, and prior state so interrupted archival reconciles from server state and Undo can unarchive the source.
 
 A move is eligible when the history is a single comparable version, the record filename and identity are valid, no scheduled task, notification route, or running worker owns it, the parent record is already in the target or moves first in the same batch, and the target has no id collision. Everything else is refused with a named reason.
 
@@ -101,7 +101,7 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 |---|---|
 | Change ownership on the server | No API reassigns a session, so a verified local target replaces it and the source mirror is archived |
 | `claude --fork-session` | Copies only the compacted chain and grows disk use |
-| Copy the transcript | The pool is already shared, so a copy is only disk |
+| Copy an existing local transcript | The pool is already shared, so a duplicate is only disk |
 | Delete the source | Removes the rollback |
 | Merge sidecars across versions | Requires writing a new generation |
 | Trust one `forkedFrom` hop | Misses second-generation copies |
@@ -109,12 +109,13 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 ## Limits
 
 - macOS 13 or newer with Claude Desktop. Sign Desktop into the target account to see moved history.
-- Remote Control ownership does not transfer. The menubar archives a disconnected source mirror only after one complete local target verifies. A new target bridge starts lazily when that local session is resumed there.
+- Remote Control ownership does not transfer. The menubar archives a disconnected source mirror only after an existing or newly materialized local target verifies. A new target bridge starts lazily when that local session is resumed there.
 - Artifact ownership, versions, comments, and share links stay with the original account. Artifacts are neither copied nor recreated.
-- Sign Claude Desktop into From for Remote Control reconciliation. CLI moves without `--cloud` change local records only.
+- Embedded base64, text, and HTTP or HTTPS images and documents can be rescued. Account-owned file ids and unknown source shapes are refused.
+- Sign Claude Desktop into From for Remote Control reconciliation and cloud Undo. CLI moves without `--cloud` change local records only.
 - Remote Control uses private Claude endpoints and fails closed if their response shape, organization, history, status, or authentication changes.
 - Receipts from before 1.2.0 use byte-exact undo checks.
-- File layouts are undocumented. Verified with Claude Code 2.1.257 and Desktop transcript 2.1.258.
+- File layouts and Remote Control endpoints are undocumented. Verified with Claude Desktop 1.46388.1, bundled Claude Code 2.1.260, and transcript 2.1.258.
 - Moving history out of a Team organization is your organization's decision.
 - Unofficial. Not affiliated with Anthropic.
 
