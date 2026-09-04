@@ -2,7 +2,7 @@
 
 <h3 align="center">Move Claude Code history between accounts. Menubar or CLI.</h3>
 
-<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant menubar with source accounts converging on one destination" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant panel with source accounts converging on one destination" width="760"></p>
 
 ## What it does
 
@@ -19,7 +19,7 @@ npx claude-transplant
 
 To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v3.0.0` or a commit hash to pin.
 
-The menubar shows two columns of email over plan, with FROM on the left and TO on the right. TO starts on the most recently used account other than the signed-in one, while every other account starts selected as a source. Uncheck only the accounts to leave behind. Curves converge on TO, chevrons show direction, destination changes swap lane identity, and source changes fade only that lane. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one is active. It starts at login, shows progress in the icon, and posts a notification when done. Run the menubar command again after upgrading, use `menubar --snapshot panel.png` to render the live panel, or use `menubar --remove` to uninstall.
+The menubar shows two columns of email over plan, with FROM on the left and TO on the right. TO starts on the most recently used account other than the signed-in one, while every other account starts selected as a source. Uncheck only the accounts to leave behind. Curves converge on TO, chevrons show direction, destination changes swap lane identity, and source changes fade only that lane. Long inventories scroll together. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one is active. Keep local abandons pending cloud work without reversing successful local movement. It starts at login, shows progress in the icon, and posts a notification when done. The app bundles its own CLI, so run the menubar command again after upgrading. Use `menubar --snapshot panel.png` to render the live panel without installing it, or use `menubar --remove` to uninstall. The animation above is rendered from the same Swift panel.
 
 ```
 From  ↑↓ move · space select · enter next

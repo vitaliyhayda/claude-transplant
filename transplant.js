@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
 import { createReadStream, realpathSync } from 'node:fs'
-import { copyFile, mkdir, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -520,7 +520,7 @@ export async function accounts(paths) {
     const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false })
+    out.push({ account, org, dir, email, orgName, sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: account === cur.account })
   }
   const mine = out.filter((a) => a.account === cur.account)
   const focused = mine.toSorted((a, b) => b.focusedAt - a.focusedAt)[0]
@@ -2629,6 +2629,12 @@ const plist = (dict) => {
   ].join('\n')
 }
 
+const compileMenubar = (source, binary) => {
+  const build = spawnSync('swiftc', ['-O', '-parse-as-library', '-o', binary, source], { encoding: 'utf8' })
+  if (build.error) throw new Error('swiftc not found, run xcode-select --install')
+  if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
+}
+
 async function menubar(paths, remove, snapshot) {
   const app = path.join(paths.state, 'Claude Transplant.app')
   const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
@@ -2645,9 +2651,22 @@ async function menubar(paths, remove, snapshot) {
     return 'menubar removed'
   }
   const source = path.join(HERE, 'menubar.swift')
+  if (snapshot) {
+    const output = path.resolve(snapshot)
+    const scratch = await mkdtemp(path.join(os.tmpdir(), 'claude-transplant-snapshot-'))
+    try {
+      const renderer = path.join(scratch, 'Claude Transplant')
+      compileMenubar(source, renderer)
+      await mkdir(path.dirname(output), { recursive: true })
+      const shot = spawnSync(renderer, ['--snapshot', output, '--node', process.execPath, '--script', path.join(HERE, 'transplant.js')], { encoding: 'utf8' })
+      if (shot.status !== 0) throw new Error(`snapshot failed: ${(shot.stderr || '').trim()}`)
+    } finally {
+      await rm(scratch, { recursive: true, force: true })
+    }
+    return `snapshot written | ${output}`
+  }
   const key = sha((await readFile(source, 'utf8')) + (await readJson(path.join(HERE, 'package.json'))).version)
   const built = path.join(app, 'Contents/Resources/build.sha256')
-  let rebuilt = false
   if ((await readFile(built, 'utf8').catch(() => '')) !== key) {
     const fresh = `${app}.building`
     await rm(fresh, { recursive: true, force: true })
@@ -2665,33 +2684,20 @@ async function menubar(paths, remove, snapshot) {
       NSHighResolutionCapable: true
     }
     await writeFile(path.join(fresh, 'Contents/Info.plist'), plist(info))
-    const build = spawnSync('swiftc', ['-O', '-parse-as-library', '-o', path.join(fresh, 'Contents/MacOS/Claude Transplant'), source], { encoding: 'utf8' })
-    if (build.error) throw new Error('swiftc not found, run xcode-select --install')
-    if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
+    compileMenubar(source, path.join(fresh, 'Contents/MacOS/Claude Transplant'))
     await writeFile(path.join(fresh, 'Contents/Resources/build.sha256'), key)
     stop()
     await rm(app, { recursive: true, force: true })
     await rename(fresh, app)
-    rebuilt = true
   }
   const script = path.join(app, 'Contents/Resources/transplant.js')
   await copyFile(path.join(HERE, 'transplant.js'), script)
   await writeFile(path.join(paths.state, 'menubar.json'), `${JSON.stringify({ node: process.execPath, script })}\n`)
-  const launch = async () => {
-    await mkdir(path.dirname(agent), { recursive: true })
-    await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary], RunAtLoad: true }))
-    const load = spawnSync('launchctl', ['bootstrap', domain, agent], { encoding: 'utf8' })
-    if (load.status !== 0) throw new Error(`launchctl failed: ${(load.stderr || '').trim()}`)
-  }
-  if (snapshot) {
-    const output = path.resolve(snapshot)
-    const shot = spawnSync(binary, ['--snapshot', output], { encoding: 'utf8' })
-    if (rebuilt) await launch()
-    if (shot.status !== 0) throw new Error(`snapshot failed: ${(shot.stderr || '').trim()}`)
-    return `snapshot written | ${output}`
-  }
   stop()
-  await launch()
+  await mkdir(path.dirname(agent), { recursive: true })
+  await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary], RunAtLoad: true }))
+  const load = spawnSync('launchctl', ['bootstrap', domain, agent], { encoding: 'utf8' })
+  if (load.status !== 0) throw new Error(`launchctl failed: ${(load.stderr || '').trim()}`)
   return `menubar installed | starts at login | ${app}`
 }
 
@@ -2714,11 +2720,9 @@ function parse(argv) {
   }
   if ((args.from.length > 0) !== Boolean(args.to)) throw new Error('--from and --to go together')
   if ((args.help || args.version) && argv.length > 1) throw new Error(`${args.help ? '--help' : '--version'} goes alone`)
-  if (args.cmd === 'accounts' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('accounts accepts only --json')
-  if (args.cmd === 'finish' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('finish accepts only --json')
-  if (args.cmd === 'keep-local' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('keep-local accepts only --json')
-  if (args.cmd === 'undo' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('undo accepts only --json')
-  if (args.cmd === 'menubar' && (args.from.length || args.to || args.dry || args.cloud || args.json || args.remove && args.snapshot)) throw new Error('menubar accepts only --remove or --snapshot <png>')
+  const incompatible = args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot
+  if (['accounts', 'finish', 'keep-local', 'undo'].includes(args.cmd) && incompatible) throw new Error(`${args.cmd} accepts only --json`)
+  if (args.cmd === 'menubar' && (args.from.length || args.to || args.dry || args.cloud || args.json || (args.remove && args.snapshot))) throw new Error('menubar accepts only --remove or --snapshot <png>')
   if (args.cmd !== 'menubar' && (args.remove || args.snapshot)) throw new Error('--remove and --snapshot require menubar')
   return args
 }
@@ -2836,7 +2840,7 @@ async function main(argv) {
   if (args.cmd === 'accounts') {
     if (args.json) {
       const deferred = await deferredWorkflow(paths)
-      return emit(all.map(({ account, org, email, orgName, label, stats, active, sessions, unreadable, activeAt }) => {
+      return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         return {
           account,
@@ -2846,6 +2850,7 @@ async function main(argv) {
           label,
           stats,
           active,
+          signedIn,
           sessions: sessions.length,
           unreadable: unreadable.length,
           activeAt,

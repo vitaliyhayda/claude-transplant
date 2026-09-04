@@ -9,7 +9,7 @@ struct Account: Decodable, Identifiable {
     let orgName: String?
     let label: String
     let active: Bool?
-    let sessions: Int
+    let signedIn: Bool?
     let activeAt: Double?
     let pending: String?
     let pendingFailures: [Failure]?
@@ -93,22 +93,21 @@ final class Model: ObservableObject {
     @Published var restartAvailable = false
     @Published var progressCompleted: Int?
     @Published var progressTotal: Int?
+    var snapshotFailed = false
     let snapshot: Bool
     let demo: Bool
     private let config: Config?
     private var refreshing = false
     private var pendingResult = false
 
-    init(snapshot: Bool = false) {
+    init(snapshot: Bool = false, config supplied: Config? = nil) {
         self.snapshot = snapshot
         demo = false
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
-        config = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
+        config = supplied ?? (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
         if snapshot {
-            if let config {
-                let text = Model.capture(node(config.node), [config.script, "accounts", "--json"])
-                accounts = (try? JSONDecoder().decode([Account].self, from: Data(text.utf8))) ?? []
-            }
+            guard let config, let text = Model.capture(node(config.node), [config.script, "accounts", "--json"]), let decoded = try? JSONDecoder().decode([Account].self, from: Data(text.utf8)) else { snapshotFailed = true; return }
+            accounts = decoded
             settle()
             return
         }
@@ -167,8 +166,13 @@ final class Model: ObservableObject {
     private func settle() {
         if to == nil || !accounts.contains(where: { $0.id == to }) {
             let recent = accounts.sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
-            let current = accounts.first { $0.active == true } ?? recent.first
-            to = recent.first { $0.id != current?.id }?.id
+            if let current = accounts.first(where: { $0.active == true }) {
+                to = recent.first { $0.id != current.id }?.id
+            } else if let login = accounts.first(where: { $0.signedIn == true })?.account {
+                to = recent.first { $0.account != login }?.id
+            } else {
+                to = recent.dropFirst().first?.id
+            }
         }
         let ids = accounts.map(\.id)
         var next = lanes.filter { ids.contains($0.key) && ids.contains($0.value) }
@@ -343,16 +347,17 @@ final class Model: ObservableObject {
         return process.terminationStatus
     }
 
-    nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String {
+    nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return "" }
+        do { try process.run() } catch { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
         return String(decoding: data, as: UTF8.self)
     }
 
@@ -615,7 +620,7 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            board
+            accountBoard
             if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
             ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -654,6 +659,15 @@ struct Panel: View {
         }
     }
 
+    @ViewBuilder private var accountBoard: some View {
+        if model.accounts.count <= Panel.visibleRows {
+            board
+        } else {
+            ScrollView(.vertical) { board }
+                .frame(height: CGFloat(Panel.visibleRows * 34 + 18))
+        }
+    }
+
     private var board: some View {
         let width = columnWidth
         return HStack(alignment: .top, spacing: 0) {
@@ -687,6 +701,7 @@ struct Panel: View {
     }
 
     static let gap: CGFloat = 150
+    static let visibleRows = 10
 
     private func column<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -707,7 +722,7 @@ enum Snapshot {
 
     @MainActor
     static func write(_ model: Model, to file: String) {
-        guard let png = data(model) else { exit(1) }
+        guard !model.snapshotFailed, let png = data(model) else { exit(1) }
         do { try png.write(to: URL(fileURLWithPath: file)) } catch { exit(1) }
         exit(0)
     }
@@ -715,10 +730,10 @@ enum Snapshot {
 
 enum Demo {
     static let accounts = [
-        Account(account: "alex-personal", org: "personal", email: "alex@example.com", orgName: "Personal", label: "alex@example.com · Personal", active: true, sessions: 84, activeAt: 400, pending: nil, pendingFailures: nil),
-        Account(account: "alex-team", org: "team", email: "alex@example.com", orgName: "Acme Inc.", label: "alex@example.com · Acme Inc.", active: false, sessions: 212, activeAt: 300, pending: nil, pendingFailures: nil),
-        Account(account: "sam-personal", org: "personal", email: "sam@example.com", orgName: "Personal", label: "sam@example.com · Personal", active: false, sessions: 35, activeAt: 200, pending: nil, pendingFailures: nil),
-        Account(account: "sam-team", org: "team", email: "sam@example.com", orgName: "Northwind", label: "sam@example.com · Northwind", active: false, sessions: 12, activeAt: 100, pending: nil, pendingFailures: nil)
+        Account(account: "alex-personal", org: "personal", email: "alex@example.com", orgName: "Personal", label: "alex@example.com · Personal", active: true, signedIn: true, activeAt: 400, pending: nil, pendingFailures: nil),
+        Account(account: "alex-team", org: "team", email: "alex@example.com", orgName: "Acme Inc.", label: "alex@example.com · Acme Inc.", active: false, signedIn: true, activeAt: 300, pending: nil, pendingFailures: nil),
+        Account(account: "sam-personal", org: "personal", email: "sam@example.com", orgName: "Personal", label: "sam@example.com · Personal", active: false, signedIn: false, activeAt: 200, pending: nil, pendingFailures: nil),
+        Account(account: "sam-team", org: "team", email: "sam@example.com", orgName: "Northwind", label: "sam@example.com · Northwind", active: false, signedIn: false, activeAt: 100, pending: nil, pendingFailures: nil)
     ]
 
     @MainActor
@@ -773,7 +788,9 @@ struct TransplantApp: App {
             let directory = args[index + 1]
             DispatchQueue.main.async { Demo.play(model, into: directory) }
         } else if let index = args.firstIndex(of: "--snapshot"), index + 1 < args.count {
-            let model = Model(snapshot: true)
+            let value = { (flag: String) in args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+            let supplied = value("--node").flatMap { node in value("--script").map { Config(node: node, script: $0) } }
+            let model = Model(snapshot: true, config: supplied)
             _model = StateObject(wrappedValue: model)
             let file = args[index + 1]
             DispatchQueue.main.async { Snapshot.write(model, to: file) }

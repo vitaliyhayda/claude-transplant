@@ -931,6 +931,8 @@ test('active account follows the latest organization request, not background usa
   await writeFile(h.paths.usage, JSON.stringify({ samples: [{ org: h.org.T, t: 1 }] }))
   const expired = await accounts(h.paths)
   assert.equal(expired.some((a) => a.active), false)
+  assert.equal(expired.filter((a) => a.account === h.acct.P).every((a) => a.signedIn), true)
+  assert.equal(expired.filter((a) => a.account !== h.acct.P).some((a) => a.signedIn), false)
   await writeFile(h.paths.scope, JSON.stringify({ scope: { breadcrumbs: [{ timestamp: Date.now() + 60000, data: { url: `https://claude.ai/api/organizations/${h.org.P}/usage` } }] } }))
   const future = await accounts(h.paths)
   assert.equal(future.some((a) => a.active), false)
@@ -1001,6 +1003,18 @@ test('accounts includes a known login organization with no Desktop directory', a
   assert.equal(row.label, 'known@example.com · Known Team')
   assert.equal(row.sessions.length, 0)
   assert.equal(await stat(row.dir).then(() => true, () => false), false)
+})
+
+test('menubar snapshot renders live accounts without installing', async () => {
+  const h = await home()
+  const output = path.join(h.root, 'snapshot', 'panel.png')
+  const result = await cli(h.root, ['menubar', '--snapshot', output])
+  const png = await readFile(output)
+
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(png.subarray(1, 4).toString(), 'PNG')
+  assert.equal(await stat(path.join(h.paths.state, 'Claude Transplant.app')).then(() => true, () => false), false)
+  assert.equal(await stat(path.join(h.root, 'Library/LaunchAgents/io.github.vitaliyhayda.claude-transplant.plist')).then(() => true, () => false), false)
 })
 
 test('same-account organization moves rehome one record without copying history', async () => {
