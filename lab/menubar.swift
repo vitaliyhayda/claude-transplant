@@ -119,7 +119,6 @@ final class Model: ObservableObject {
     var canKeepLocal: Bool { !running && pendingAccounts.contains { $0.pending == "cloud" } }
     var pendingReady: Bool { !running && activePendingAccount != nil && config != nil }
     var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && config != nil }
-    var sources: [String] { accounts.map(\.id).filter { from.contains($0) } }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
         let labels = pendingAccounts.map(\.label).joined(separator: " or ")
@@ -136,7 +135,7 @@ final class Model: ObservableObject {
         return Double(completed) / Double(total)
     }
 
-    func canSource(_ account: Account) -> Bool { account.sessions > 0 && account.id != to }
+    func canSource(_ account: Account) -> Bool { account.id != to }
 
     func toggle(_ id: String) {
         guard let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
@@ -467,36 +466,87 @@ struct Tag: View {
     }
 }
 
+struct AnimatableVector: VectorArithmetic {
+    var values: [Double]
+
+    static var zero: AnimatableVector { AnimatableVector(values: []) }
+    static func + (lhs: AnimatableVector, rhs: AnimatableVector) -> AnimatableVector { combine(lhs, rhs, +) }
+    static func - (lhs: AnimatableVector, rhs: AnimatableVector) -> AnimatableVector { combine(lhs, rhs, -) }
+    mutating func scale(by rhs: Double) { values = values.map { $0 * rhs } }
+    var magnitudeSquared: Double { values.reduce(0) { $0 + $1 * $1 } }
+
+    private static func combine(_ a: AnimatableVector, _ b: AnimatableVector, _ op: (Double, Double) -> Double) -> AnimatableVector {
+        let count = max(a.values.count, b.values.count)
+        return AnimatableVector(values: (0..<count).map { op($0 < a.values.count ? a.values[$0] : 0, $0 < b.values.count ? b.values[$0] : 0) })
+    }
+}
+
+struct Bundle: Shape {
+    var vector: AnimatableVector
+    var animatableData: AnimatableVector {
+        get { vector }
+        set { vector = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let v = vector.values
+        var i = 0
+        while i + 4 < v.count {
+            let anchor = CGPoint(x: v[i], y: v[i + 1])
+            let end = CGPoint(x: v[i + 2], y: v[i + 3])
+            let presence = min(1, max(0, v[i + 4]))
+            i += 5
+            guard presence > 0.01 else { continue }
+            let start = CGPoint(x: end.x + (anchor.x - end.x) * presence, y: end.y + (anchor.y - end.y) * presence)
+            let span = end.x - start.x
+            let c1 = CGPoint(x: start.x + span * 0.55, y: start.y)
+            let c2 = CGPoint(x: end.x - span * 0.45, y: end.y)
+            path.move(to: start)
+            path.addCurve(to: end, control1: c1, control2: c2)
+            let mid = Bundle.point(start, c1, c2, end)
+            let tangent = Bundle.tangent(start, c1, c2, end)
+            let length = max(0.001, hypot(tangent.x, tangent.y))
+            let u = CGPoint(x: tangent.x / length, y: tangent.y / length)
+            let n = CGPoint(x: -u.y, y: u.x)
+            let size = 4.6 * presence
+            let tip = CGPoint(x: mid.x + u.x * size * 0.7, y: mid.y + u.y * size * 0.7)
+            let back = CGPoint(x: mid.x - u.x * size * 0.7, y: mid.y - u.y * size * 0.7)
+            path.move(to: CGPoint(x: back.x + n.x * size, y: back.y + n.y * size))
+            path.addLine(to: tip)
+            path.addLine(to: CGPoint(x: back.x - n.x * size, y: back.y - n.y * size))
+        }
+        return path
+    }
+
+    private static func point(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint) -> CGPoint {
+        CGPoint(x: (p0.x + 3 * p1.x + 3 * p2.x + p3.x) / 8, y: (p0.y + 3 * p1.y + 3 * p2.y + p3.y) / 8)
+    }
+
+    private static func tangent(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint) -> CGPoint {
+        CGPoint(x: 0.75 * (p1.x - p0.x) + 1.5 * (p2.x - p1.x) + 0.75 * (p3.x - p2.x), y: 0.75 * (p1.y - p0.y) + 1.5 * (p2.y - p1.y) + 0.75 * (p3.y - p2.y))
+    }
+}
+
 struct Arrows: View {
     let anchors: [String: Anchor<CGRect>]
-    let sources: [String]
+    let accounts: [Account]
+    let sources: Set<String>
     let target: String?
 
     var body: some View {
         GeometryReader { proxy in
-            if let target, let end = anchors["to/" + target].map({ proxy[$0] }) {
-                let tip = CGPoint(x: end.minX - 8, y: end.midY)
-                ForEach(sources, id: \.self) { id in
-                    if let start = anchors["from/" + id].map({ proxy[$0] }) {
-                        let origin = CGPoint(x: start.maxX + 8, y: start.midY)
-                        let span = tip.x - origin.x
-                        Path { path in
-                            path.move(to: origin)
-                            path.addCurve(to: tip, control1: CGPoint(x: origin.x + span * 0.55, y: origin.y), control2: CGPoint(x: tip.x - span * 0.45, y: tip.y))
-                        }
-                        .stroke(Color.accentColor.opacity(0.85), style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
-                        Circle().fill(Color.accentColor).frame(width: 5, height: 5).position(origin)
-                    }
-                }
-                if !sources.isEmpty {
-                    Path { path in
-                        path.move(to: CGPoint(x: tip.x - 7, y: tip.y - 4.5))
-                        path.addLine(to: tip)
-                        path.addLine(to: CGPoint(x: tip.x - 7, y: tip.y + 4.5))
-                    }
-                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
-                }
-            }
+            let end = target.flatMap { anchors["to/" + $0] }.map { proxy[$0] }.map { CGPoint(x: $0.minX - 10, y: $0.midY) }
+            let vector = AnimatableVector(values: accounts.flatMap { account -> [Double] in
+                guard let rect = anchors["from/" + account.id].map({ proxy[$0] }) else { return [0, 0, 0, 0, 0] }
+                let start = CGPoint(x: rect.maxX + 10, y: rect.midY)
+                let finish = end ?? start
+                let present = end != nil && sources.contains(account.id) && account.id != target
+                return [start.x, start.y, finish.x, finish.y, present ? 1 : 0]
+            })
+            Bundle(vector: vector)
+                .stroke(Color.accentColor.opacity(0.9), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+                .animation(.spring(response: 0.45, dampingFraction: 0.86), value: vector)
         }
         .allowsHitTesting(false)
     }
@@ -607,23 +657,35 @@ struct Panel: View {
     }
 
     private var board: some View {
-        HStack(alignment: .top, spacing: 76) {
+        let width = columnWidth
+        return HStack(alignment: .top, spacing: 0) {
             column("From") {
                 ForEach(model.accounts) { account in
                     Row(account: account, radio: false, selected: model.from.contains(account.id), muted: !model.canSource(account)) { model.toggle(account.id) }
                 }
             }
+            .frame(width: width, alignment: .leading)
+            Spacer(minLength: 72)
             column("To") {
                 ForEach(model.accounts) { account in
                     Row(account: account, radio: true, selected: model.to == account.id, muted: false) { model.selectTarget(account.id) }
                 }
             }
+            .frame(width: width, alignment: .leading)
         }
         .overlayPreferenceValue(RowKey.self) { anchors in
-            Arrows(anchors: anchors, sources: model.sources, target: model.to)
-                .animation(.easeInOut(duration: 0.25), value: model.to)
-                .animation(.easeInOut(duration: 0.25), value: model.from)
+            Arrows(anchors: anchors, accounts: model.accounts, sources: model.from, target: model.to)
         }
+    }
+
+    private var columnWidth: CGFloat {
+        let name: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]
+        let plan: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11)]
+        let widest = model.accounts.map { account -> CGFloat in
+            let tags = CGFloat((account.active == true ? 48 : 0) + (account.pending != nil ? 54 : 0))
+            return max((account.name as NSString).size(withAttributes: name).width, (account.plan as NSString).size(withAttributes: plan).width + tags)
+        }.max() ?? 0
+        return min(266, max(180, 44 + ceil(widest)))
     }
 
     private func column<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -631,7 +693,6 @@ struct Panel: View {
             Text(title.uppercased()).font(.caption2.weight(.semibold)).tracking(0.8).foregroundStyle(.secondary).padding(.bottom, 2)
             content()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
