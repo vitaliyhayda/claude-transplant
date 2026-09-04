@@ -159,6 +159,7 @@ test('cli exits nonzero on partial failure and undoes over json', async () => {
   const events = moved.stdout.trim().split('\n').map((l) => JSON.parse(l))
   const done = events.at(-1)
   assert.equal(done.ok, false)
+  assert.equal(done.complete, true)
   assert.equal(done.moved, 1)
   assert.equal(done.failed.length, 1)
   assert.equal(done.restart, true)
@@ -1200,7 +1201,7 @@ test('a zero-record source still creates a pending cloud check', async () => {
   assert.ok((await undo(h.paths)).dest)
 })
 
-test('Keep local cancels pending cloud checks without reversing completed local work', async () => {
+test('Keep local retains a verified bridge rehome while its remote check is unavailable', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
   await h.record('T', SOURCE, rehomeRecord({ title: 'Keep local source', bridgeSessionIds: ['session_keep_local'] }))
@@ -1252,6 +1253,29 @@ test('Keep local refuses when an existing carrier no longer contains the retired
   const kept = await keepLocal(h.paths)
 
   assert.match(kept.refused[0], /no longer contains source history/)
+  assert.equal(kept.receipt.cloudChecks[0].status, 'pending')
+})
+
+test('Keep local rejects a quarantined source record changed after retirement', async () => {
+  const h = await home()
+  const target = id(712)
+  const sourceEntries = [entry('user', 44, null, SOURCE)]
+  await h.write(SOURCE, sourceEntries)
+  await h.write(target, fork(sourceEntries, SOURCE, target, 'Carrier'))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Tamper source' }))
+  await h.record('Z', target, rehomeRecord({ title: 'Tamper carrier' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  await h.write(target, [entry('user', 45, null, target, { message: { role: 'user', content: 'replacement history' } })])
+  const sourcePlan = moved.receipt.superseded.find((row) => row.source)
+  const parkedRecord = sourcePlan.moved[0][1]
+  const changed = JSON.parse(await readFile(parkedRecord, 'utf8'))
+  await writeFile(parkedRecord, JSON.stringify({ ...changed, cliSessionId: target }))
+  const kept = await keepLocal(h.paths)
+
+  assert.match(kept.refused[0], /recovery artifact changed/)
   assert.equal(kept.receipt.cloudChecks[0].status, 'pending')
 })
 

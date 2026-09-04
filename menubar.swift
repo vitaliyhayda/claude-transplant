@@ -245,7 +245,7 @@ final class Model: ObservableObject {
             if cloudChecked > 0 { outcomes.append("\(cloudChecked) cloud source checked") }
             if cloudRestored > 0 { outcomes.append("\(cloudRestored) cloud mirrors restored") }
             if newerCloud > 0 { outcomes.append("\(newerCloud) newer cloud sessions left for next move") }
-            if pendingCloud > 0 { outcomes.append("\(pendingCloud) cloud checks pending") }
+            if pendingCloud > 0 { outcomes.append("\(pendingCloud) cloud \(pendingCloud == 1 ? "check" : "checks") pending") }
             if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
             if keptLocal > 0 { outcomes.append("Local move kept, \(keptLocal) cloud checks cancelled") }
             if moved == 0, retired > 0 { outcomes.append("\(retired) source entries retired") }

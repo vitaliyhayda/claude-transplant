@@ -26,7 +26,7 @@ const REMOTE_TAGS = new Set(['remote-control-sdk', 'remote-control-repl'])
 const HELP = `claude-transplant   move Claude Code history between accounts
 
   claude-transplant             pick from → to, move, retire the source entries, print receipt
-  claude-transplant --dry-run   plan only, write nothing, refuses while recovery is pending
+  claude-transplant --dry-run   plan only, write nothing, refuses while a move or recovery is pending
   claude-transplant undo        quarantine the last move, put the source entries back
   claude-transplant finish      finish pending cloud work for the active source
   claude-transplant keep-local  cancel pending cloud checks, keep completed local work
@@ -45,6 +45,7 @@ const stable = (v) => JSON.stringify(sortKeys(v))
 const jsonText = (value, spacing = 2) => `${JSON.stringify(value, null, spacing || undefined)}\n`
 const short = (id) => id.slice(0, 8)
 const count = (v) => v.toLocaleString('en-US')
+const quantity = (value, singular, plural = `${singular}s`) => `${count(value)} ${value === 1 ? singular : plural}`
 const exists = (p) => stat(p).then(() => true, () => false)
 const readJson = async (p) => JSON.parse(await readFile(p, 'utf8'))
 const stamp = () => new Date().toISOString().slice(0, 23).replace(/[:.]/g, '-')
@@ -2313,7 +2314,7 @@ async function transfer(inv, to, paths, report) {
   const retired = retiredCount(receipt)
   const superseded = receipt.superseded.length - retired
   const pendingCloud = openCloudChecks(receipt).length
-  if (pendingCloud) report('pending', `${count(pendingCloud)} source cloud checks`)
+  if (pendingCloud) report('pending', quantity(pendingCloud, 'source cloud check'))
   if (!done && !receipt.superseded.length && !receipt.remote.length && !receipt.remotePending && !pendingCloud) {
     await rm(file, { force: true })
     return receipt.failed.length ? { file: null, receipt, checks: [], problems, ok: false, validationOnly: true } : null
@@ -2332,7 +2333,7 @@ async function transfer(inv, to, paths, report) {
   if (retired) report('retired', `${count(retired)} source records → quarantine | transcripts untouched`)
   const resultOkay = ok && receipt.failed.length === 0
   const newerCloud = receipt.cloudChecks.reduce((total, check) => total + (check.later?.length ?? 0), 0)
-  return { file, receipt, checks: lines, problems, ok: resultOkay, complete: resultOkay && pendingCloud === 0, pendingCloud, pendingLabels: cloudCheckLabels(receipt), newerCloud }
+  return { file, receipt, checks: lines, problems, ok: resultOkay, complete: pendingCloud === 0, pendingCloud, pendingLabels: cloudCheckLabels(receipt), newerCloud }
 }
 
 export function finishPending(paths, options = {}) {
@@ -2430,6 +2431,7 @@ export function keepLocal(paths) {
     }
     const to = (await accounts(paths)).find((account) => sameAccount(account, receipt.toAccount))
     const existing = (receipt.superseded ?? []).filter((row) => row.source && !receipt.sessions.some((session) => session.targetId === row.by))
+    refused.push(...await restoreProblems(existing, path.join(paths.state, 'quarantine')))
     const sourceSessions = []
     for (const source of existing) {
       const file = source.moved?.[0]?.[1]
@@ -2439,9 +2441,13 @@ export function keepLocal(paths) {
     }
     if (sourceSessions.length && to) {
       const auditSource = { account: 'retired', org: 'retired', label: 'retired sources', sessions: sourceSessions, unreadable: [], taskFile: path.join(paths.state, 'keep-local-audit-tasks.json'), taskSessions: new Set(), taskError: null }
-      const audit = await inventory([auditSource], to, paths)
-      const covered = new Set(audit.there.flatMap((source) => (source.members ?? [source]).map((member) => member.file)))
-      for (const source of sourceSessions) if (!covered.has(source.file)) refused.push(`${source.title} | destination no longer contains source history`)
+      try {
+        const audit = await inventory([auditSource], to, paths)
+        const covered = new Set(audit.there.flatMap((source) => (source.members ?? [source]).map((member) => member.file)))
+        for (const source of sourceSessions) if (!covered.has(source.file)) refused.push(`${source.title} | destination no longer contains source history`)
+      } catch (error) {
+        refused.push(`destination verification failed | ${error.message}`)
+      }
     }
     if (sourceSessions.length && !to) refused.push(`${receipt.to} | destination account missing`)
     if (refused.length) return { file, receipt, refused }
@@ -2880,7 +2886,7 @@ async function main(argv) {
       inv.cloud?.matches.some((match) => match.target.kind === 'rescue') ? `${count(inv.cloud.matches.filter((match) => match.target.kind === 'rescue').length)} cloud rescue` : null,
       inv.cloud?.blocked.length ? `${count(inv.cloud.blocked.length)} cloud blocked` : null,
       inv.cloud?.later.length ? `${count(inv.cloud.later.length)} newer cloud sessions left for next move` : null,
-      plannedCloudPending(inv) ? `${count(plannedCloudPending(inv))} cloud checks pending` : null,
+      plannedCloudPending(inv) ? `${quantity(plannedCloudPending(inv), 'cloud check')} pending` : null,
       `${count(inv.move.length)} to move`
     ].filter(Boolean).join(' | '))
     if (inv.cloudError) report('cloud', `deferred | ${inv.cloudError}`)

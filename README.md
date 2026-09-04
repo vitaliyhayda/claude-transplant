@@ -64,10 +64,11 @@ To    ↑↓ move · enter confirm
 
 - without history: the transcript no longer exists on disk
 - unreadable: the Desktop record is not valid JSON, named, nonzero exit
+- source rejected or target rejected: a readable record has invalid identity or unsafe transcript history, named and left untouched
 - compatible source versions: the same history exists in several transcript files, blocked unless the target already holds every version, since moving it would mean merging
 - grew apart: overlapping versions with different messages or state, all move
 - already there: the target already holds every message and sidecar file
-- blocked: needs merging, has a collision or malformed record, an unresolved parent, or is owned by a scheduled task, notification route, or running worker, named and left untouched
+- blocked: needs merging, has a collision, an unresolved parent, or is owned by a scheduled task, notification route, or running worker, named and left untouched
 - retired: source entries moved to quarantine after verification, including already-there ones
 - cloud mirrors: active or paused Remote Control rows found under the signed-in source
 - cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads, with no model call
