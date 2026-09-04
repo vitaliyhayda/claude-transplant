@@ -381,52 +381,44 @@ final class Model: ObservableObject {
 
 struct AccountRow: View {
     let account: Account
-    let sourceOn: Bool
-    let targetOn: Bool
-    let toggleSource: () -> Void
-    let chooseTarget: () -> Void
+    let selected: Bool
+    let radio: Bool
+    let action: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
-            Button(action: toggleSource) {
-                HStack(spacing: 8) {
-                    Image(systemName: sourceOn ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(sourceOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-                    Text(account.label).lineLimit(1).truncationMode(.tail).layoutPriority(1)
-                    if account.active == true {
-                        Text("active")
-                            .font(.system(size: 10, weight: .semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.green.opacity(0.18), in: Capsule())
-                            .foregroundStyle(.green)
-                    }
-                    if account.pending != nil {
-                        Text(account.pendingFailures?.isEmpty == false ? "retry" : "pending")
-                            .font(.system(size: 10, weight: .semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.orange.opacity(0.18), in: Capsule())
-                            .foregroundStyle(.orange)
-                    }
-                    Spacer(minLength: 12)
-                    Text(account.detail)
-                        .font(.system(.caption, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: 190, alignment: .trailing)
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: selected ? (radio ? "largecircle.fill.circle" : "checkmark.circle.fill") : "circle")
+                    .foregroundStyle(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                Text(account.label).lineLimit(1).truncationMode(.tail).layoutPriority(1)
+                if account.active == true {
+                    Text("active")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.green)
                 }
-                .contentShape(Rectangle())
+                if account.pending != nil {
+                    Text(account.pendingFailures?.isEmpty == false ? "retry" : "pending")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.orange)
+                }
+                Spacer(minLength: 12)
+                Text(account.detail)
+                    .font(.system(.caption, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 190, alignment: .trailing)
             }
-            .buttonStyle(.plain)
-            Button(action: chooseTarget) {
-                Image(systemName: targetOn ? "largecircle.fill.circle" : "circle")
-                    .foregroundStyle(targetOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
     }
 }
 
@@ -497,22 +489,23 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("FROM")
-                    Spacer()
-                    Text("TO")
-                }
-                .font(.caption2.weight(.semibold))
-                .tracking(0.8)
-                .foregroundStyle(.secondary)
+            accountBlock("From") {
                 ForEach(model.accounts) { account in
                     AccountRow(
                         account: account,
-                        sourceOn: model.from.contains(account.id),
-                        targetOn: model.to == account.id,
-                        toggleSource: { model.toggle(account.id) },
-                        chooseTarget: { model.selectTarget(account.id) }
+                        selected: model.from.contains(account.id),
+                        radio: false,
+                        action: { model.toggle(account.id) }
+                    )
+                }
+            }
+            accountBlock("To") {
+                ForEach(model.accounts) { account in
+                    AccountRow(
+                        account: account,
+                        selected: model.to == account.id,
+                        radio: true,
+                        action: { model.selectTarget(account.id) }
                     )
                 }
             }
@@ -554,6 +547,13 @@ struct Panel: View {
         .onDisappear { if !model.demo { model.panelVisibility(false) } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
             if !model.demo, let window = note.object as? NSWindow { model.panelVisibility(window.occlusionState.contains(.visible)) }
+        }
+    }
+
+    private func accountBlock<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title.uppercased()).font(.caption2.weight(.semibold)).tracking(0.8).foregroundStyle(.secondary)
+            content()
         }
     }
 }
@@ -636,7 +636,7 @@ struct Screen: View {
             }
             Cursor().offset(x: cursor.x, y: cursor.y)
         }
-        .frame(width: 760, height: 620, alignment: .topLeading)
+        .frame(width: 760, height: 700, alignment: .topLeading)
         .environment(\.colorScheme, .dark)
     }
 }
@@ -675,14 +675,14 @@ enum Demo {
         glide(to: CGPoint(x: 586, y: 12), frames: 9)
         open = true
         snap(900)
-        glide(to: CGPoint(x: 722, y: 150), frames: 9)
+        glide(to: CGPoint(x: 177, y: 268), frames: 9)
         model.selectTarget(accounts[2].id)
         snap(1100)
-        glide(to: CGPoint(x: 205, y: 220), frames: 8)
+        glide(to: CGPoint(x: 205, y: 328), frames: 8)
         model.begin()
         model.lines = [("inventory", "310 records | 1 without history | 1 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 2 cloud checks pending | 305 to move")]
         snap(250)
-        glide(to: CGPoint(x: 150, y: 420), frames: 6)
+        glide(to: CGPoint(x: 190, y: 371), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
             model.progressCompleted = done
             model.progressTotal = 305

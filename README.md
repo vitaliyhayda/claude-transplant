@@ -17,9 +17,9 @@ npx claude-transplant menubar
 npx claude-transplant
 ```
 
-To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v2.2.0` or a commit hash to pin.
+To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v2.2.1` or a commit hash to pin.
 
-The menubar app shows one account list with FROM and TO controls, starts at login, shows progress in the icon, and posts a notification when done. Click a TO account first and every other account becomes a source, then click Move. Manual FROM choices stay intact when the destination changes, except the destination itself is removed from FROM. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one of them is active. Keep local abandons pending or failed cloud work without reversing successful local movement. The app bundles its own copy of the CLI, so run the menubar command again after upgrading. `menubar --remove` uninstalls. The animation above is rendered by the app itself with `--demo <dir>`.
+The menubar app shows FROM and TO as two stacked account sections, starts at login, shows progress in the icon, and posts a notification when done. Both sections are always visible. Click a TO account first and every other account becomes a source, then click Move. Manual FROM choices stay intact when the destination changes, except the destination itself is removed from FROM. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one of them is active. Keep local abandons pending or failed cloud work without reversing successful local movement. The app bundles its own copy of the CLI, so run the menubar command again after upgrading. `menubar --remove` uninstalls. The animation above is rendered by the app itself with `--demo <dir>`.
 
 ```
 From  ↑↓ move · space select · enter next
