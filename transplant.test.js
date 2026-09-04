@@ -9,7 +9,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, finishPending, inventory, keepLocal, layout, move, normalize, semantic, step, undo } from './transplant.js'
+import { accounts, finishPending, inventory, keepLocal, layout, move, normalize, profileRemoteEvidence, semantic, step, undo } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -171,7 +171,7 @@ test('cli exits nonzero on partial failure and undoes over json', async () => {
   assert.equal(JSON.parse(undone.stdout.trim().split('\n').at(-1)).sessions, 1)
 })
 
-test('menubar-style cloud moves do local work without an active source login', async () => {
+test('menubar-style cloud moves do not invent pending work for a cleared source', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
   await h.record('P', SOURCE, rehomeRecord({ title: 'Offline source' }))
@@ -179,21 +179,14 @@ test('menubar-style cloud moves do local work without an active source login', a
   assert.equal(moved.code, 0)
   const result = JSON.parse(moved.stdout.trim().split('\n').at(-1))
   assert.equal(result.moved, 1)
-  assert.equal(result.pendingCloud, 1)
-  assert.equal(result.complete, false)
+  assert.equal(result.pendingCloud, 0)
+  assert.equal(result.complete, true)
   assert.deepEqual(await readdir(h.dir('P')), [])
   assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
 
   const listed = await cli(h.root, ['accounts', '--json'])
   const accountRows = JSON.parse(listed.stdout)
-  assert.equal(accountRows.find((account) => account.account === h.acct.P && account.org === h.org.P).pending, 'cloud')
-  const blocked = await cli(h.root, ['--from', 'z@example.com personal', '--to', 'p@example.com personal', '--json'])
-  assert.equal(blocked.code, 1)
-  assert.match(JSON.parse(blocked.stdout.trim().split('\n').at(-1)).reason, /pending move/)
-  const directTarget = (await accounts(h.paths)).find((account) => account.account === h.acct.T && account.org === h.org.T)
-  const direct = await move({ cloud: null }, directTarget, h.paths)
-  assert.equal(direct.deferred.mode, 'cloud')
-  assert.equal((await readdir(h.paths.state)).filter((name) => /^\d.*\.json$/.test(name)).length, 1)
+  assert.equal(accountRows.find((account) => account.account === h.acct.P && account.org === h.org.P).pending, null)
 
   const undone = await cli(h.root, ['undo', '--json'])
   assert.equal(undone.code, 0)
@@ -1186,19 +1179,67 @@ test('local moves finish while inaccessible source cloud checks stay pending', a
   assert.deepEqual(await readdir(h.dir('T')), [])
 })
 
-test('a zero-record source still creates a pending cloud check', async () => {
+test('a zero-record source creates no speculative cloud check', async () => {
   const h = await home()
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const result = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, remoteEvidence: new Map() }), to, h.paths)
 
-  assert.ok(result.file)
-  assert.equal(result.ok, true)
-  assert.equal(result.complete, false)
-  assert.equal(result.pendingCloud, 1)
-  assert.deepEqual(result.pendingLabels, [from.label])
-  assert.ok((await undo(h.paths)).dest)
+  assert.equal(result, null)
+  assert.equal(await readdir(h.paths.state).then((names) => names.filter((name) => /^\d.*\.json$/.test(name)).length), 0)
+})
+
+test('OAuth profile metadata counts only relevant Remote Control rows', async () => {
+  const now = Date.parse('2026-09-04T00:00:00.000Z')
+  const account = { account: id(950), org: id(951), profileServices: ['profile'] }
+  let stored = { claudeAiOauth: { accessToken: 'old', refreshToken: 'refresh', expiresAt: now - 1, refreshTokenExpiresAt: now + 60_000, scopes: ['user:sessions:claude_code'] } }
+  let writes = 0
+  const request = async (url) => {
+    if (url.includes('/oauth/token')) return new Response(JSON.stringify({ access_token: 'fresh', refresh_token: 'next', expires_in: 3600, refresh_token_expires_in: 7200, scope: 'user:sessions:claude_code' }))
+    if (url.includes('/oauth/validate')) return new Response(JSON.stringify({ valid: true, account_uuid: account.account, organization_uuid: account.org, scopes: ['user:sessions:claude_code'] }))
+    return new Response(JSON.stringify({ data: [remoteSession(), remoteSession({ tags: ['product:cowork'] }), remoteSession({ status: 'archived' })] }), { headers: { 'anthropic-organization-id': account.org } })
+  }
+  const evidence = await profileRemoteEvidence([account], {
+    now,
+    refresh: true,
+    request,
+    readCredential: async () => stored,
+    writeCredential: async (_service, value) => { writes++; stored = value }
+  })
+
+  assert.equal(evidence.get(`${account.account}/${account.org}`), 1)
+  assert.equal(writes, 2)
+  assert.equal(stored.claudeAiOauth.accessToken, 'fresh')
+})
+
+test('dry profile metadata never refreshes an expired credential', async () => {
+  const now = Date.parse('2026-09-04T00:00:00.000Z')
+  const account = { account: id(952), org: id(953), profileServices: ['profile'] }
+  const stored = { claudeAiOauth: { accessToken: 'old', refreshToken: 'refresh', expiresAt: now - 1, refreshTokenExpiresAt: now + 60_000, scopes: ['user:sessions:claude_code'] } }
+  const evidence = await profileRemoteEvidence([account], {
+    now,
+    readCredential: async () => stored,
+    writeCredential: async () => assert.fail('dry evidence wrote a credential'),
+    request: async () => assert.fail('dry evidence used an expired credential')
+  })
+
+  assert.equal(evidence.size, 0)
+})
+
+test('verified empty profile metadata suppresses pending after local movement', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const evidence = new Map([[`${from.account}/${from.org}`, 0]])
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, remoteEvidence: evidence }), to, h.paths)
+
+  assert.equal(result.complete, true)
+  assert.equal(result.pendingCloud, 0)
+  assert.deepEqual(result.receipt.cloudChecks, [])
 })
 
 test('Keep local retains a verified bridge rehome while its remote check is unavailable', async () => {
@@ -1218,6 +1259,22 @@ test('Keep local retains a verified bridge rehome while its remote check is unav
   assert.equal((await cli(h.root, ['--dry-run', '--from', 'z@example.com personal', '--to', 'p@example.com personal', '--json'])).code, 0)
   assert.ok((await undo(h.paths)).dest)
   assert.equal(moved.file, kept.file)
+})
+
+test('Keep local accepts a valid rehome record used after the move', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Original title' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  const record = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), title: 'Continued title', completedTurns: 2 }))
+  const kept = await keepLocal(h.paths)
+
+  assert.equal(kept.ok, true)
+  assert.equal(kept.cancelled, 1)
 })
 
 test('Keep local refuses when a moved destination record disappeared', async () => {
