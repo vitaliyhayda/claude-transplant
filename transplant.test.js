@@ -29,6 +29,15 @@ const entry = (type, k, parent, session, extra = {}) => ({
   message: { role: type, content: `message ${k}` },
   ...extra
 })
+const remoteState = (status, extra = {}) => ({
+  status,
+  connection_status: 'disconnected',
+  worker_status: 'WORKER_STATUS_UNSPECIFIED',
+  client_presence: [],
+  last_event_at: '2026-09-01T00:01:00.000Z',
+  ...extra
+})
+const remoteRows = (entries) => entries.map((payload, sequence_num) => ({ event_type: payload.type, payload, sequence_num, created_at: payload.timestamp }))
 const cli = (home, args) => promisify(execFile)(process.execPath, [path.join(here, 'transplant.js'), ...args], {
   env: { ...process.env, HOME: home },
   cwd: here
@@ -1003,6 +1012,385 @@ test('cross-login moves rehome across same and different organizations', async (
     assert.deepEqual(await readdir(h.dir('P')), [])
     assert.deepEqual(await readdir(targetDir), [`local_${SOURCE}.json`])
   }
+})
+
+test('a verified target archives its source Remote Control mirror and Undo restores it', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, [entry('user', 50, null, SOURCE), ...entries])
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const calls = []
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_fixture', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    events: async () => entries.map((row) => ({
+      type: row.type,
+      uuid: id(Number(row.uuid.slice(-12)) + 100),
+      session_id: 'cse_fixture',
+      message: row.type === 'assistant' ? { ...row.message, usage: { output_tokens: 999 }, stop_reason: null } : row.message
+    })),
+    session: async () => remoteState(status, { id: 'cse_fixture' }),
+    archive: async () => { calls.push('archive'); status = 'archived' },
+    unarchive: async () => { calls.push('unarchive'); status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.cloud.matches.length, 1)
+  assert.equal(inv.cloud.blocked.length, 0)
+
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.deepEqual(calls, ['archive'])
+  assert.equal(result.receipt.remote.length, 1)
+  assert.equal(status, 'archived')
+  const targetFile = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const activated = JSON.parse(await readFile(targetFile, 'utf8'))
+  assert.equal(activated.isArchived, false)
+  activated.lastFocusedAt = Date.now()
+  activated.promptAppendSnapshot = { append: 'current Desktop prompt', cliVersion: 'fixture' }
+  await writeFile(targetFile, JSON.stringify(activated))
+
+  const undone = await undo(h.paths, { cloud })
+  assert.ok(undone.dest)
+  assert.deepEqual(calls, ['archive', 'unarchive'])
+  assert.equal(status, 'active')
+  const restored = JSON.parse(await readFile(targetFile, 'utf8'))
+  assert.equal(restored.isArchived, true)
+  assert.deepEqual(restored.promptAppendSnapshot, activated.promptAppendSnapshot)
+})
+
+test('attachment prompts and tiny ordering drift prove semantic Remote Control containment', async () => {
+  const h = await home()
+  const remote = Array.from({ length: 100 }, (_, index) => entry(index % 2 ? 'assistant' : 'user', index + 100, index ? index + 99 : null, SOURCE))
+  const local = structuredClone(remote)
+  const prompt = local[80].message.content
+  local.splice(80, 1, { type: 'attachment', uuid: id(800), sessionId: SOURCE, attachment: { prompt } })
+  ;[local[20], local[21]] = [local[21], local[20]]
+  await h.write(SOURCE, local)
+  await h.record('Z', SOURCE, rehomeRecord())
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_equivalent', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    events: async () => remote,
+    session: async () => remoteState('active'),
+    archive: async () => {},
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 1)
+  assert.equal(inv.cloud.matches[0].target.kind, 'existing')
+  assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+})
+
+test('a divergent Remote Control history becomes a separate verified local session', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('Z', SOURCE, rehomeRecord())
+  const remote = [
+    entry('user', 10, null, 'cse_rescue', { message: { role: 'user', content: 'remote branch question\u2028with separator' } }),
+    entry('assistant', 11, 10, 'cse_rescue', { message: { role: 'assistant', content: [{ type: 'text', text: 'remote branch answer' }] } })
+  ]
+  let status = 'active'
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_rescue', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    events: async () => remote,
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches[0].target.kind, 'rescue')
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.equal(status, 'archived')
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(result.receipt.sessions[0].strategy, 'remote')
+  assert.equal(result.receipt.remote[0].targetKind, 'rescue')
+  const rescued = result.receipt.sessions[0]
+  assert.match(await readFile(rescued.targetTranscript, 'utf8'), /\\u2028/)
+  const rescuedEntries = lines(await readFile(rescued.targetTranscript, 'utf8'))
+  assert.deepEqual(rescuedEntries.filter((row) => row.message).map((row) => row.message), remote.map((row) => row.message))
+  assert.equal(JSON.parse(await readFile(rescued.record, 'utf8')).title, `Session ${SOURCE.slice(-3)}`)
+  assert.ok((await undo(h.paths, { cloud })).dest)
+  assert.equal(status, 'active')
+  assert.equal(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8').then(() => true), true)
+  assert.equal(await readFile(rescued.targetTranscript).then(() => true, () => false), false)
+  assert.equal(await readFile(rescued.record).then(() => true, () => false), false)
+})
+
+test('an unsupported remote content block is never rescued or archived', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('Z', SOURCE, rehomeRecord())
+  const remote = [entry('user', 10, null, 'cse_unsupported', { message: { role: 'user', content: [{ type: 'server-only-artifact', id: 'artifact_fixture' }] } })]
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_unsupported', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    events: async () => remote,
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(result.ok, false)
+  assert.equal(result.validationOnly, true)
+  assert.equal(archived, false)
+  assert.match(result.receipt.failed[0].error, /unsupported content block/)
+  assert.deepEqual((await readdir(h.dir('Z'))).filter((name) => name.endsWith('.json')), [`local_${SOURCE}.json`])
+})
+
+test('missing Remote Control readiness fields fail closed', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord())
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_unknown', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    events: async () => entries,
+    session: async () => ({ status: 'active', last_event_at: '2026-09-01T00:01:00.000Z' }),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(result.ok, false)
+  assert.equal(archived, false)
+  assert.match(result.receipt.failed[0].error, /not proven disconnected and idle/)
+})
+
+test('a Remote Control mirror stays active when no local target shares its title', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Different local session' }))
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_other', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    events: async () => [entry('user', 9, null, 'cse_other', { message: { role: 'user', content: 'different history' } })],
+    session: async () => remoteState(archived ? 'archived' : 'active', { id: 'cse_other' }),
+    archive: async () => { archived = true },
+    unarchive: async () => { archived = false }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.equal(inv.cloud.blocked.length, 1)
+  assert.match(inv.cloud.blocked[0].error, /no local target with the same title/)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.equal(result.validationOnly, true)
+  assert.equal(archived, false)
+})
+
+test('a local move lands before its matching Remote Control mirror archives', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const targetRecord = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_move', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-repl'], status }],
+    events: async () => entries,
+    session: async () => remoteState(status, { id: 'cse_move' }),
+    archive: async () => { assert.ok(await readFile(targetRecord)); status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.move.length, 1)
+  assert.equal(inv.cloud.matches[0].target.kind, 'move')
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.remote.length, 1)
+  assert.equal(status, 'archived')
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.equal(JSON.parse(await readFile(targetRecord, 'utf8')).isArchived, false)
+  assert.ok((await undo(h.paths, { cloud })).dest)
+  assert.equal(status, 'active')
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
+})
+
+test('Undo refuses the wrong cloud identity before changing local records', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord())
+  let status = 'active'
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_identity', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    events: async () => entries,
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(result.ok, true)
+  const wrong = { ...cloud, account: h.acct.Q, org: h.org.Q }
+  const refused = await undo(h.paths, { cloud: wrong })
+  assert.match(refused.restoreProblems[0], /sign Claude Desktop into the source account/)
+  assert.equal(status, 'archived')
+  assert.ok(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)))
+})
+
+test('Undo checks an activated target before restoring its cloud mirror', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  let unarchived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_changed', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    events: async () => entries,
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { unarchived = true; status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  const targetFile = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const changed = JSON.parse(await readFile(targetFile, 'utf8'))
+  changed.permissionMode = 'changed after move'
+  await writeFile(targetFile, JSON.stringify(changed))
+
+  const refused = await undo(h.paths, { cloud })
+  assert.match(refused.restoreProblems[0], /activated target record changed/)
+  assert.equal(unarchived, false)
+  assert.equal(status, 'archived')
+})
+
+test('interrupted target activation restoration resumes when the prior state is already present', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_activation_resume', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    events: async () => entries,
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  const targetFile = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const target = JSON.parse(await readFile(targetFile, 'utf8'))
+  await writeFile(targetFile, JSON.stringify({ ...target, isArchived: true }))
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  receipt.undoing = []
+  delete receipt.remoteUndoing
+  status = 'active'
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const recovered = await undo(h.paths, { cloud })
+  assert.ok(recovered.dest)
+  assert.equal(JSON.parse(await readFile(targetFile, 'utf8')).isArchived, true)
+})
+
+test('a connected Remote Control session is never archived or locally activated', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_busy', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    events: async () => entries,
+    session: async () => remoteState('active', { connection_status: 'connected' }),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(result.ok, false)
+  assert.match(result.receipt.failed[0].error, /not proven disconnected and idle/)
+  assert.equal(archived, false)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
+})
+
+test('an interrupted Remote Control archive is recovered from server state', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  let first = true
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_interrupted', title: `Session ${SOURCE.slice(-3)}`, environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    events: async () => entries,
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived'; if (first) { first = false; throw new Error('connection lost after archive') } },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  const interrupted = await move(inv, to, h.paths)
+  assert.equal(interrupted.ok, false)
+  assert.ok(interrupted.receipt.remotePending)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, false)
+  const recovered = await move(inv, to, h.paths)
+  assert.equal(recovered.recoveryRequired, true)
+  const receipt = JSON.parse(await readFile(interrupted.file, 'utf8'))
+  assert.equal(receipt.remotePending, undefined)
+  assert.equal(receipt.remote.length, 1)
+  assert.ok((await undo(h.paths, { cloud })).dest)
+  assert.equal(status, 'active')
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
 })
 
 test('rehome eligibility stays narrow around ownership locks', async () => {

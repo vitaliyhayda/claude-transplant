@@ -44,6 +44,9 @@ struct Event: Decodable {
     let done: Bool?
     let ok: Bool?
     let moved: Int?
+    let rescued: Int?
+    let cloudArchived: Int?
+    let cloudRestored: Int?
     let retired: Int?
     let failed: [Failure]?
     let problems: [Problem]?
@@ -135,7 +138,7 @@ final class Model: ObservableObject {
 
     func move() {
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
-        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--json"]
+        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--cloud", "--json"]
         begin()
         run(args, line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
@@ -177,18 +180,29 @@ final class Model: ObservableObject {
             restartAvailable = false
         } else if event.done == true {
             let moved = event.moved ?? 0
+            let rescued = event.rescued ?? 0
+            let cloudArchived = event.cloudArchived ?? 0
             let failed = event.failed ?? []
             if !failed.isEmpty {
-                lines.append(("failed", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n")))
+                if failed.count == 1 {
+                    lines.append(("failed", identity(failed[0].title, failed[0].id) + " | " + failed[0].error))
+                } else {
+                    var reasons: [String] = []
+                    for failure in failed where !reasons.contains(failure.error) { reasons.append(failure.error) }
+                    lines.append(("failed", reasons.map { reason in "\(failed.filter { $0.error == reason }.count) sessions | \(reason)" }.joined(separator: "\n")))
+                }
             }
             let problems = event.problems ?? []
             for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
             let retired = event.retired ?? 0
-            let idle = retired == 0 ? "Nothing to move" : "\(retired) source entries retired"
-            let movedText = moved == 0
-                ? (failed.isEmpty ? idle : "\(failed.count) failed")
-                : "\(moved) sessions moved" + (failed.isEmpty ? "" : ", \(failed.count) failed")
-            let summary = movedText + (problems.isEmpty ? "" : ", verification failed")
+            var outcomes: [String] = []
+            if moved - rescued > 0 { outcomes.append("\(moved - rescued) sessions moved") }
+            if rescued > 0 { outcomes.append("\(rescued) remote branches rescued") }
+            if cloudArchived > 0 { outcomes.append("\(cloudArchived) cloud mirrors archived") }
+            else if moved == 0, retired > 0 { outcomes.append("\(retired) source entries retired") }
+            if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
+            if !problems.isEmpty { outcomes.append("verification failed") }
+            let summary = outcomes.isEmpty ? "Nothing to move" : outcomes.joined(separator: ", ")
             restartAvailable = event.restart ?? false
             note = summary
             notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
@@ -196,7 +210,8 @@ final class Model: ObservableObject {
             restartAvailable = event.restart ?? false
             note = restartAvailable ? "" : event.note ?? ""
             let restored = event.restored ?? 0
-            notify(restored > 0 ? "\(restored) source entries restored" : "\(event.sessions ?? 0) sessions undone", event.note ?? "")
+            let cloudRestored = event.cloudRestored ?? 0
+            notify(cloudRestored > 0 ? "\(cloudRestored) cloud mirrors restored" : restored > 0 ? "\(restored) source entries restored" : "\(event.sessions ?? 0) sessions undone", event.note ?? "")
         } else if let refused = event.refused {
             note = event.reason ?? "Undo refused, \(refused.count) sessions changed since the move"
             restartAvailable = false
@@ -585,7 +600,7 @@ enum Demo {
         }
         glide(to: CGPoint(x: 282, y: 238), frames: 8)
         model.begin()
-        model.lines = [("inventory", "333 records | 4 without history | 21 compatible source versions | 3 blocked | 3 already there | 305 to move")]
+        model.lines = [("inventory", "333 records | 4 without history | 3 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 305 to move")]
         snap(250)
         glide(to: CGPoint(x: 150, y: 420), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
@@ -601,21 +616,22 @@ enum Demo {
         model.badge = ""
         model.progressCompleted = nil
         model.progressTotal = nil
-        model.lines.append(("move", "305 ✓ | 141,228 events | 305 zero-copy"))
+        model.lines.append(("move", "306 ✓ | 141,347 events | 305 zero-copy | 1 rescued"))
         snap(350)
         model.lines.append(("sidecars", "1,842 files | unchanged ✓"))
         snap(350)
-        model.lines.append(("desktop", "305 records | 240 archived | 65 active"))
+        model.lines.append(("desktop", "306 records | 240 archived | 66 active"))
         snap(350)
         model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓ | 2s"))
         snap(350)
-        model.lines.append(("retired", "305 source records → quarantine | transcripts untouched"))
+        model.lines.append(("retired", "308 source records → quarantine | transcripts untouched"))
+        model.lines.append(("cloud", "5 source mirrors archived"))
         snap(500)
         model.running = false
         model.from = []
         model.to = nil
         model.symbol = "checkmark"
-        model.note = "305 sessions moved"
+        model.note = "305 sessions moved, 1 remote branch rescued, 5 cloud mirrors archived"
         model.restartAvailable = true
         snap(2800)
         try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))
