@@ -2,7 +2,7 @@
 
 <h3 align="center">Move Claude Code history between accounts. Menubar or CLI.</h3>
 
-<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant: pick from, pick to, move" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant: choose a destination, move local history, finish pending cloud checks" width="760"></p>
 
 ## What it does
 
@@ -52,6 +52,7 @@ To    ↑↓ move · enter confirm
 | `claude-transplant --dry-run` | plan only and write nothing, refuses pending recovery, with `--cloud` it reads remote metadata and history |
 | `claude-transplant undo` | quarantine the last move, restore the source entries, refused if a target changed or a source cannot be restored |
 | `claude-transplant finish` | check the active pending source, retry its failures, or continue a staged cloud Undo |
+| `claude-transplant keep-local` | cancel unchecked cloud sources without reversing completed local movement |
 | `claude-transplant accounts` | list accounts |
 | `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
@@ -81,7 +82,7 @@ A session is three files that can disagree: the transcript in `~/.claude/project
 
 Remote Control adds a fourth, server-owned layer. With `--cloud`, claude-transplant reads whichever selected source is active through Claude Desktop's authenticated session and hashes durable user and assistant message shapes. Every other selected source becomes a pending cloud check on the same receipt while its eligible local records still move. Sign into a pending source and run `finish`, or click Finish pending, to inspect it without repeating the local move. A failed source keeps its remote session active and remains retryable. If one local target contains the remote history, that record becomes the destination. A bridge id links the remote row to its local session when available. Otherwise, one same-title target must share eight consecutive exact remote messages before it can anchor a separate companion whose supported remote message payloads are copied exactly into a new local transcript. The anchor supplies local project metadata and a narrow allowlist of project, display, and model settings because the remote endpoint does not expose a local working directory. Anchor-only prompt, browser, permission, spawn, and runtime state is discarded, and permission mode resets to default. The tool checks that the remote worker is disconnected and unchanged before archiving its source mirror. Cookies are decrypted in memory through macOS Keychain, sent only to `claude.ai`, and never printed or stored.
 
-One receipt owns the local move, completed cloud checks, failures, retries, and unchecked sources. A delayed check includes only Remote Control sessions created no later than that original Move, so it never sweeps later work into an older instruction. Another move cannot start until that receipt is complete or undone. Undo cancels unchecked cloud sources immediately. If several source accounts already archived cloud mirrors, Undo restores the mirrors available under the current login and asks for each remaining source login before reversing the local records. No completed layer is silently abandoned.
+One receipt owns the local move, completed cloud checks, failures, retries, and unchecked sources. A delayed check includes only Remote Control sessions created no later than that original Move, so it never sweeps later work into an older instruction. Another move cannot start until that receipt is complete, kept local, or undone. Keep local cancels the unchecked cloud work without reversing completed local movement. Undo cancels unchecked cloud sources and reverses the whole move. If several source accounts already archived cloud mirrors, Undo restores the mirrors available under the current login and asks for each remaining source login before reversing the local records. No completed layer is silently abandoned.
 
 A move is eligible when the history is a single comparable version, the record filename and identity are valid, no scheduled task, notification route, or running worker owns it, the parent record is already in the target or moves first in the same batch, and the target has no id collision. Everything else is refused with a named reason.
 

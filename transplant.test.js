@@ -9,7 +9,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, finishPending, inventory, layout, move, normalize, semantic, step, undo } from './transplant.js'
+import { accounts, finishPending, inventory, keepLocal, layout, move, normalize, semantic, step, undo } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -178,11 +178,60 @@ test('menubar-style cloud moves do local work without an active source login', a
   const blocked = await cli(h.root, ['--from', 'z@example.com personal', '--to', 'p@example.com personal', '--json'])
   assert.equal(blocked.code, 1)
   assert.match(JSON.parse(blocked.stdout.trim().split('\n').at(-1)).reason, /pending move/)
+  const directTarget = (await accounts(h.paths)).find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const direct = await move({ cloud: null }, directTarget, h.paths)
+  assert.equal(direct.deferred.mode, 'cloud')
+  assert.equal((await readdir(h.paths.state)).filter((name) => /^\d.*\.json$/.test(name)).length, 1)
 
   const undone = await cli(h.root, ['undo', '--json'])
   assert.equal(undone.code, 0)
   assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`])
   assert.deepEqual(await readdir(h.dir('Z')), [])
+})
+
+test('human CLI names staged Undo instead of printing false success', async () => {
+  const h = await home()
+  const at = '2099-01-03T00-00-00-000'
+  const receipt = {
+    at,
+    from: ['source'],
+    to: 'target',
+    sessions: [],
+    failed: [],
+    superseded: [],
+    undoing: [],
+    remoteUndoing: [{ id: 'cse_pending_undo', title: 'Pending undo', account: h.acct.T, org: h.org.T, accountLabel: 't@example.com · Team T' }]
+  }
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, `${at}.json`), JSON.stringify(receipt))
+  const result = await cli(h.root, ['undo'])
+
+  assert.equal(result.code, 0)
+  assert.match(result.stdout, /pending.*t@example.com · Team T/i)
+  assert.doesNotMatch(result.stdout, /quarantine\s+undefined/)
+  assert.doesNotMatch(result.stdout, /shared transcripts unchanged/)
+})
+
+test('human CLI reports Finish recovery without an undefined pending count', async () => {
+  const h = await home()
+  const at = '2099-01-04T00-00-00-000'
+  const receipt = {
+    at,
+    from: ['source'],
+    to: 'target',
+    sessions: [],
+    failed: [],
+    superseded: [],
+    finalizing: true,
+    cloudChecks: [{ account: h.acct.T, org: h.org.T, label: 't@example.com · Team T', status: 'pending' }]
+  }
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, `${at}.json`), JSON.stringify(receipt))
+  const result = await cli(h.root, ['finish'])
+
+  assert.equal(result.code, 1)
+  assert.match(result.stdout, /recovered.*finalization rolled back/i)
+  assert.doesNotMatch(result.stdout, /undefined cloud checks/)
 })
 
 test('a second move cannot cross the kernel lock', async () => {
@@ -443,6 +492,22 @@ test('a contained destination supersedes only its Desktop record', async () => {
   assert.ok(await readFile(olderTranscript))
   assert.deepEqual((await readdir(h.dir('Z'))).map((f) => f.slice(6, -5)), [id(945)])
   assert.equal((await readdir(h.dir('P'))).length, 1)
+})
+
+test('a target without a Desktop record id never covers and retires a valid source', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Valid source' }))
+  await h.record('Z', SOURCE, rehomeRecord({ sessionId: null, title: 'Invalid target identity' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths)
+
+  assert.equal(inv.there.length, 0)
+  assert.equal(inv.move.length, 0)
+  assert.match(inv.blocked[0].error, /target session id collision/)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
 })
 
 test('stale source entries retire when the destination already holds them', async () => {
@@ -1094,6 +1159,25 @@ test('a zero-record source still creates a pending cloud check', async () => {
   assert.ok((await undo(h.paths)).dest)
 })
 
+test('Keep local cancels pending cloud checks without reversing completed local work', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Keep local source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  const kept = await keepLocal(h.paths)
+
+  assert.equal(kept.cancelled, 1)
+  assert.equal(kept.receipt.cloudChecks[0].status, 'cancelled')
+  assert.deepEqual(await readdir(h.dir('T')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+  assert.equal((await cli(h.root, ['--dry-run', '--from', 'z@example.com personal', '--to', 'p@example.com personal', '--json'])).code, 0)
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal(moved.file, kept.file)
+})
+
 test('a source cloud outage never blocks its eligible local move', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -1194,7 +1278,7 @@ test('Finish pending preserves a record-only bridge identity after local rehome'
   }
   const finished = await finishPending(h.paths, { cloud })
 
-  assert.equal(moved.receipt.sessions[0].sourceBridgeIds.includes('session_record_only'), true)
+  assert.equal(moved.receipt.cloudLinks[0].bridgeIds.includes('session_record_only'), true)
   assert.equal(finished.ok, true)
   assert.equal(finished.complete, true)
   assert.equal(finished.rescued, 1)
@@ -1220,6 +1304,38 @@ test('Finish pending preserves a record-only bridge identity when history was al
     list: async () => [{ id: 'cse_existing_record_only', title: 'Renamed remote title', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
     eventRows: async () => remoteRows(remote),
     session: async () => remoteState(status, { id: 'cse_existing_record_only' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(finished.ok, true)
+  assert.equal(finished.rescued, 1)
+  assert.equal(status, 'archived')
+})
+
+test('duplicate owners keep record-only bridge identities scoped to each source account', async () => {
+  const h = await home()
+  const local = [entry('user', 37, null, SOURCE, { message: { role: 'user', content: 'shared local history' } })]
+  const remote = [entry('user', 38, null, 'cse_second_owner', { message: { role: 'user', content: 'second owner remote branch' } })]
+  await h.write(SOURCE, local)
+  await h.record('P', SOURCE, rehomeRecord({ title: 'First owner', bridgeSessionIds: ['session_first_owner'] }))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Second owner', bridgeSessionIds: ['session_second_owner'] }))
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory(from, to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  assert.equal(moved.receipt.cloudLinks.some((row) => row.account === h.acct.T && row.bridgeIds.includes('session_second_owner')), true)
+  let status = 'active'
+  const cloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_second_owner', title: 'Renamed second owner', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status, { id: 'cse_second_owner' }),
     archive: async () => { status = 'archived' },
     unarchive: async () => { status = 'active' }
   }
@@ -1256,6 +1372,32 @@ test('Finish pending never sweeps in a Remote Control session created after Move
   assert.equal(finished.complete, true)
   assert.equal(finished.pendingCloud, 0)
   assert.equal(finished.receipt.remote.length, 0)
+  assert.equal(archived, false)
+})
+
+test('the first cloud attempt uses the same creation cutoff as its retry', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 39, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Cutoff source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  let archived = false
+  const requestedAt = new Date().toISOString()
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_after_click', title: 'Cutoff source', created_at: new Date(Date.parse(requestedAt) + 60_000).toISOString(), environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    eventRows: async () => remoteRows([entry('user', 40, null, 'cse_after_click')]),
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true, requestedAt }), to, h.paths)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.pendingCloud, 0)
+  assert.equal(result.receipt.remote.length, 0)
   assert.equal(archived, false)
 })
 
@@ -1369,6 +1511,7 @@ test('a deferred rescue verification failure can be retried after harmless recor
   assert.equal(failed.ok, false)
   assert.equal(failed.receipt.cloudChecks[0].status, 'failed')
   assert.equal(status, 'active')
+  assert.match((await keepLocal(h.paths)).refused[0], /verification failed/)
 
   const retried = await finishPending(h.paths, { cloud })
   assert.equal(retried.ok, true)
@@ -1989,6 +2132,42 @@ test('an interrupted Remote Control archive is recovered from server state', asy
   assert.ok((await undo(h.paths, { cloud })).dest)
   assert.equal(status, 'active')
   assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
+})
+
+test('an interrupted unapplied archive leaves a tagged failure that retry clears', async () => {
+  const h = await home()
+  const entries = [entry('user', 41, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  let interrupt = true
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [{ id: 'cse_unapplied', title: `Session ${SOURCE.slice(-3)}`, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status, { id: 'cse_unapplied' }),
+    archive: async () => {
+      if (interrupt) throw new Error('connection failed before archive')
+      status = 'archived'
+    },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true })
+  const interrupted = await move(inv, to, h.paths)
+  assert.ok(interrupted.receipt.remotePending)
+
+  const recovered = await move(inv, to, h.paths)
+  assert.equal(recovered.recoveryRequired, true)
+  interrupt = false
+  const retried = await finishPending(h.paths, { cloud })
+  assert.equal(retried.ok, true)
+  assert.equal(retried.complete, true)
+  assert.equal(retried.receipt.failed.length, 0)
+  assert.equal(status, 'archived')
 })
 
 test('rehome eligibility stays narrow around ownership locks', async () => {

@@ -49,7 +49,9 @@ struct Event: Decodable {
     let moved: Int?
     let rescued: Int?
     let cloudArchived: Int?
+    let cloudChecked: Int?
     let cloudRestored: Int?
+    let keptLocal: Int?
     let pendingCloud: Int?
     let pendingUndo: [String]?
     let pendingLabels: [String]?
@@ -104,12 +106,14 @@ final class Model: ObservableObject {
     }
 
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
-    var pendingReady: Bool { !running && pendingAccounts.contains { $0.active == true } && (config != nil || demo) }
+    var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
+    var canKeepLocal: Bool { !running && pendingAccounts.contains { $0.pending == "cloud" } }
+    var pendingReady: Bool { !running && activePendingAccount != nil && (config != nil || demo) }
     var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
         let labels = pendingAccounts.map(\.label).joined(separator: " or ")
-        let failures = pendingAccounts.flatMap { $0.pendingFailures ?? [] }
+        let failures = activePendingAccount?.pendingFailures ?? []
         if let first = failures.first {
             let title = identity(first.title, first.id)
             if !pendingReady { return "Sign Claude Desktop into \(labels) to retry pending" }
@@ -179,6 +183,12 @@ final class Model: ObservableObject {
         run(["finish", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
 
+    func keepLocal() {
+        guard canKeepLocal else { return }
+        begin()
+        run(["keep-local", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+    }
+
     func begin() {
         lines = []
         note = ""
@@ -213,9 +223,11 @@ final class Model: ObservableObject {
             let moved = event.moved ?? 0
             let rescued = event.rescued ?? 0
             let cloudArchived = event.cloudArchived ?? 0
+            let cloudChecked = event.cloudChecked ?? 0
             let cloudRestored = event.cloudRestored ?? 0
             let pendingCloud = event.pendingCloud ?? 0
             let pendingUndo = event.pendingUndo ?? []
+            let keptLocal = event.keptLocal ?? 0
             pendingResult = event.complete == false || pendingCloud > 0 || !pendingUndo.isEmpty
             let failed = event.failed ?? []
             if !failed.isEmpty {
@@ -228,9 +240,11 @@ final class Model: ObservableObject {
             if moved - rescued > 0 { outcomes.append("\(moved - rescued) sessions moved") }
             if rescued > 0 { outcomes.append("\(rescued) remote branches rescued") }
             if cloudArchived > 0 { outcomes.append("\(cloudArchived) cloud mirrors archived") }
+            if cloudChecked > 0 { outcomes.append("\(cloudChecked) cloud source checked") }
             if cloudRestored > 0 { outcomes.append("\(cloudRestored) cloud mirrors restored") }
             if pendingCloud > 0 { outcomes.append("\(pendingCloud) cloud checks pending") }
             if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
+            if keptLocal > 0 { outcomes.append("Local move kept, \(keptLocal) cloud checks cancelled") }
             if moved == 0, retired > 0 { outcomes.append("\(retired) source entries retired") }
             if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
             if !problems.isEmpty { outcomes.append("verification failed") }
@@ -368,42 +382,44 @@ struct AccountRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Button(action: toggleSource) {
-                Image(systemName: sourceOn ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(sourceOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                HStack(spacing: 8) {
+                    Image(systemName: sourceOn ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(sourceOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                    Text(account.label).lineLimit(1).truncationMode(.tail).layoutPriority(1)
+                    if account.active == true {
+                        Text("active")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.green)
+                    }
+                    if account.pending != nil {
+                        Text(account.pendingFailures?.isEmpty == false ? "retry" : "pending")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer(minLength: 12)
+                    Text(account.detail)
+                        .font(.system(.caption, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 190, alignment: .trailing)
+                }
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            Text(account.label).lineLimit(1).truncationMode(.tail).layoutPriority(1)
-            if account.active == true {
-                Text("active")
-                    .font(.system(size: 10, weight: .semibold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.green.opacity(0.18), in: Capsule())
-                    .foregroundStyle(.green)
-            }
-            if account.pending != nil {
-                Text(account.pendingFailures?.isEmpty == false ? "retry" : "pending")
-                    .font(.system(size: 10, weight: .semibold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange.opacity(0.18), in: Capsule())
-                    .foregroundStyle(.orange)
-            }
-            Spacer(minLength: 12)
-            Text(account.detail)
-                .font(.system(.caption, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: 190, alignment: .trailing)
             Button(action: chooseTarget) {
                 Image(systemName: targetOn ? "largecircle.fill.circle" : "circle")
                     .foregroundStyle(targetOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
             }
             .buttonStyle(.plain)
         }
-        .contentShape(Rectangle())
     }
 }
 
@@ -516,6 +532,9 @@ struct Panel: View {
                     Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
                 } else {
                     Pill(title: "Finish pending", prominent: true, enabled: model.pendingReady) { model.finishPending() }
+                    if model.canKeepLocal {
+                        Pill(title: "Keep local", prominent: false, enabled: true) { model.keepLocal() }
+                    }
                 }
                 Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
                 Spacer()
@@ -530,7 +549,6 @@ struct Panel: View {
             if !model.demo, let window = note.object as? NSWindow { model.panelVisibility(window.occlusionState.contains(.visible)) }
         }
     }
-
 }
 
 struct MenuBar: View {
