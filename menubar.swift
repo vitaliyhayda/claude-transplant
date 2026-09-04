@@ -489,25 +489,11 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            accountBlock("From") {
-                ForEach(model.accounts) { account in
-                    AccountRow(
-                        account: account,
-                        selected: model.from.contains(account.id),
-                        radio: false,
-                        action: { model.toggle(account.id) }
-                    )
-                }
-            }
-            accountBlock("To") {
-                ForEach(model.accounts) { account in
-                    AccountRow(
-                        account: account,
-                        selected: model.to == account.id,
-                        radio: true,
-                        action: { model.selectTarget(account.id) }
-                    )
-                }
+            if model.demo {
+                accountLists
+            } else {
+                ScrollView { accountLists }
+                    .frame(height: min(310, 48 + CGFloat(model.accounts.count) * 44))
             }
             if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
             ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
@@ -547,6 +533,21 @@ struct Panel: View {
         .onDisappear { if !model.demo { model.panelVisibility(false) } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
             if !model.demo, let window = note.object as? NSWindow { model.panelVisibility(window.occlusionState.contains(.visible)) }
+        }
+    }
+
+    private var accountLists: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            accountBlock("From") {
+                ForEach(model.accounts) { account in
+                    AccountRow(account: account, selected: model.from.contains(account.id), radio: false) { model.toggle(account.id) }
+                }
+            }
+            accountBlock("To") {
+                ForEach(model.accounts) { account in
+                    AccountRow(account: account, selected: model.to == account.id, radio: true) { model.selectTarget(account.id) }
+                }
+            }
         }
     }
 
