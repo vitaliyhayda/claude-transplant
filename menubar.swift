@@ -8,6 +8,8 @@ struct Account: Decodable, Identifiable {
     let label: String
     let stats: String
     let active: Bool?
+    let pending: String?
+    let pendingFailures: [Failure]?
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var detail: String { stats.replacingOccurrences(of: " | active", with: "").replacingOccurrences(of: " | ", with: "  ·  ") }
@@ -43,10 +45,14 @@ struct Event: Decodable {
     let total: Int?
     let done: Bool?
     let ok: Bool?
+    let complete: Bool?
     let moved: Int?
     let rescued: Int?
     let cloudArchived: Int?
     let cloudRestored: Int?
+    let pendingCloud: Int?
+    let pendingUndo: [String]?
+    let pendingLabels: [String]?
     let retired: Int?
     let failed: [Failure]?
     let problems: [Problem]?
@@ -82,6 +88,7 @@ final class Model: ObservableObject {
     let demo: Bool
     private let config: Config?
     private var refreshing = false
+    private var pendingResult = false
 
     init(demo: Bool = false) {
         self.demo = demo
@@ -96,9 +103,20 @@ final class Model: ObservableObject {
         refresh()
     }
 
-    var ready: Bool { !running && !from.isEmpty && to != nil && (config != nil || demo) }
-    var remaining: [Account] { accounts.filter { !from.contains($0.id) } }
-    var sources: [Account] { remaining.count == 1 && !from.isEmpty ? accounts.filter { $0.id != remaining[0].id } : accounts }
+    var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
+    var pendingReady: Bool { !running && pendingAccounts.contains { $0.active == true } && (config != nil || demo) }
+    var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
+    var pendingPrompt: String {
+        guard !pendingAccounts.isEmpty else { return "" }
+        let labels = pendingAccounts.map(\.label).joined(separator: " or ")
+        let failures = pendingAccounts.flatMap { $0.pendingFailures ?? [] }
+        if let first = failures.first {
+            let title = identity(first.title, first.id)
+            if !pendingReady { return "Sign Claude Desktop into \(labels) to retry pending" }
+            return failures.count == 1 ? "Retry \(title)" : "Retry \(failures.count) cloud sessions"
+        }
+        return pendingReady ? "Pending work is ready for this account" : "Sign Claude Desktop into \(labels) to finish pending"
+    }
     var progress: Double? {
         guard let completed = progressCompleted, let total = progressTotal, total > 0 else { return nil }
         return Double(completed) / Double(total)
@@ -108,7 +126,13 @@ final class Model: ObservableObject {
         if from.isEmpty { clearResult() }
         if from.contains(id) { from.remove(id) } else { from.insert(id) }
         if to == id { to = nil }
-        if remaining.count == 1 { to = remaining[0].id }
+    }
+
+    func selectTarget(_ id: String) {
+        clearResult()
+        if from.isEmpty { from = Set(accounts.map(\.id).filter { $0 != id }) }
+        else { from.remove(id) }
+        to = id
     }
 
     func panelVisibility(_ visible: Bool) {
@@ -149,6 +173,12 @@ final class Model: ObservableObject {
         run(["undo", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
 
+    func finishPending() {
+        guard pendingReady else { return }
+        begin()
+        run(["finish", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+    }
+
     func begin() {
         lines = []
         note = ""
@@ -158,6 +188,7 @@ final class Model: ObservableObject {
         badge = "starting"
         progressCompleted = nil
         progressTotal = nil
+        pendingResult = false
     }
 
     private func handle(_ line: String) {
@@ -182,6 +213,10 @@ final class Model: ObservableObject {
             let moved = event.moved ?? 0
             let rescued = event.rescued ?? 0
             let cloudArchived = event.cloudArchived ?? 0
+            let cloudRestored = event.cloudRestored ?? 0
+            let pendingCloud = event.pendingCloud ?? 0
+            let pendingUndo = event.pendingUndo ?? []
+            pendingResult = event.complete == false || pendingCloud > 0 || !pendingUndo.isEmpty
             let failed = event.failed ?? []
             if !failed.isEmpty {
                 lines.append(("failed", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n")))
@@ -193,6 +228,9 @@ final class Model: ObservableObject {
             if moved - rescued > 0 { outcomes.append("\(moved - rescued) sessions moved") }
             if rescued > 0 { outcomes.append("\(rescued) remote branches rescued") }
             if cloudArchived > 0 { outcomes.append("\(cloudArchived) cloud mirrors archived") }
+            if cloudRestored > 0 { outcomes.append("\(cloudRestored) cloud mirrors restored") }
+            if pendingCloud > 0 { outcomes.append("\(pendingCloud) cloud checks pending") }
+            if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
             if moved == 0, retired > 0 { outcomes.append("\(retired) source entries retired") }
             if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
             if !problems.isEmpty { outcomes.append("verification failed") }
@@ -253,7 +291,7 @@ final class Model: ObservableObject {
         progressTotal = nil
         from = []
         to = nil
-        symbol = status == 0 ? "checkmark" : "exclamationmark.triangle"
+        symbol = status == 0 ? (pendingResult ? "clock.arrow.circlepath" : "checkmark") : "exclamationmark.triangle"
         if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.symbol = "arrow.left.arrow.right" }
         refresh()
@@ -320,32 +358,52 @@ final class Model: ObservableObject {
     }
 }
 
-struct Row: View {
+struct AccountRow: View {
     let account: Account
-    let on: Bool
-    let radio: Bool
-    let action: () -> Void
+    let sourceOn: Bool
+    let targetOn: Bool
+    let toggleSource: () -> Void
+    let chooseTarget: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: on ? (radio ? "largecircle.fill.circle" : "checkmark.circle.fill") : "circle")
-                    .foregroundStyle(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-                Text(account.label).lineLimit(1).truncationMode(.tail)
-                if account.active == true {
-                    Text("active")
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.green.opacity(0.18), in: Capsule())
-                        .foregroundStyle(.green)
-                }
-                Spacer(minLength: 12)
-                Text(account.detail).font(.system(.caption, design: .rounded)).monospacedDigit().foregroundStyle(.secondary).fixedSize()
+        HStack(spacing: 8) {
+            Button(action: toggleSource) {
+                Image(systemName: sourceOn ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(sourceOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            Text(account.label).lineLimit(1).truncationMode(.tail).layoutPriority(1)
+            if account.active == true {
+                Text("active")
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.green.opacity(0.18), in: Capsule())
+                    .foregroundStyle(.green)
+            }
+            if account.pending != nil {
+                Text(account.pendingFailures?.isEmpty == false ? "retry" : "pending")
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.18), in: Capsule())
+                    .foregroundStyle(.orange)
+            }
+            Spacer(minLength: 12)
+            Text(account.detail)
+                .font(.system(.caption, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 190, alignment: .trailing)
+            Button(action: chooseTarget) {
+                Image(systemName: targetOn ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(targetOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+            }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
+        .contentShape(Rectangle())
     }
 }
 
@@ -416,23 +474,30 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            block("From") {
-                ForEach(model.sources) { account in
-                    Row(account: account, on: model.from.contains(account.id), radio: false) { model.toggle(account.id) }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("FROM")
+                    Spacer()
+                    Text("TO")
+                }
+                .font(.caption2.weight(.semibold))
+                .tracking(0.8)
+                .foregroundStyle(.secondary)
+                ForEach(model.accounts) { account in
+                    AccountRow(
+                        account: account,
+                        sourceOn: model.from.contains(account.id),
+                        targetOn: model.to == account.id,
+                        toggleSource: { model.toggle(account.id) },
+                        chooseTarget: { model.selectTarget(account.id) }
+                    )
                 }
             }
-            if !model.from.isEmpty {
-                block("To") {
-                    ForEach(model.remaining) { account in
-                        Row(account: account, on: model.to == account.id, radio: true) { model.to = account.id }
-                    }
-                }
-            }
-            if !model.lines.isEmpty || !model.note.isEmpty { Divider() }
+            if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
             ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(item.element.0).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                    Text(item.element.1)
+                    Text(item.element.1).fixedSize(horizontal: false, vertical: true)
                 }
                 .font(.system(.caption, design: .monospaced))
             }
@@ -440,21 +505,25 @@ struct Panel: View {
                 if let progress = model.progress { Bar(value: progress) }
                 else { ActivityBar() }
             }
-            if !model.note.isEmpty {
-                Text(model.note.sentence).font(.callout.weight(.medium))
+            if !model.note.isEmpty || !model.pendingPrompt.isEmpty {
+                Text((model.note.isEmpty ? model.pendingPrompt : model.note).sentence).font(.callout.weight(.medium))
             }
             if model.restartAvailable {
                 Button(action: { model.restartDesktop() }) { Text("Restart Claude Desktop to see them").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
             }
             HStack(spacing: 10) {
-                Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
+                if model.pendingAccounts.isEmpty {
+                    Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
+                } else {
+                    Pill(title: "Finish pending", prominent: true, enabled: model.pendingReady) { model.finishPending() }
+                }
                 Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
         }
         .padding(18)
-        .frame(width: 520)
+        .frame(width: 600)
         .onAppear { if !model.demo { model.panelVisibility(true) } }
         .onDisappear { if !model.demo { model.panelVisibility(false) } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
@@ -462,12 +531,6 @@ struct Panel: View {
         }
     }
 
-    private func block<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title.uppercased()).font(.caption2.weight(.semibold)).tracking(0.8).foregroundStyle(.secondary)
-            content()
-        }
-    }
 }
 
 struct MenuBar: View {
@@ -548,17 +611,17 @@ struct Screen: View {
             }
             Cursor().offset(x: cursor.x, y: cursor.y)
         }
-        .frame(width: 760, height: 530, alignment: .topLeading)
+        .frame(width: 760, height: 620, alignment: .topLeading)
         .environment(\.colorScheme, .dark)
     }
 }
 
 enum Demo {
     static let accounts = [
-        Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "86 | 2h ago | api", active: false),
-        Account(account: "john", org: "team", label: "john@example.com · Team", stats: "212 | 3d ago | api", active: false),
-        Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "35 | 5d ago | notes", active: false),
-        Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "12 | 4m ago | notes", active: true)
+        Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "86 | 2h ago | api", active: false, pending: nil, pendingFailures: nil),
+        Account(account: "john", org: "team", label: "john@example.com · Team", stats: "212 | 3d ago | api", active: false, pending: nil, pendingFailures: nil),
+        Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "35 | 5d ago | notes", active: false, pending: nil, pendingFailures: nil),
+        Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "12 | 4m ago | notes", active: true, pending: nil, pendingFailures: nil)
     ]
 
     @MainActor
@@ -587,14 +650,12 @@ enum Demo {
         glide(to: CGPoint(x: 586, y: 12), frames: 9)
         open = true
         snap(900)
-        for (index, y) in [108.0, 130.0, 152.0].enumerated() {
-            glide(to: CGPoint(x: 292, y: y), frames: 7)
-            model.toggle(accounts[index].id)
-            snap(index == 2 ? 1000 : 450)
-        }
-        glide(to: CGPoint(x: 282, y: 238), frames: 8)
+        glide(to: CGPoint(x: 722, y: 150), frames: 9)
+        model.selectTarget(accounts[2].id)
+        snap(1100)
+        glide(to: CGPoint(x: 205, y: 220), frames: 8)
         model.begin()
-        model.lines = [("inventory", "333 records | 4 without history | 3 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 305 to move")]
+        model.lines = [("inventory", "333 records | 4 without history | 3 blocked | 3 already there | 5 cloud mirrors | 1 cloud rescue | 2 cloud checks pending | 305 to move")]
         snap(250)
         glide(to: CGPoint(x: 150, y: 420), frames: 6)
         for done in stride(from: 0, through: 305, by: 23) {
@@ -620,12 +681,19 @@ enum Demo {
         snap(350)
         model.lines.append(("retired", "308 source records → quarantine | transcripts untouched"))
         model.lines.append(("cloud", "5 source mirrors archived"))
+        model.lines.append(("pending", "2 source cloud checks"))
         snap(500)
         model.running = false
         model.from = []
         model.to = nil
-        model.symbol = "checkmark"
-        model.note = "305 sessions moved, 1 remote branch rescued, 5 cloud mirrors archived"
+        model.accounts = [
+            Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "0 | -", active: false, pending: "cloud", pendingFailures: []),
+            Account(account: "john", org: "team", label: "john@example.com · Team", stats: "0 | -", active: false, pending: "cloud", pendingFailures: []),
+            Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "333 | now | notes", active: false, pending: nil, pendingFailures: nil),
+            Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "0 | -", active: true, pending: nil, pendingFailures: nil)
+        ]
+        model.symbol = "clock.arrow.circlepath"
+        model.note = "305 sessions moved, 1 remote branch rescued, 5 cloud mirrors archived, 2 cloud checks pending"
         model.restartAvailable = true
         snap(2800)
         try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))

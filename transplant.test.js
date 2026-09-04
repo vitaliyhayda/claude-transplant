@@ -2,14 +2,14 @@ import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { appendFile, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, inventory, layout, move, normalize, semantic, step, undo } from './transplant.js'
+import { accounts, finishPending, inventory, layout, move, normalize, semantic, step, undo } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -157,6 +157,32 @@ test('cli exits nonzero on partial failure and undoes over json', async () => {
   const undone = await run(['undo', '--json'])
   assert.equal(undone.code, 0)
   assert.equal(JSON.parse(undone.stdout.trim().split('\n').at(-1)).sessions, 1)
+})
+
+test('menubar-style cloud moves do local work without an active source login', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Offline source' }))
+  const moved = await cli(h.root, ['--from', 'p@example.com personal', '--to', 'z@example.com personal', '--cloud', '--json'])
+  assert.equal(moved.code, 0)
+  const result = JSON.parse(moved.stdout.trim().split('\n').at(-1))
+  assert.equal(result.moved, 1)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.complete, false)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+
+  const listed = await cli(h.root, ['accounts', '--json'])
+  const accountRows = JSON.parse(listed.stdout)
+  assert.equal(accountRows.find((account) => account.account === h.acct.P && account.org === h.org.P).pending, 'cloud')
+  const blocked = await cli(h.root, ['--from', 'z@example.com personal', '--to', 'p@example.com personal', '--json'])
+  assert.equal(blocked.code, 1)
+  assert.match(JSON.parse(blocked.stdout.trim().split('\n').at(-1)).reason, /pending move/)
+
+  const undone = await cli(h.root, ['undo', '--json'])
+  assert.equal(undone.code, 0)
+  assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`])
+  assert.deepEqual(await readdir(h.dir('Z')), [])
 })
 
 test('a second move cannot cross the kernel lock', async () => {
@@ -1015,6 +1041,390 @@ test('cross-login moves rehome across same and different organizations', async (
   }
 })
 
+test('local moves finish while inaccessible source cloud checks stay pending', async () => {
+  const h = await home()
+  const first = id(701)
+  const second = id(702)
+  await h.write(first, [entry('user', 1, null, first)])
+  await h.write(second, [entry('user', 2, null, second)])
+  await h.record('P', first, rehomeRecord({ title: 'First source' }))
+  await h.record('T', second, rehomeRecord({ title: 'Second source' }))
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [],
+    eventRows: async () => [],
+    session: async () => remoteState('active'),
+    archive: async () => {},
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory(from, to, h.paths, () => {}, { cloud, cloudRequested: true })
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.complete, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.deepEqual(result.receipt.cloudChecks.map(({ label, status }) => ({ label, status })), [
+    { label: from[0].label, status: 'complete' },
+    { label: from[1].label, status: 'pending' }
+  ])
+  assert.deepEqual((await readdir(h.dir('Z'))).sort(), [`local_${first}.json`, `local_${second}.json`].sort())
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('a zero-record source still creates a pending cloud check', async () => {
+  const h = await home()
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+
+  assert.ok(result.file)
+  assert.equal(result.ok, true)
+  assert.equal(result.complete, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.deepEqual(result.pendingLabels, [from.label])
+  assert.ok((await undo(h.paths)).dest)
+})
+
+test('a source cloud outage never blocks its eligible local move', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Cloud outage source' }))
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => { throw new Error('service unavailable') },
+    eventRows: async () => [],
+    session: async () => remoteState('active'),
+    archive: async () => {},
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true })
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.ok, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.cloudChecks[0].status, 'failed')
+  assert.match(result.receipt.failed[0].error, /service unavailable/)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+})
+
+test('Finish pending closes the same logical receipt under the matching source login', async () => {
+  const h = await home()
+  const first = id(703)
+  const second = id(704)
+  const firstEntries = [entry('user', 3, null, first)]
+  const secondEntries = [entry('user', 4, null, second), entry('assistant', 5, 4, second)]
+  await h.write(first, firstEntries)
+  await h.write(second, secondEntries)
+  await h.record('P', first, rehomeRecord({ title: 'First deferred source' }))
+  await h.record('T', second, rehomeRecord({ title: 'Second deferred source', isArchived: true }))
+  const emptyCloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [],
+    eventRows: async () => [],
+    session: async () => remoteState('active'),
+    archive: async () => {},
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory(from, to, h.paths, () => {}, { cloud: emptyCloud, cloudRequested: true }), to, h.paths)
+  let status = 'active'
+  const deferredCloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_deferred', title: 'Second deferred source', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(secondEntries),
+    session: async () => remoteState(status, { id: 'cse_deferred' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const finished = await finishPending(h.paths, { cloud: deferredCloud })
+
+  assert.equal(finished.file, moved.file)
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.pendingCloud, 0)
+  assert.equal(finished.receipt.cloudChecks.every((check) => check.status === 'complete'), true)
+  assert.equal(finished.receipt.remote.length, 1)
+  assert.equal(finished.restart, true)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${second}.json`), 'utf8')).isArchived, false)
+  assert.equal(status, 'archived')
+  assert.deepEqual((await readdir(h.paths.state)).filter((name) => /^\d.*\.json$/.test(name)), [path.basename(moved.file)])
+})
+
+test('Finish pending preserves a record-only bridge identity after local rehome', async () => {
+  const h = await home()
+  const session = id(709)
+  const local = [entry('user', 31, null, session, { message: { role: 'user', content: 'local history' } })]
+  const remote = [entry('user', 32, null, 'cse_record_only', { message: { role: 'user', content: 'remote branch' } })]
+  await h.write(session, local)
+  await h.record('T', session, rehomeRecord({ title: 'Original local title', bridgeSessionIds: ['session_record_only'] }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  let status = 'active'
+  const cloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_record_only', title: 'Renamed remote title', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status, { id: 'cse_record_only' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(moved.receipt.sessions[0].sourceBridgeIds.includes('session_record_only'), true)
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.rescued, 1)
+  assert.equal(status, 'archived')
+})
+
+test('Finish pending preserves a record-only bridge identity when history was already there', async () => {
+  const h = await home()
+  const local = [entry('user', 33, null, SOURCE, { message: { role: 'user', content: 'local history' } })]
+  const remote = [entry('user', 34, null, 'cse_existing_record_only', { message: { role: 'user', content: 'remote branch' } })]
+  await h.write(SOURCE, local)
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Already there source', bridgeSessionIds: ['session_existing_record_only'] }))
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Already there target' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  assert.equal(moved.receipt.sessions.length, 0)
+  let status = 'active'
+  const cloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_existing_record_only', title: 'Renamed remote title', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status, { id: 'cse_existing_record_only' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(finished.ok, true)
+  assert.equal(finished.rescued, 1)
+  assert.equal(status, 'archived')
+})
+
+test('Finish pending never sweeps in a Remote Control session created after Move', async () => {
+  const h = await home()
+  const session = id(708)
+  const entries = [entry('user', 30, null, session)]
+  await h.write(session, entries)
+  await h.record('T', session, rehomeRecord({ title: 'Later remote source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  let archived = false
+  const cloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_created_later', title: 'Later remote source', created_at: new Date(Date.parse(moved.receipt.startedAt) + 60_000).toISOString(), environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState('active', { id: 'cse_created_later' }),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.pendingCloud, 0)
+  assert.equal(finished.receipt.remote.length, 0)
+  assert.equal(archived, false)
+})
+
+test('Finish pending refuses an undated remote row instead of widening the move', async () => {
+  const h = await home()
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  let archived = false
+  const cloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_undated', title: 'Undated remote', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active' }],
+    eventRows: async () => [],
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const result = await finishPending(h.paths, { cloud })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.match(result.receipt.failed[0].error, /creation time is missing/)
+  assert.equal(archived, false)
+})
+
+test('a failed deferred cloud session remains explicit and retryable', async () => {
+  const h = await home()
+  const session = id(705)
+  const shared = branchEntries(8, session, 10)
+  const local = [...shared, entry('assistant', 18, 17, session, { message: { role: 'assistant', content: 'local branch' } })]
+  await h.write(session, local)
+  await h.record('T', session, rehomeRecord({ title: 'Retryable cloud source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  let supported = false
+  let status = 'active'
+  const remote = [
+    ...shared,
+    entry('user', 19, 17, 'cse_retryable', {
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'remote branch' }]
+      }
+    })
+  ]
+  const cloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_retryable', title: 'Retryable cloud source', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => {
+      if (!supported) throw new Error('Remote Control history contains an unsupported content block')
+      return remoteRows(remote)
+    },
+    session: async () => remoteState(status, { id: 'cse_retryable' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+
+  const failed = await finishPending(h.paths, { cloud })
+  assert.equal(failed.file, moved.file)
+  assert.equal(failed.ok, false)
+  assert.equal(failed.pendingCloud, 1)
+  assert.equal(failed.receipt.cloudChecks[0].status, 'failed')
+  assert.match(failed.receipt.failed.at(-1).error, /unsupported content block/)
+  assert.equal(status, 'active')
+
+  supported = true
+  const retried = await finishPending(h.paths, { cloud })
+  assert.equal(retried.ok, true)
+  assert.equal(retried.complete, true)
+  assert.equal(retried.pendingCloud, 0)
+  assert.equal(retried.receipt.failed.length, 0)
+  assert.equal(retried.receipt.sessions.filter((row) => row.strategy === 'remote').length, 1)
+  assert.equal(status, 'archived')
+})
+
+test('a deferred rescue verification failure can be retried after harmless record drift', async () => {
+  const h = await home()
+  const session = id(710)
+  const local = [entry('user', 35, null, session, { message: { role: 'user', content: 'local history' } })]
+  const remote = [entry('user', 36, null, 'cse_verify_retry', { message: { role: 'user', content: 'remote branch' } })]
+  await h.write(session, local)
+  await h.record('T', session, rehomeRecord({ title: 'Verification retry', bridgeSessionIds: ['session_verify_retry'] }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  let status = 'active'
+  const cloud = {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [{ id: 'cse_verify_retry', title: 'Verification retry remote', created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status }],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status, { id: 'cse_verify_retry' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  let damaged = false
+  const report = (stage, _text, progress) => {
+    if (stage !== 'verify' || progress?.completed !== 0 || damaged) return
+    damaged = true
+    const rescueFile = readdirSync(h.dir('Z')).map((name) => path.join(h.dir('Z'), name)).find((file) => !file.endsWith(`${session}.json`))
+    const record = JSON.parse(readFileSync(rescueFile, 'utf8'))
+    writeFileSync(rescueFile, JSON.stringify({ ...record, lastFocusedAt: record.lastFocusedAt + 1 }))
+  }
+  const failed = await finishPending(h.paths, { cloud, report })
+  assert.equal(failed.ok, false)
+  assert.equal(failed.receipt.cloudChecks[0].status, 'failed')
+  assert.equal(status, 'active')
+
+  const retried = await finishPending(h.paths, { cloud })
+  assert.equal(retried.ok, true)
+  assert.equal(retried.complete, true)
+  assert.equal(retried.receipt.verification.ok, true)
+  assert.equal(retried.receipt.verification.problems.length, 0)
+  assert.equal(status, 'archived')
+})
+
+test('Undo cancels unchecked cloud sources and completes across source logins', async () => {
+  const h = await home()
+  const first = id(706)
+  const second = id(707)
+  const firstEntries = [entry('user', 20, null, first), entry('assistant', 21, 20, first)]
+  const secondEntries = [entry('user', 22, null, second), entry('assistant', 23, 22, second)]
+  await h.write(first, firstEntries)
+  await h.write(second, secondEntries)
+  await h.record('P', first, rehomeRecord({ title: 'First undo source' }))
+  await h.record('T', second, rehomeRecord({ title: 'Second undo source' }))
+  const states = { first: 'active', second: 'active' }
+  const makeCloud = (account, org, key, remote, title, entries) => ({
+    account,
+    org,
+    list: async () => [{ id: remote, title, created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: states[key] }],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(states[key], { id: remote }),
+    archive: async () => { states[key] = 'archived' },
+    unarchive: async () => { states[key] = 'active' }
+  })
+  const firstCloud = makeCloud(h.acct.P, h.org.P, 'first', 'cse_first_undo', 'First undo source', firstEntries)
+  const secondCloud = makeCloud(h.acct.T, h.org.T, 'second', 'cse_second_undo', 'Second undo source', secondEntries)
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await move(await inventory(from, to, h.paths, () => {}, { cloud: firstCloud, cloudRequested: true }), to, h.paths)
+  await finishPending(h.paths, { cloud: secondCloud })
+  assert.deepEqual(states, { first: 'archived', second: 'archived' })
+
+  const staged = await undo(h.paths, { cloud: firstCloud })
+  assert.deepEqual(states, { first: 'active', second: 'archived' })
+  assert.deepEqual(staged.pendingUndo, [from[1].label])
+  assert.equal(staged.dest, undefined)
+  assert.equal(staged.receipt.cloudChecks.every((check) => check.status === 'cancelled' || check.status === 'complete'), true)
+  assert.deepEqual((await readdir(h.dir('Z'))).sort(), [`local_${first}.json`, `local_${second}.json`].sort())
+
+  const finished = await finishPending(h.paths, { cloud: secondCloud })
+  assert.deepEqual(states, { first: 'active', second: 'active' })
+  assert.ok(finished.dest)
+  assert.deepEqual((await readdir(h.dir('P'))), [`local_${first}.json`])
+  assert.deepEqual((await readdir(h.dir('T'))), [`local_${second}.json`])
+  assert.deepEqual(await readdir(h.dir('Z')), [])
+})
+
 test('a verified target archives its source Remote Control mirror and Undo restores it', async () => {
   const h = await home()
   const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
@@ -1305,7 +1715,8 @@ test('an unsupported remote content block is never rescued or archived', async (
   assert.match(inv.cloud.blocked[0].error, /unsupported content block/)
   const result = await move(inv, to, h.paths)
   assert.equal(result.ok, false)
-  assert.equal(result.validationOnly, true)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.cloudChecks[0].status, 'failed')
   assert.equal(archived, false)
   assert.match(result.receipt.failed[0].error, /unsupported content block/)
   assert.deepEqual((await readdir(h.dir('Z'))).filter((name) => name.endsWith('.json')), [`local_${SOURCE}.json`])
@@ -1361,7 +1772,8 @@ test('a Remote Control mirror stays active when no local target shares its title
   assert.match(inv.cloud.blocked[0].error, /no linked or same-title local target/)
   const result = await move(inv, to, h.paths)
   assert.equal(result.ok, false)
-  assert.equal(result.validationOnly, true)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.cloudChecks[0].status, 'failed')
   assert.equal(archived, false)
 })
 
@@ -1430,7 +1842,7 @@ test('a local verification failure keeps its Remote Control source active', asyn
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
 })
 
-test('Undo refuses the wrong cloud identity before changing local records', async () => {
+test('Undo stages the matching cloud identity before changing local records', async () => {
   const h = await home()
   const entries = [entry('user', 1, null, SOURCE)]
   await h.write(SOURCE, entries)
@@ -1451,8 +1863,8 @@ test('Undo refuses the wrong cloud identity before changing local records', asyn
   const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
   assert.equal(result.ok, true)
   const wrong = { ...cloud, account: h.acct.Q, org: h.org.Q }
-  const refused = await undo(h.paths, { cloud: wrong })
-  assert.match(refused.restoreProblems[0], /sign Claude Desktop into the source account/)
+  const staged = await undo(h.paths, { cloud: wrong })
+  assert.deepEqual(staged.pendingUndo, [from.label])
   assert.equal(status, 'archived')
   assert.ok(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)))
 })
@@ -1816,6 +2228,7 @@ test('an interrupted rehome removes only its unchanged target record', async () 
     sessions: [],
     failed: [],
     superseded: [],
+    cloudChecks: [{ account: h.acct.P, org: h.org.P, label: 'source', status: 'pending' }],
     finalizing: true,
     pending: {
       strategy: 'rehome',
@@ -1836,6 +2249,7 @@ test('an interrupted rehome removes only its unchanged target record', async () 
   assert.ok(await readFile(path.join(h.project, `${SOURCE}.jsonl`)))
   assert.equal(await readFile(targetRecord).catch(() => null), null)
   assert.deepEqual(await readdir(path.join(h.paths.state, 'quarantine', at, 'failed')), [`local_${SOURCE}.json`])
+  assert.equal(JSON.parse(await readFile(path.join(h.paths.state, `${at}.json`), 'utf8')).cloudChecks[0].status, 'cancelled')
 })
 
 test('interrupted rehome rollback keeps shared transcript and sidecar changes', async () => {
