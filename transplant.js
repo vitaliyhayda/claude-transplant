@@ -32,7 +32,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant finish      finish pending cloud work for the active source
   claude-transplant keep-local  cancel pending cloud checks, keep completed local work
   claude-transplant accounts    list accounts
-  claude-transplant menubar     install the menubar app, starts at login, --remove uninstalls
+  claude-transplant menubar     install the menubar app, --snapshot <png>, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
   --cloud                       reconcile active source, queue only local work left
@@ -102,8 +102,7 @@ export function layout(home = os.homedir()) {
     pool: path.join(home, '.claude/projects'),
     login: path.join(home, '.claude.json'),
     backups: path.join(home, '.claude/backups'),
-    state: process.env.CLAUDE_TRANSPLANT_STATE ?? path.join(support, 'claude-transplant'),
-    lock: path.join(support, 'claude-transplant', 'lock')
+    state: path.join(support, 'claude-transplant')
   }
 }
 
@@ -233,8 +232,7 @@ async function quarantine(items, dest) {
 
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
-  await mkdir(path.dirname(paths.lock), { recursive: true })
-  const lockFile = paths.lock
+  const lockFile = path.join(paths.state, 'lock')
   const guard = spawn('/usr/bin/lockf', ['-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
   await new Promise((resolve, reject) => {
     let ready = false
@@ -1189,12 +1187,9 @@ async function rehomeOne(s, to, journal, guard) {
   }
 }
 
-const gained = (c) => [...new Set(c.ids)].some((u) => !c.forked.has(u))
 const knownOf = (row) => ({
-  semantic: row.targetSemantic ?? row.semantic,
-  semanticVersion: row.targetSemanticVersion ?? row.semanticVersion,
-  bridge: row.targetBridge ?? row.bridge,
-  sha: row.targetSha ?? row.sha
+  semantic: row.targetSemantic,
+  semanticVersion: row.targetSemanticVersion
 })
 const artifacts = (row) => row.strategy === 'rehome' ? [row.record] : [row.targetTranscript, row.targetDir, row.record].filter(Boolean)
 const retiredCount = (receipt) => (receipt.superseded ?? []).filter((p) => p.source).length
@@ -1227,12 +1222,9 @@ const inventoryFailures = (inv) => [
 
 async function changed(file, sessionId, known) {
   if (!(await exists(file))) return false
-  if (known?.semantic && known.semanticVersion === SEMANTIC_VERSION) {
-    const data = await load(file)
-    return semantic(data.entries, sessionId, data.invalid) !== known.semantic || (known.bridge !== undefined && data.entries.some((entry) => entry.type === 'bridge-session') !== known.bridge)
-  }
-  if (known?.sha) return sha(await readFile(file)) !== known.sha
-  return gained(await scan(file))
+  if (!known?.semantic || known.semanticVersion !== SEMANTIC_VERSION) return true
+  const data = await load(file)
+  return semantic(data.entries, sessionId, data.invalid) !== known.semantic || (known.bridge !== undefined && data.entries.some((entry) => entry.type === 'bridge-session') !== known.bridge)
 }
 
 async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDrift = false) {
@@ -1259,7 +1251,7 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
     try {
       const record = JSON.parse(currentRecord)
       if (row.strategy === 'rehome' && allowRecordDrift && row.recordKeepSemantic) recordChanged = keepRecordSemantic(record) !== row.recordKeepSemantic
-      else recordChanged = row.recordSemantic ? recordSemantic(record) !== row.recordSemantic : sha(currentRecord) !== row.recordSha
+      else recordChanged = !row.recordSemantic || recordSemantic(record) !== row.recordSemantic
     } catch { recordChanged = true }
   }
   if (recordChanged) changes.push('desktop record')
@@ -1281,15 +1273,13 @@ async function restoreProblems(plan, root, parkedOnly = false) {
         continue
       }
       const [hasOriginal, hasParked] = await Promise.all([exists(original), exists(parked)])
-      const optionalLegacyDir = !item.required && UUID.test(path.basename(original)) && !path.extname(original)
       if (parkedOnly && !hasParked) {
-        if (!hasOriginal && !optionalLegacyDir) problems.push(`${item.title || item.id} | recovery artifact missing | ${path.basename(parked)}`)
+        if (!hasOriginal) problems.push(`${item.title || item.id} | recovery artifact missing | ${path.basename(parked)}`)
         continue
       }
       if (hasOriginal && hasParked) problems.push(`${item.title || item.id} | restore path occupied | ${path.basename(original)}`)
-      else if (!hasOriginal && !hasParked) {
-        if (!optionalLegacyDir) problems.push(`${item.title || item.id} | recovery artifact missing | ${path.basename(parked)}`)
-      } else {
+      else if (!hasOriginal && !hasParked) problems.push(`${item.title || item.id} | recovery artifact missing | ${path.basename(parked)}`)
+      else {
         const available = hasOriginal ? original : parked
         const expectedHash = hashes.get(original)
         const expectedTree = trees.get(original)
@@ -1297,10 +1287,6 @@ async function restoreProblems(plan, root, parkedOnly = false) {
         if (expectedHash && sha(await readFile(available).catch(() => Buffer.alloc(0))) !== expectedHash) problems.push(`${item.title || item.id} | recovery artifact changed | ${path.basename(available)}`)
         else if (expectedTree && (await manifest(available).catch(() => null))?.sha !== expectedTree) problems.push(`${item.title || item.id} | recovery artifact changed | ${path.basename(available)}`)
         else if (expectedSemantic && recordSemantic(await readJson(available).catch(() => ({}))) !== expectedSemantic) problems.push(`${item.title || item.id} | recovery artifact changed | ${path.basename(available)}`)
-        else if (item.source && !expectedHash && path.basename(original).startsWith('local_')) {
-          const record = await readJson(available).catch(() => null)
-          if (record?.cliSessionId !== item.id) problems.push(`${item.title || item.id} | recovery record invalid | ${path.basename(available)}`)
-        }
       }
     }
   }
@@ -1394,11 +1380,7 @@ async function park(plan, before = async () => {}) {
       const [hasOriginal, hasParked] = await Promise.all([exists(original), exists(parked)])
       if (hasOriginal && hasParked) throw new Error(`retirement path occupied: ${path.basename(parked)}`)
       if (hasParked) continue
-      if (!hasOriginal) {
-        const optionalLegacyDir = !item.required && UUID.test(path.basename(original)) && !path.extname(original)
-        if (!optionalLegacyDir) throw new Error(`retirement artifact missing: ${path.basename(original)}`)
-        continue
-      }
+      if (!hasOriginal) throw new Error(`retirement artifact missing: ${path.basename(original)}`)
       if (hashes.has(original) && sha(await readFile(original)) !== hashes.get(original)) throw new Error(`retirement artifact changed: ${path.basename(original)}`)
       if (trees.has(original) && (await manifest(original)).sha !== trees.get(original)) throw new Error(`retirement artifact changed: ${path.basename(original)}`)
       if (semantics.has(original) && recordSemantic(await readJson(original)) !== semantics.get(original)) throw new Error(`retirement artifact changed: ${path.basename(original)}`)
@@ -1486,7 +1468,7 @@ async function rollbackTarget(row, dest, liveWorkers = workers()) {
     if (!record.error) {
       const raw = await readFile(record.file).catch(() => null)
       let sameRecord = Boolean(raw)
-      try { if (raw) sameRecord = row.recordSemantic ? recordSemantic(JSON.parse(raw)) === row.recordSemantic : sha(raw) === row.recordSha } catch { sameRecord = false }
+      try { if (raw) sameRecord = Boolean(row.recordSemantic) && recordSemantic(JSON.parse(raw)) === row.recordSemantic } catch { sameRecord = false }
       if (!sameRecord) changes.push('desktop record changed')
     }
     if (row.taskFile && (await taskSessions(row.taskFile)).has(row.targetRecordId ?? `local_${row.targetId}`) !== row.taskOwned) changes.push('scheduled tasks changed')
@@ -1502,7 +1484,7 @@ async function rollbackTarget(row, dest, liveWorkers = workers()) {
   if (!record.error) {
     const raw = await readFile(record.file).catch(() => null)
     let sameRecord = Boolean(raw)
-    try { if (raw) sameRecord = row.recordSemantic ? recordSemantic(JSON.parse(raw)) === row.recordSemantic : sha(raw) === row.recordSha } catch { sameRecord = false }
+    try { if (raw) sameRecord = Boolean(row.recordSemantic) && recordSemantic(JSON.parse(raw)) === row.recordSemantic } catch { sameRecord = false }
     if (!sameRecord) changes.push('desktop record changed')
   }
   if (row.taskFile && (await taskSessions(row.taskFile)).has(row.targetRecordId ?? `local_${row.targetId}`) !== row.taskOwned) changes.push('scheduled tasks changed')
@@ -1583,11 +1565,12 @@ async function reconcile(paths, options = {}) {
   const recovered = []
   if (receipt.pending) {
     const { id, title, targetId, made, strategy } = receipt.pending
+    if (!['rehome', 'remote'].includes(strategy)) throw new Error('unsupported pending receipt strategy')
     const used = strategy === 'rehome'
       ? await readFile(made[0]).then((raw) => Boolean(receipt.pending.recordSha && sha(raw) !== receipt.pending.recordSha), () => false)
       : await changed(made[0], targetId, knownOf(receipt.pending))
     if (!used) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-    const changedCopy = strategy === 'rehome' ? 'target record' : strategy === 'remote' ? 'remote rescue' : 'legacy copy'
+    const changedCopy = strategy === 'rehome' ? 'target record' : 'remote rescue'
     const error = used ? `interrupted, ${changedCopy} changed since, left in place` : 'interrupted'
     receipt.failed.push({ id, title, targetId, artifacts: made, retained: used, error })
     if (used) receipt.retained = [...(receipt.retained ?? []), { id, title, targetId, artifacts: made }]
@@ -1656,7 +1639,7 @@ async function untouched(row, liveWorkers, checkShared = true) {
   const raw = record ? await readFile(record).catch(() => null) : null
   let sameRecord = Boolean(raw)
   if (raw) {
-    try { sameRecord = row.recordSemantic ? recordSemantic(JSON.parse(raw)) === row.recordSemantic : !row.recordSha || sha(raw) === row.recordSha } catch { sameRecord = false }
+    try { sameRecord = Boolean(row.recordSemantic) && recordSemantic(JSON.parse(raw)) === row.recordSemantic } catch { sameRecord = false }
   }
   return sameRecord && await witnessed(row, liveWorkers, checkShared)
 }
@@ -1933,7 +1916,7 @@ async function rescueRemote(match, to, cloud, journal) {
   const recordText = jsonText(placed)
   const made = [targetTranscript, record]
   const targetSemantic = semantic(entries, targetId)
-  await journal({ strategy: 'remote', id: targetId, targetId, made, targetSha: sha(transcriptText), targetSemantic, targetSemanticVersion: SEMANTIC_VERSION })
+  await journal({ strategy: 'remote', id: targetId, targetId, made, targetSemantic, targetSemanticVersion: SEMANTIC_VERSION })
   await writeNew(targetTranscript, transcriptText)
   await writeNew(record, recordText)
   const sidecarRoot = path.join(path.dirname(targetTranscript), targetId)
@@ -1960,7 +1943,6 @@ async function rescueRemote(match, to, cloud, journal) {
     transcriptFingerprint: await fingerprint(targetTranscript),
     targetSemantic,
     targetSemanticVersion: SEMANTIC_VERSION,
-    targetSha: sha(transcriptText),
     sidecars: { count: 0, bytes: 0, sha: sha(stable([])), fingerprint: sidecarFingerprint },
     events: remoteHistory.length,
     remoteEvents: rows.length,
@@ -2647,7 +2629,7 @@ const plist = (dict) => {
   ].join('\n')
 }
 
-async function menubar(paths, remove) {
+async function menubar(paths, remove, snapshot) {
   const app = path.join(paths.state, 'Claude Transplant.app')
   const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
   const agent = path.join(paths.home, 'Library/LaunchAgents', `${LABEL}.plist`)
@@ -2665,6 +2647,7 @@ async function menubar(paths, remove) {
   const source = path.join(HERE, 'menubar.swift')
   const key = sha((await readFile(source, 'utf8')) + (await readJson(path.join(HERE, 'package.json'))).version)
   const built = path.join(app, 'Contents/Resources/build.sha256')
+  let rebuilt = false
   if ((await readFile(built, 'utf8').catch(() => '')) !== key) {
     const fresh = `${app}.building`
     await rm(fresh, { recursive: true, force: true })
@@ -2689,19 +2672,31 @@ async function menubar(paths, remove) {
     stop()
     await rm(app, { recursive: true, force: true })
     await rename(fresh, app)
-  } else stop()
+    rebuilt = true
+  }
   const script = path.join(app, 'Contents/Resources/transplant.js')
   await copyFile(path.join(HERE, 'transplant.js'), script)
   await writeFile(path.join(paths.state, 'menubar.json'), `${JSON.stringify({ node: process.execPath, script })}\n`)
-  await mkdir(path.dirname(agent), { recursive: true })
-  await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary], RunAtLoad: true }))
-  const load = spawnSync('launchctl', ['bootstrap', domain, agent], { encoding: 'utf8' })
-  if (load.status !== 0) throw new Error(`launchctl failed: ${(load.stderr || '').trim()}`)
+  const launch = async () => {
+    await mkdir(path.dirname(agent), { recursive: true })
+    await writeFile(agent, plist({ Label: LABEL, ProgramArguments: [binary], RunAtLoad: true }))
+    const load = spawnSync('launchctl', ['bootstrap', domain, agent], { encoding: 'utf8' })
+    if (load.status !== 0) throw new Error(`launchctl failed: ${(load.stderr || '').trim()}`)
+  }
+  if (snapshot) {
+    const output = path.resolve(snapshot)
+    const shot = spawnSync(binary, ['--snapshot', output], { encoding: 'utf8' })
+    if (rebuilt) await launch()
+    if (shot.status !== 0) throw new Error(`snapshot failed: ${(shot.stderr || '').trim()}`)
+    return `snapshot written | ${output}`
+  }
+  stop()
+  await launch()
   return `menubar installed | starts at login | ${app}`
 }
 
 function parse(argv) {
-  const args = { from: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false }
+  const args = { from: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null }
   const value = (i) => { if (argv[i] === undefined || argv[i].startsWith('-')) throw new Error(`${argv[i - 1]} needs a value`); return argv[i] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -2711,6 +2706,7 @@ function parse(argv) {
     else if (a === '--cloud') args.cloud = true
     else if (a === '--json') args.json = true
     else if (a === '--remove') args.remove = true
+    else if (a === '--snapshot') args.snapshot = value(++i)
     else if (a === '--version' || a === '-v') args.version = true
     else if (a === '--help' || a === '-h') args.help = true
     else if (!a.startsWith('-') && !args.cmd) args.cmd = a
@@ -2718,12 +2714,12 @@ function parse(argv) {
   }
   if ((args.from.length > 0) !== Boolean(args.to)) throw new Error('--from and --to go together')
   if ((args.help || args.version) && argv.length > 1) throw new Error(`${args.help ? '--help' : '--version'} goes alone`)
-  if (args.cmd === 'accounts' && (args.from.length || args.to || args.dry || args.cloud || args.remove)) throw new Error('accounts accepts only --json')
-  if (args.cmd === 'finish' && (args.from.length || args.to || args.dry || args.cloud || args.remove)) throw new Error('finish accepts only --json')
-  if (args.cmd === 'keep-local' && (args.from.length || args.to || args.dry || args.cloud || args.remove)) throw new Error('keep-local accepts only --json')
-  if (args.cmd === 'undo' && (args.from.length || args.to || args.dry || args.cloud || args.remove)) throw new Error('undo accepts only --json')
-  if (args.cmd === 'menubar' && (args.from.length || args.to || args.dry || args.cloud || args.json)) throw new Error('menubar accepts only --remove')
-  if (args.cmd !== 'menubar' && args.remove) throw new Error('--remove requires menubar')
+  if (args.cmd === 'accounts' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('accounts accepts only --json')
+  if (args.cmd === 'finish' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('finish accepts only --json')
+  if (args.cmd === 'keep-local' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('keep-local accepts only --json')
+  if (args.cmd === 'undo' && (args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot)) throw new Error('undo accepts only --json')
+  if (args.cmd === 'menubar' && (args.from.length || args.to || args.dry || args.cloud || args.json || args.remove && args.snapshot)) throw new Error('menubar accepts only --remove or --snapshot <png>')
+  if (args.cmd !== 'menubar' && (args.remove || args.snapshot)) throw new Error('--remove and --snapshot require menubar')
   return args
 }
 
@@ -2735,7 +2731,7 @@ async function main(argv) {
   const paths = layout()
   const out = process.stdout
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
-  if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove))}\n`)
+  if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
   if (args.cmd === 'keep-local') {
     const result = await keepLocal(paths)
     if (result.recoveryRequired || result.refused || result.ok === false) process.exitCode = 1
@@ -2822,15 +2818,12 @@ async function main(argv) {
       return out.write(`  refused | source recovery is incomplete | nothing changed\n${result.restoreProblems.map((t) => `    ${t}`).join('\n')}\n`)
     }
     const rescued = receipt.sessions.filter((row) => row.strategy === 'remote')
-    const legacy = receipt.sessions.filter((row) => !['rehome', 'remote'].includes(row.strategy))
-    const rehomed = receipt.sessions.length - legacy.length - rescued.length
-    const files = legacy.reduce((n, row) => n + row.sidecars.count, 0)
+    const rehomed = receipt.sessions.length - rescued.length
     const back = retiredCount(receipt)
     const cloudBack = receipt.remote?.length ?? 0
     return out.write([
       rehomed ? `  ${count(rehomed)} desktop records → quarantine` : null,
       rescued.length ? `  ${count(rescued.length)} rescued remote transcripts | ${count(rescued.length)} desktop records → quarantine` : null,
-      legacy.length ? `  ${count(legacy.length)} legacy transcripts | ${count(files)} sidecar files | ${count(legacy.length)} desktop records → quarantine` : null,
       back ? `  ${count(back)} source records put back` : null,
       cloudBack ? `  ${count(cloudBack)} cloud mirrors restored` : null,
       '  shared transcripts unchanged ✓',
@@ -2926,7 +2919,7 @@ async function main(argv) {
     if (p) {
       let text = `${p.receipt?.sessions?.length ?? 0} sessions | interrupted finalization, reconciled on the next move`
       if (p.corrupt) text = `${p.name} | corrupt receipt, set aside on the next move`
-      else if (p.receipt.pending) text = `${p.receipt.pending.title} | interrupted ${p.receipt.pending.strategy === 'rehome' ? 'record placement' : p.receipt.pending.strategy === 'remote' ? 'remote rescue' : 'legacy copy'}, reconciled on the next move`
+      else if (p.receipt.pending) text = `${p.receipt.pending.title} | interrupted ${p.receipt.pending.strategy === 'rehome' ? 'record placement' : 'remote rescue'}, reconciled on the next move`
       else if (p.receipt.retiring) text = `${p.receipt.retiring.length} entries | interrupted retirement, reconciled on the next move`
       else if (p.receipt.undoing) text = `${p.receipt.undoing.length} sessions | interrupted undo, reconciled on the next move`
       report('pending', text)

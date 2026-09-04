@@ -2,7 +2,7 @@
 
 <h3 align="center">Move Claude Code history between accounts. Menubar or CLI.</h3>
 
-<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant: choose a destination, move local history, finish pending cloud checks" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant menubar with source accounts converging on one destination" width="760"></p>
 
 ## What it does
 
@@ -17,9 +17,9 @@ npx claude-transplant menubar
 npx claude-transplant
 ```
 
-To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v2.2.1` or a commit hash to pin.
+To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v3.0.0` or a commit hash to pin.
 
-The menubar app shows FROM and TO as two stacked account sections, starts at login, shows progress in the icon, and posts a notification when done. Both sections are always visible. Click a TO account first and every other account becomes a source, then click Move. Manual FROM choices stay intact when the destination changes, except the destination itself is removed from FROM. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one of them is active. Keep local abandons pending or failed cloud work without reversing successful local movement. The app bundles its own copy of the CLI, so run the menubar command again after upgrading. `menubar --remove` uninstalls. The animation above is rendered by the app itself with `--demo <dir>`.
+The menubar shows two columns of email over plan, with FROM on the left and TO on the right. TO starts on the most recently used account other than the signed-in one, while every other account starts selected as a source. Uncheck only the accounts to leave behind. Curves converge on TO, chevrons show direction, destination changes swap lane identity, and source changes fade only that lane. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one is active. It starts at login, shows progress in the icon, and posts a notification when done. Run the menubar command again after upgrading, use `menubar --snapshot panel.png` to render the live panel, or use `menubar --remove` to uninstall.
 
 ```
 From  ↑↓ move · space select · enter next
@@ -54,7 +54,7 @@ To    ↑↓ move · enter confirm
 | `claude-transplant finish` | check the active pending source, retry its failures, or continue a staged cloud Undo |
 | `claude-transplant keep-local` | cancel pending or failed cloud sources without reversing completed local movement |
 | `claude-transplant accounts` | list accounts |
-| `claude-transplant menubar` | install the menubar app, `--remove` uninstalls |
+| `claude-transplant menubar` | install the menubar app, `--snapshot <png>` renders live accounts, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
 | `--cloud` | reconcile the active source and queue only inaccessible sources that still have unreadable or unarchived local records |
 | `--json` | one event per line |
@@ -124,7 +124,6 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 - Embedded base64, text, and HTTP or HTTPS images and documents can be rescued. Account-owned file ids and unknown source shapes are refused.
 - Sign Claude Desktop into a named pending source to finish its Remote Control check or cloud Undo. Local movement never waits for that login.
 - Remote Control uses private Claude endpoints and fails closed if their response shape, organization, history, status, or authentication changes.
-- Receipts from before 1.2.0 use byte-exact undo checks.
 - File layouts and Remote Control endpoints are undocumented. Verified with Claude Desktop 1.46388.1, bundled Claude Code 2.1.260, and transcript 2.1.258.
 - Moving history out of a Team organization is your organization's decision.
 - Unofficial. Not affiliated with Anthropic.

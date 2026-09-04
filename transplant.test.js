@@ -138,7 +138,8 @@ test('cli exits nonzero on partial failure and undoes over json', async () => {
   await h.record('P', id(600))
   const run = (args) => cli(h.root, args)
   const orphan = path.join(h.project, `${id(900)}.jsonl`)
-  await writeFile(orphan, JSON.stringify({ ...entry('user', 900, null, id(900)), forkedFrom: { sessionId: id(1), messageUuid: id(901) } }) + '\n')
+  const orphanEntry = { ...entry('user', 900, null, id(900)), forkedFrom: { sessionId: id(1), messageUuid: id(901) } }
+  await writeFile(orphan, JSON.stringify(orphanEntry) + '\n')
   await mkdir(h.paths.state, { recursive: true })
   const interrupted = {
     at: '2026-01-01T00-00-00-000',
@@ -146,7 +147,7 @@ test('cli exits nonzero on partial failure and undoes over json', async () => {
     to: 'x',
     sessions: [],
     failed: [],
-    pending: { id: id(900), title: 'Orphan', made: [orphan], events: 1 }
+    pending: { strategy: 'remote', id: id(900), title: 'Orphan', targetId: id(900), made: [orphan], targetSemantic: semantic([orphanEntry], id(900)), targetSemanticVersion: 3 }
   }
   await writeFile(path.join(h.paths.state, `${interrupted.at}.json`), JSON.stringify(interrupted))
   const dry = await run(['--from', 'p@example.com', '--to', 'z@example.com', '--dry-run', '--json'])
@@ -769,59 +770,6 @@ test('real-shape sync replays collapse without conflicts', async () => {
   assert.equal(shaped.conflicts, 0)
 })
 
-test('legacy reconstruction receipts remain undoable', async () => {
-  const h = await home()
-  const sourceId = id(906)
-  const targetId = id(907)
-  await h.write(targetId, [entry('user', 907, null, targetId)])
-  await h.record('P', sourceId)
-  await h.record('Z', targetId)
-  const sourceRecord = path.join(h.dir('P'), `local_${sourceId}.json`)
-  const targetRecord = path.join(h.dir('Z'), `local_${targetId}.json`)
-  const targetTranscript = path.join(h.project, `${targetId}.jsonl`)
-  const at = '2099-01-02T00-00-00-000'
-  const parkedSource = path.join(h.paths.state, 'quarantine', at, 'sources', path.relative(h.paths.records, sourceRecord))
-  const digest = async (file) => createHash('sha256').update(await readFile(file)).digest('hex')
-  const sourceSha = await digest(sourceRecord)
-  await mkdir(path.dirname(parkedSource), { recursive: true })
-  await rename(sourceRecord, parkedSource)
-  const receipt = {
-    at,
-    from: ['source'],
-    to: 'target',
-    failed: [],
-    finalizing: false,
-    sessions: [{
-      id: sourceId,
-      targetId,
-      title: 'Legacy copy',
-      targetTranscript,
-      targetSha: await digest(targetTranscript),
-      targetDir: null,
-      record: targetRecord,
-      recordSha: await digest(targetRecord),
-      sidecars: { count: 0, sha: createHash('sha256').update('[]').digest('hex') },
-      taskOwned: false
-    }],
-    superseded: [{
-      id: sourceId,
-      title: 'Legacy source',
-      by: targetId,
-      source: true,
-      required: [sourceRecord],
-      hashes: [[sourceRecord, sourceSha]],
-      moved: [[sourceRecord, parkedSource]]
-    }]
-  }
-  await mkdir(h.paths.state, { recursive: true })
-  await writeFile(path.join(h.paths.state, `${at}.json`), JSON.stringify(receipt))
-  const result = await undo(h.paths)
-  assert.ok(result.dest)
-  assert.ok(await readFile(sourceRecord))
-  assert.equal(await readFile(targetTranscript).catch(() => null), null)
-  assert.equal(await readFile(targetRecord).catch(() => null), null)
-})
-
 test('interrupted undo resumes from its journal', async () => {
   const h = await home()
   await h.write(id(918), [entry('user', 918, null, id(918))])
@@ -880,7 +828,7 @@ test('a changed interrupted copy stays tracked and blocks undo', async () => {
     to: 'x',
     sessions: [],
     failed: [],
-    pending: { id: id(898), title: 'Changed', targetId, made: [target] }
+    pending: { strategy: 'remote', id: id(898), title: 'Changed', targetId, made: [target], targetSemantic: semantic([entry('user', 898, null, targetId)], targetId), targetSemanticVersion: 3 }
   }
   const file = path.join(h.paths.state, `${receipt.at}.json`)
   await writeFile(file, JSON.stringify(receipt))

@@ -5,14 +5,18 @@ import UserNotifications
 struct Account: Decodable, Identifiable {
     let account: String
     let org: String
+    let email: String?
+    let orgName: String?
     let label: String
-    let stats: String
     let active: Bool?
+    let sessions: Int
+    let activeAt: Double?
     let pending: String?
     let pendingFailures: [Failure]?
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
-    var detail: String { stats.replacingOccurrences(of: " | active", with: "").replacingOccurrences(of: " | ", with: "  ·  ") }
+    var name: String { email ?? String(account.prefix(8)) }
+    var plan: String { orgName ?? String(org.prefix(8)) }
 }
 
 struct Config: Decodable {
@@ -55,7 +59,6 @@ struct Event: Decodable {
     let keptLocal: Int?
     let pendingCloud: Int?
     let pendingUndo: [String]?
-    let pendingLabels: [String]?
     let retired: Int?
     let failed: [Failure]?
     let problems: [Problem]?
@@ -80,6 +83,8 @@ final class Model: ObservableObject {
     @Published var accounts: [Account] = []
     @Published var from: Set<String> = []
     @Published var to: String?
+    @Published var excluded: Set<String> = []
+    @Published var lanes: [String: String] = [:]
     @Published var lines: [(String, String)] = []
     @Published var note = ""
     @Published var badge = ""
@@ -88,22 +93,35 @@ final class Model: ObservableObject {
     @Published var restartAvailable = false
     @Published var progressCompleted: Int?
     @Published var progressTotal: Int?
+    let snapshot: Bool
     let demo: Bool
     private let config: Config?
     private var refreshing = false
     private var pendingResult = false
 
-    init(demo: Bool = false) {
-        self.demo = demo
-        if demo {
-            config = nil
-            accounts = Demo.accounts
-            return
-        }
+    init(snapshot: Bool = false) {
+        self.snapshot = snapshot
+        demo = false
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
         config = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
+        if snapshot {
+            if let config {
+                let text = Model.capture(node(config.node), [config.script, "accounts", "--json"])
+                accounts = (try? JSONDecoder().decode([Account].self, from: Data(text.utf8))) ?? []
+            }
+            settle()
+            return
+        }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         refresh()
+    }
+
+    init(demo accounts: [Account]) {
+        snapshot = true
+        demo = true
+        config = nil
+        self.accounts = accounts
+        settle()
     }
 
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
@@ -127,17 +145,38 @@ final class Model: ObservableObject {
         return Double(completed) / Double(total)
     }
 
+    func canSource(_ account: Account) -> Bool { account.id != to }
+
     func toggle(_ id: String) {
-        if from.isEmpty { clearResult() }
-        if from.contains(id) { from.remove(id) } else { from.insert(id) }
-        if to == id { to = nil }
+        guard let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
+        clearResult()
+        if from.contains(id) { excluded.insert(id) } else { excluded.remove(id) }
+        settle()
     }
 
     func selectTarget(_ id: String) {
         clearResult()
-        if from.isEmpty { from = Set(accounts.map(\.id).filter { $0 != id }) }
-        else { from.remove(id) }
+        if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
+            lanes[vacated] = id
+            lanes[taken] = old
+        }
         to = id
+        settle()
+    }
+
+    private func settle() {
+        if to == nil || !accounts.contains(where: { $0.id == to }) {
+            let recent = accounts.sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
+            let current = accounts.first { $0.active == true } ?? recent.first
+            to = recent.first { $0.id != current?.id }?.id
+        }
+        let ids = accounts.map(\.id)
+        var next = lanes.filter { ids.contains($0.key) && ids.contains($0.value) }
+        var free = ids.filter { id in !next.values.contains(id) }.makeIterator()
+        for id in ids where next[id] == nil { if let source = free.next() { next[id] = source } }
+        lanes = next
+        excluded = excluded.filter { ids.contains($0) }
+        from = Set(accounts.filter(canSource).map(\.id)).subtracting(excluded)
     }
 
     func panelVisibility(_ visible: Bool) {
@@ -160,8 +199,7 @@ final class Model: ObservableObject {
             refreshing = false
             guard let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
-            from = from.filter { id in list.contains { $0.id == id } }
-            if let current = to, !list.contains(where: { $0.id == current }) { to = nil }
+            settle()
         }
     }
 
@@ -305,12 +343,25 @@ final class Model: ObservableObject {
         return process.terminationStatus
     }
 
+    nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private func finish(_ status: Int32, _ error: String) {
         running = false
         badge = ""
         progressCompleted = nil
         progressTotal = nil
-        from = []
+        excluded = []
         to = nil
         symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
         if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
@@ -340,7 +391,7 @@ final class Model: ObservableObject {
     }
 
     private func run(_ args: [String], line: @escaping (String) -> Void, done: @escaping (Int32, String) -> Void) {
-        guard let config else { done(1, "Menubar configuration is missing"); return }
+        guard let config else { done(1, "Menubar configuration is missing, run npx claude-transplant menubar"); return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node(config.node))
         process.arguments = [config.script] + args
@@ -379,46 +430,124 @@ final class Model: ObservableObject {
     }
 }
 
-struct AccountRow: View {
+struct RowKey: PreferenceKey {
+    static let defaultValue: [String: Anchor<CGRect>] = [:]
+    static func reduce(value: inout [String: Anchor<CGRect>], nextValue: () -> [String: Anchor<CGRect>]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+struct Row: View {
     let account: Account
-    let selected: Bool
     let radio: Bool
+    let selected: Bool
+    let muted: Bool
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 8) {
+            HStack(spacing: 9) {
                 Image(systemName: selected ? (radio ? "largecircle.fill.circle" : "checkmark.circle.fill") : "circle")
+                    .font(.system(size: 15))
                     .foregroundStyle(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-                Text(account.label).lineLimit(1).truncationMode(.tail).layoutPriority(1)
-                if account.active == true {
-                    Text("active")
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.green.opacity(0.18), in: Capsule())
-                        .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(account.name).font(.system(size: 13, weight: selected ? .semibold : .medium)).lineLimit(1).truncationMode(.middle)
+                    HStack(spacing: 6) {
+                        Text(account.plan).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                        if account.active == true { Tag(text: "active", color: .green) }
+                        if account.pending != nil { Tag(text: account.pendingFailures?.isEmpty == false ? "retry" : "pending", color: .orange) }
+                    }
                 }
-                if account.pending != nil {
-                    Text(account.pendingFailures?.isEmpty == false ? "retry" : "pending")
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.orange.opacity(0.18), in: Capsule())
-                        .foregroundStyle(.orange)
-                }
-                Spacer(minLength: 12)
-                Text(account.detail)
-                    .font(.system(.caption, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: 190, alignment: .trailing)
+                Spacer(minLength: 0)
             }
+            .frame(height: 34)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .opacity(muted ? 0.35 : 1)
+        .anchorPreference(key: RowKey.self, value: .bounds) { [(radio ? "to/" : "from/") + account.id: $0] }
+    }
+}
+
+struct Tag: View {
+    let text: String
+    let color: Color
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1.5)
+            .background(color.opacity(0.18), in: Capsule())
+            .foregroundStyle(color)
+    }
+}
+
+struct Arrow: Shape {
+    var start: CGPoint
+    var end: CGPoint
+
+    var animatableData: AnimatablePair<CGPoint.AnimatableData, CGPoint.AnimatableData> {
+        get { AnimatablePair(start.animatableData, end.animatableData) }
+        set { start.animatableData = newValue.first; end.animatableData = newValue.second }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let span = end.x - start.x
+        let c1 = CGPoint(x: start.x + span * 0.55, y: start.y)
+        let c2 = CGPoint(x: end.x - span * 0.45, y: end.y)
+        path.move(to: start)
+        path.addCurve(to: end, control1: c1, control2: c2)
+        let mark = Arrow.point(start, c1, c2, end, 0.15)
+        let tangent = Arrow.tangent(start, c1, c2, end, 0.15)
+        let length = max(0.001, hypot(tangent.x, tangent.y))
+        let u = CGPoint(x: tangent.x / length, y: tangent.y / length)
+        let n = CGPoint(x: -u.y, y: u.x)
+        let size = 4.6
+        let tip = CGPoint(x: mark.x + u.x * size * 0.7, y: mark.y + u.y * size * 0.7)
+        let back = CGPoint(x: mark.x - u.x * size * 0.7, y: mark.y - u.y * size * 0.7)
+        path.move(to: CGPoint(x: back.x + n.x * size, y: back.y + n.y * size))
+        path.addLine(to: tip)
+        path.addLine(to: CGPoint(x: back.x - n.x * size, y: back.y - n.y * size))
+        return path
+    }
+
+    private static func point(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: Double) -> CGPoint {
+        let u = 1 - t
+        let a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t
+        return CGPoint(x: a * p0.x + b * p1.x + c * p2.x + d * p3.x, y: a * p0.y + b * p1.y + c * p2.y + d * p3.y)
+    }
+
+    private static func tangent(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: Double) -> CGPoint {
+        let u = 1 - t
+        let a = 3 * u * u, b = 6 * u * t, c = 3 * t * t
+        return CGPoint(x: a * (p1.x - p0.x) + b * (p2.x - p1.x) + c * (p3.x - p2.x), y: a * (p1.y - p0.y) + b * (p2.y - p1.y) + c * (p3.y - p2.y))
+    }
+}
+
+struct Arrows: View {
+    @EnvironmentObject private var model: Model
+    let anchors: [String: Anchor<CGRect>]
+
+    var body: some View {
+        GeometryReader { proxy in
+            let end = model.to.flatMap { anchors["to/" + $0] }.map { proxy[$0] }.map { CGPoint(x: $0.minX - 10, y: $0.midY) }
+            ForEach(model.accounts) { lane in
+                let source = model.lanes[lane.id] ?? lane.id
+                if let rect = anchors["from/" + source].map({ proxy[$0] }) {
+                    let start = CGPoint(x: rect.maxX + 10, y: rect.midY)
+                    let visible = end != nil && source != model.to && model.from.contains(source)
+                    Arrow(start: start, end: end ?? start)
+                        .stroke(Color.accentColor.opacity(0.9), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+                        .animation(.spring(response: 0.45, dampingFraction: 0.86), value: start)
+                        .animation(.spring(response: 0.45, dampingFraction: 0.86), value: end)
+                        .opacity(visible ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.22), value: visible)
+                }
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -446,10 +575,7 @@ struct ActivityBar: View {
                 let phase = timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.1) / 1.1
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary)
-                    Capsule()
-                        .fill(Color.accentColor)
-                        .frame(width: segment)
-                        .offset(x: -segment + (width + segment) * phase)
+                    Capsule().fill(Color.accentColor).frame(width: segment).offset(x: -segment + (width + segment) * phase)
                 }
             }
         }
@@ -483,13 +609,13 @@ struct Panel: View {
     @EnvironmentObject private var model: Model
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
                 Text("Claude Transplant").font(.system(.title3, design: .rounded, weight: .semibold))
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            accountLists
+            board
             if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
             ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -499,8 +625,7 @@ struct Panel: View {
                 .font(.system(.caption, design: .monospaced))
             }
             if model.running {
-                if let progress = model.progress { Bar(value: progress) }
-                else { ActivityBar() }
+                if let progress = model.progress { Bar(value: progress) } else { ActivityBar() }
             }
             if !model.note.isEmpty || !model.pendingPrompt.isEmpty {
                 Text((model.note.isEmpty ? model.pendingPrompt : model.note).sentence).font(.callout.weight(.medium))
@@ -513,222 +638,125 @@ struct Panel: View {
                     Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
                 } else {
                     Pill(title: "Finish pending", prominent: true, enabled: model.pendingReady) { model.finishPending() }
-                    if model.canKeepLocal {
-                        Pill(title: "Keep local", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() }
-                    }
+                    if model.canKeepLocal { Pill(title: "Keep local", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
                 }
                 Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
         }
-        .padding(18)
-        .frame(width: 600)
-        .onAppear { if !model.demo { model.panelVisibility(true) } }
-        .onDisappear { if !model.demo { model.panelVisibility(false) } }
+        .padding(16)
+        .frame(width: 2 * columnWidth + Panel.gap + 32)
+        .onAppear { if !model.snapshot { model.panelVisibility(true) } }
+        .onDisappear { if !model.snapshot { model.panelVisibility(false) } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
-            if !model.demo, let window = note.object as? NSWindow { model.panelVisibility(window.occlusionState.contains(.visible)) }
+            if !model.snapshot, let window = note.object as? NSWindow { model.panelVisibility(window.occlusionState.contains(.visible)) }
         }
     }
 
-    private var accountLists: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            accountBlock("From") { accountList(radio: false) }
-            accountBlock("To") { accountList(radio: true) }
-        }
-    }
-
-    @ViewBuilder private func accountList(radio: Bool) -> some View {
-        if model.demo || model.accounts.count <= 5 {
-            accountRows(radio: radio)
-        } else {
-            ScrollView { accountRows(radio: radio) }
-                .frame(height: 140)
-        }
-    }
-
-    private func accountRows(radio: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(model.accounts) { account in
-                AccountRow(account: account, selected: radio ? model.to == account.id : model.from.contains(account.id), radio: radio) {
-                    if radio { model.selectTarget(account.id) }
-                    else { model.toggle(account.id) }
+    private var board: some View {
+        let width = columnWidth
+        return HStack(alignment: .top, spacing: 0) {
+            column("From") {
+                ForEach(model.accounts) { account in
+                    Row(account: account, radio: false, selected: model.from.contains(account.id), muted: !model.canSource(account)) { model.toggle(account.id) }
                 }
             }
+            .frame(width: width, alignment: .leading)
+            Spacer(minLength: Panel.gap)
+            column("To") {
+                ForEach(model.accounts) { account in
+                    Row(account: account, radio: true, selected: model.to == account.id, muted: false) { model.selectTarget(account.id) }
+                }
+            }
+            .frame(width: width, alignment: .leading)
+        }
+        .overlayPreferenceValue(RowKey.self) { anchors in
+            Arrows(anchors: anchors)
         }
     }
 
-    private func accountBlock<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title.uppercased()).font(.caption2.weight(.semibold)).tracking(0.8).foregroundStyle(.secondary)
+    private var columnWidth: CGFloat {
+        let name: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]
+        let plan: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11)]
+        let widest = model.accounts.map { account -> CGFloat in
+            let tags = CGFloat((account.active == true ? 48 : 0) + (account.pending != nil ? 54 : 0))
+            return max((account.name as NSString).size(withAttributes: name).width, (account.plan as NSString).size(withAttributes: plan).width + tags)
+        }.max() ?? 0
+        return min(300, max(180, 44 + ceil(widest)))
+    }
+
+    static let gap: CGFloat = 150
+
+    private func column<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title.uppercased()).font(.caption2.weight(.semibold)).tracking(0.8).foregroundStyle(.secondary).padding(.bottom, 4)
             content()
         }
     }
 }
 
-struct MenuBar: View {
-    let open: Bool
-    let symbol: String
-    let badge: String
-
-    var body: some View {
-        HStack(spacing: 0) {
-            Image(systemName: "apple.logo").padding(.leading, 18).padding(.trailing, 18)
-            Text("Finder").fontWeight(.bold).padding(.trailing, 18)
-            ForEach(["File", "Edit", "View", "Go", "Window", "Help"], id: \.self) { Text($0).padding(.trailing, 18) }
-            Spacer()
-            HStack(spacing: 4) {
-                Image(systemName: symbol).font(.system(size: 12, weight: .medium))
-                if !badge.isEmpty { Text(badge).font(.system(size: 12)).monospacedDigit() }
-            }
-            .padding(.horizontal, 7)
-            .frame(height: 20)
-            .background(open ? Color.white.opacity(0.22) : Color.clear, in: RoundedRectangle(cornerRadius: 5))
-            Image(systemName: "wifi").frame(width: 28)
-            Image(systemName: "battery.100").frame(width: 28)
-            Text("Tue 9:41 AM").frame(width: 92, alignment: .trailing).padding(.trailing, 12)
-        }
-        .font(.system(size: 13))
-        .foregroundStyle(.white)
-        .frame(height: 24)
-        .background(Color.black.opacity(0.32))
-    }
-}
-
-struct Cursor: View {
-    static func arrow() -> Path {
-        var path = Path()
-        path.move(to: CGPoint(x: 0, y: 0))
-        path.addLine(to: CGPoint(x: 0, y: 17))
-        path.addLine(to: CGPoint(x: 4.5, y: 13))
-        path.addLine(to: CGPoint(x: 8, y: 20))
-        path.addLine(to: CGPoint(x: 10.5, y: 19))
-        path.addLine(to: CGPoint(x: 7, y: 12))
-        path.addLine(to: CGPoint(x: 12.5, y: 12))
-        path.closeSubpath()
-        return path
+enum Snapshot {
+    @MainActor
+    static func data(_ model: Model) -> Data? {
+        let renderer = ImageRenderer(content: Panel().environmentObject(model).background(Color(white: 0.11)).environment(\.colorScheme, .dark))
+        renderer.scale = 2
+        guard let tiff = renderer.nsImage?.tiffRepresentation else { return nil }
+        return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
     }
 
-    var body: some View {
-        Cursor.arrow().fill(.black)
-            .overlay(Cursor.arrow().stroke(.white, lineWidth: 1.2))
-            .frame(width: 14, height: 21)
-    }
-}
-
-struct Screen: View {
-    @ObservedObject var model: Model
-    let open: Bool
-    let cursor: CGPoint
-
-    var body: some View {
-        ZStack(alignment: .topLeading) {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.13, green: 0.17, blue: 0.38),
-                    Color(red: 0.42, green: 0.16, blue: 0.36),
-                    Color(red: 0.86, green: 0.42, blue: 0.30)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            VStack(alignment: .trailing, spacing: 6) {
-                MenuBar(open: open, symbol: model.symbol, badge: model.badge)
-                if open {
-                    Panel().environmentObject(model)
-                        .background(Color(white: 0.11))
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .shadow(color: .black.opacity(0.5), radius: 26, y: 14)
-                        .padding(.trailing, 8)
-                }
-            }
-            Cursor().offset(x: cursor.x, y: cursor.y)
-        }
-        .frame(width: 760, height: 700, alignment: .topLeading)
-        .environment(\.colorScheme, .dark)
+    @MainActor
+    static func write(_ model: Model, to file: String) {
+        guard let png = data(model) else { exit(1) }
+        do { try png.write(to: URL(fileURLWithPath: file)) } catch { exit(1) }
+        exit(0)
     }
 }
 
 enum Demo {
     static let accounts = [
-        Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "84 | 2h ago | api", active: false, pending: nil, pendingFailures: nil),
-        Account(account: "john", org: "team", label: "john@example.com · Team", stats: "212 | 3d ago | api", active: false, pending: nil, pendingFailures: nil),
-        Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "35 | 5d ago | notes", active: false, pending: nil, pendingFailures: nil),
-        Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "12 | 4m ago | notes", active: true, pending: nil, pendingFailures: nil)
+        Account(account: "alex-personal", org: "personal", email: "alex@example.com", orgName: "Personal", label: "alex@example.com · Personal", active: true, sessions: 84, activeAt: 400, pending: nil, pendingFailures: nil),
+        Account(account: "alex-team", org: "team", email: "alex@example.com", orgName: "Acme Inc.", label: "alex@example.com · Acme Inc.", active: false, sessions: 212, activeAt: 300, pending: nil, pendingFailures: nil),
+        Account(account: "sam-personal", org: "personal", email: "sam@example.com", orgName: "Personal", label: "sam@example.com · Personal", active: false, sessions: 35, activeAt: 200, pending: nil, pendingFailures: nil),
+        Account(account: "sam-team", org: "team", email: "sam@example.com", orgName: "Northwind", label: "sam@example.com · Northwind", active: false, sessions: 12, activeAt: 100, pending: nil, pendingFailures: nil)
     ]
 
     @MainActor
-    static func play(_ model: Model, into dir: URL) {
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    static func play(_ model: Model, into directory: String) {
+        let root = URL(fileURLWithPath: directory)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var durations: [Int] = []
-        var cursor = CGPoint(x: 430, y: 340)
-        var open = false
-        func snap(_ ms: Int) {
-            let renderer = ImageRenderer(content: Screen(model: model, open: open, cursor: cursor))
-            renderer.scale = 2
-            guard let tiff = renderer.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
-            try? png.write(to: dir.appendingPathComponent(String(format: "frame-%03d.png", durations.count)))
-            durations.append(ms)
+        func snap(_ milliseconds: Int) {
+            guard let png = Snapshot.data(model) else { exit(1) }
+            try? png.write(to: root.appendingPathComponent(String(format: "frame-%03d.png", durations.count)))
+            durations.append(milliseconds)
         }
-        func glide(to target: CGPoint, frames: Int) {
-            let start = cursor
-            for step in 1...frames {
-                let t = Double(step) / Double(frames)
-                let eased = t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
-                cursor = CGPoint(x: start.x + (target.x - start.x) * eased, y: start.y + (target.y - start.y) * eased)
-                snap(step == frames ? 180 : 40)
-            }
-        }
-        snap(700)
-        glide(to: CGPoint(x: 586, y: 12), frames: 9)
-        open = true
-        snap(900)
-        glide(to: CGPoint(x: 177, y: 268), frames: 9)
+        snap(1200)
         model.selectTarget(accounts[2].id)
-        snap(1100)
-        glide(to: CGPoint(x: 205, y: 328), frames: 8)
+        snap(1200)
+        model.toggle(accounts[0].id)
+        snap(900)
+        model.toggle(accounts[0].id)
+        snap(600)
         model.begin()
-        model.lines = [("inventory", "308 records | 3 already there | 5 cloud mirrors | 1 cloud rescue | 305 to move")]
-        snap(250)
-        glide(to: CGPoint(x: 190, y: 371), frames: 6)
-        for done in stride(from: 0, through: 305, by: 23) {
-            model.progressCompleted = done
+        model.lines = [("inventory", "308 records | 3 already there | 305 to move")]
+        snap(300)
+        for completed in [75, 170, 250, 305] {
+            model.progressCompleted = completed
             model.progressTotal = 305
-            model.badge = "move \(done)/305"
-            snap(100)
+            snap(180)
         }
-        model.progressCompleted = 305
-        model.progressTotal = 305
-        model.badge = "move 305/305"
-        snap(150)
+        model.running = false
         model.badge = ""
         model.progressCompleted = nil
         model.progressTotal = nil
-        model.lines.append(("move", "306 ✓ | 141,347 events | 305 zero-copy | 1 rescued"))
-        snap(350)
-        model.lines.append(("sidecars", "1,842 files | unchanged ✓"))
-        snap(350)
-        model.lines.append(("desktop", "306 records | 240 archived | 66 active"))
-        snap(350)
-        model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓ | 2s"))
-        snap(350)
-        model.lines.append(("retired", "308 source records → quarantine | transcripts untouched"))
-        model.lines.append(("cloud", "5 source mirrors archived"))
-        snap(500)
-        model.running = false
-        model.from = []
-        model.to = nil
-        model.accounts = [
-            Account(account: "john", org: "personal", label: "john@example.com · Personal", stats: "0 | -", active: false, pending: nil, pendingFailures: nil),
-            Account(account: "john", org: "team", label: "john@example.com · Team", stats: "0 | -", active: false, pending: nil, pendingFailures: nil),
-            Account(account: "john2", org: "personal", label: "john2@example.com · Personal", stats: "341 | now | notes", active: false, pending: nil, pendingFailures: nil),
-            Account(account: "john2", org: "team", label: "john2@example.com · Team", stats: "0 | -", active: true, pending: nil, pendingFailures: nil)
-        ]
+        model.lines.append(("move", "305 ✓ | zero-copy"))
+        model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
         model.symbol = "checkmark"
-        model.note = "305 sessions moved, 1 remote branch rescued, 5 cloud mirrors archived"
+        model.note = "305 sessions moved"
         model.restartAvailable = true
-        snap(2800)
-        try? JSONSerialization.data(withJSONObject: durations).write(to: dir.appendingPathComponent("durations.json"))
+        snap(2400)
+        try? JSONSerialization.data(withJSONObject: durations).write(to: root.appendingPathComponent("durations.json"))
         exit(0)
     }
 }
@@ -740,10 +768,15 @@ struct TransplantApp: App {
     init() {
         let args = CommandLine.arguments
         if let index = args.firstIndex(of: "--demo"), index + 1 < args.count {
-            let demo = Model(demo: true)
-            _model = StateObject(wrappedValue: demo)
-            let dir = URL(fileURLWithPath: args[index + 1])
-            DispatchQueue.main.async { Demo.play(demo, into: dir) }
+            let model = Model(demo: Demo.accounts)
+            _model = StateObject(wrappedValue: model)
+            let directory = args[index + 1]
+            DispatchQueue.main.async { Demo.play(model, into: directory) }
+        } else if let index = args.firstIndex(of: "--snapshot"), index + 1 < args.count {
+            let model = Model(snapshot: true)
+            _model = StateObject(wrappedValue: model)
+            let file = args[index + 1]
+            DispatchQueue.main.async { Snapshot.write(model, to: file) }
         } else {
             _model = StateObject(wrappedValue: Model())
         }
