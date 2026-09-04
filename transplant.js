@@ -105,7 +105,8 @@ export function layout(home = os.homedir()) {
     pool: path.join(home, '.claude/projects'),
     login: path.join(home, '.claude.json'),
     backups: path.join(home, '.claude/backups'),
-    state: path.join(support, 'claude-transplant')
+    state: process.env.CLAUDE_TRANSPLANT_STATE ?? path.join(support, 'claude-transplant'),
+    lock: path.join(support, 'claude-transplant', 'lock')
   }
 }
 
@@ -235,7 +236,8 @@ async function quarantine(items, dest) {
 
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
-  const lockFile = path.join(paths.state, 'lock')
+  await mkdir(path.dirname(paths.lock), { recursive: true })
+  const lockFile = paths.lock
   const guard = spawn('/usr/bin/lockf', ['-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
   await new Promise((resolve, reject) => {
     let ready = false
