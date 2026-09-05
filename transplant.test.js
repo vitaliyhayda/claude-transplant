@@ -560,13 +560,22 @@ test('placed verification ignores activity and bridge registration but records t
   record.lastFocusedAt = Date.now()
   record.completedTurns = 100
   record.bridgeSessionIds = ['session_new']
+  record.writtenBranches = ['main', 'feature/anything']
+  record.prs = [{ prNumber: 1, url: 'https://github.com/example/repo/pull/1' }]
+  record.branch = 'feature/anything'
+  record.prState = 'merged'
+  record.model = 'claude-opus-5'
+  record.contextExceededCount = 3
+  record.alwaysAllowedReasons = ['Bash']
+  record.someFutureDesktopField = { anything: true }
   await writeFile(file, JSON.stringify(record))
   assert.deepEqual((await verifyPlaced(h.paths)).changed, [])
   record.title = 'Different title after placement'
+  record.isArchived = true
   await writeFile(file, JSON.stringify(record))
   const changed = await verifyPlaced(h.paths)
   assert.equal(changed.changed.length, 1)
-  assert.ok(changed.changed[0].fields.includes('title'))
+  assert.deepEqual(changed.changed[0].fields.sort(), ['isArchived', 'title'])
   assert.ok(await readFile(changed.changed[0].placed))
   assert.ok(await readFile(changed.changed[0].found))
   assert.equal(JSON.parse(await readFile(file)).title, record.title)
@@ -3688,4 +3697,79 @@ test('process registry identifies a new worker without argv ids and rejects stal
   assert.deepEqual(stale.find(row => row.pid === 502).ids, [])
   const foreign = parseProcesses(processes, commands, '/Applications/Claude.app', [{ ...registration, pidDomain: 'linux' }])
   assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
+})
+
+test('Swift queues the clicked command once and distinguishes metadata notices from unreadable records', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
+  let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct TransplantApp: App {')[0]
+  const start = source.indexOf('    private func run(_ args: [String]')
+  const end = source.indexOf('\nstruct RowKey: PreferenceKey', start)
+  assert.ok(start > 0 && end > start)
+  source = source.slice(0, start) + `    private func run(_ args: [String], line: @escaping (String) -> Void, done: @escaping (Int32, String) -> Void) {
+        requests.append((args, line, done))
+    }
+}
+` + source.slice(end)
+  source = source.replace('guard !running, !sweeping, !snapshot else { return }', 'guard !running, !sweeping else { return }')
+  source += String.raw`
+@MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
+extension Model {
+    func checkSweep() { sweep() }
+}
+@main
+struct StateChecks {
+    @MainActor
+    static func main() {
+        let model = Model(demo: Demo.accounts)
+        model.selectTarget(Demo.accounts[2].id)
+        let selected = model.to
+        model.checkSweep()
+        precondition(model.ready && !model.running)
+        model.move()
+        precondition(model.running && !model.ready && model.displaySummary == "Waiting for background check")
+        model.selectTarget(Demo.accounts[3].id)
+        precondition(model.to == selected)
+        model.to = Demo.accounts[3].id
+        model.undo()
+        precondition(requests.count == 1)
+        requests[0].1("{\"swept\":true,\"ok\":true}")
+        requests[0].2(0, "")
+        precondition(requests.count == 2)
+        let command = requests[1].0
+        precondition(command[command.firstIndex(of: "--to")! + 1] == Demo.accounts[2].selector)
+        precondition(!command.contains("undo"))
+        precondition(!model.sweeping && model.running)
+        for field in ["record unavailable", "isStarred", "title", "isArchived"] {
+            requests = []
+            let item = Model(demo: Demo.accounts)
+            item.checkSweep()
+            requests[0].1("{\"swept\":true,\"ok\":true,\"changed\":[{\"id\":\"fixture\",\"title\":\"Fixture\",\"fields\":[\"" + field + "\"]}]}")
+            requests[0].2(0, "")
+            let unavailable = field == "record unavailable"
+            precondition(item.symbol == (unavailable ? "exclamationmark.triangle" : "info.circle"))
+            precondition(item.note.contains(unavailable ? "cannot be read" : ["isStarred": "starred state", "isArchived": "archive state", "title": "title"][field]!))
+            precondition(item.detailLines.contains { $0.1.contains("Fixture") })
+        }
+        print("Swift queue and metadata states passed")
+    }
+}
+`
+  const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [], { timeout: 15_000 })
+  assert.match(stdout, /Swift queue and metadata states passed/)
+})
+
+test('missing and unreadable moved records remain distinct from informational field changes', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  const file = moved.receipt.sessions[0].record
+  await unlink(file)
+  assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['record unavailable'])
+  await writeFile(file, '{')
+  assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['record unavailable'])
 })

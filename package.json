@@ -1,6 +1,6 @@
 {
   "name": "claude-transplant",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Move Claude Code history between accounts. Either via menubar or CLI. macOS only.",
   "type": "module",
   "bin": {
