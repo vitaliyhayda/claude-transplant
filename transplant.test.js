@@ -562,13 +562,20 @@ test('placed verification ignores activity and bridge registration but records t
   record.bridgeSessionIds = ['session_new']
   record.writtenBranches = ['main', 'feature/anything']
   record.prs = [{ prNumber: 1, url: 'https://github.com/example/repo/pull/1' }]
+  record.branch = 'feature/anything'
+  record.prState = 'merged'
+  record.model = 'claude-opus-5'
+  record.contextExceededCount = 3
+  record.alwaysAllowedReasons = ['Bash']
+  record.someFutureDesktopField = { anything: true }
   await writeFile(file, JSON.stringify(record))
   assert.deepEqual((await verifyPlaced(h.paths)).changed, [])
   record.title = 'Different title after placement'
+  record.isArchived = true
   await writeFile(file, JSON.stringify(record))
   const changed = await verifyPlaced(h.paths)
   assert.equal(changed.changed.length, 1)
-  assert.ok(changed.changed[0].fields.includes('title'))
+  assert.deepEqual(changed.changed[0].fields.sort(), ['isArchived', 'title'])
   assert.ok(await readFile(changed.changed[0].placed))
   assert.ok(await readFile(changed.changed[0].found))
   assert.equal(JSON.parse(await readFile(file)).title, record.title)

@@ -3089,7 +3089,8 @@ export async function finishWorkflow(paths, options = {}) {
   return result
 }
 
-const observedRecord = (record) => without(record, [...RECORD_RUNTIME_KEYS, 'bridgeSessionIds', 'remoteControlAutoEligible'])
+const DURABLE_RECORD_KEYS = ['title', 'isArchived', 'isStarred']
+const observedRecord = (record) => Object.fromEntries(DURABLE_RECORD_KEYS.map((key) => [key, record?.[key]]))
 
 async function inspectPlaced(paths) {
   const latest = await latestReceipt(paths)

@@ -482,8 +482,8 @@ final class Model: ObservableObject {
                 note = "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"
             } else if let changed = result?.changed, !changed.isEmpty {
-                note = "\(changed.count) moved session(s) have changed metadata. Evidence is saved with the receipt."
-                symbol = "exclamationmark.triangle"
+                note = quantity(changed.count, "moved session changed", "moved sessions changed") + " title or archive state after the move. Snapshots are in the receipt."
+                symbol = "info.circle"
             }
             if result?.ok != false, result?.restart == true {
                 restartAvailable = true
