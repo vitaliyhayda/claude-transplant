@@ -78,6 +78,7 @@ test('Desktop idle evidence requires a fresh global idle release and completed w
     { workers: [{ ...worker, known: false }] },
     { workers: [{ ...worker, ended: null }] },
     { workers: [{ ...worker, modified: started + 129999 }] },
+    { workers: [{ ...worker, activeAt: started + 125000 }] },
     { workers: [worker, { ...worker, ended: null }] },
     { log: log.replace('idle,', 'battery,') },
     { log: log + '2026-09-04 10:02:01 [info] [keep-awake] code session hold taken (turn, battery=false)\n' },
@@ -91,6 +92,7 @@ test('only selected blocking workers trigger an idle restart, held closed throug
   const io = {
     inspect: async () => ({ ...state }),
     wait: async () => {},
+    running: async () => true,
     quit: async () => { calls.push('quit'); return true },
     open: async () => { calls.push('open'); return true }
   }
@@ -114,7 +116,12 @@ test('only selected blocking workers trigger an idle restart, held closed throug
   await assert.rejects(withIdleDesktop([SOURCE], {}, () => {}, async () => { throw new Error('move failed') }, io), /move failed/)
   assert.deepEqual(calls.splice(0), ['quit', 'open'])
   io.quit = async () => { calls.push('quit'); return false }
-  assert.equal((await run()).waiting, true)
+  const vetoed = await run()
+  assert.equal(vetoed.waiting, true)
+  assert.equal(vetoed.reopenFailed, undefined)
+  assert.deepEqual(calls.splice(0), ['quit', 'move'])
+  io.running = async () => false
+  assert.equal((await run()).restarted, true, 'a delayed completed quit is reopened, not mistaken for a veto')
   assert.deepEqual(calls.splice(0), ['quit', 'move', 'open'])
   io.open = async () => false
   const reports = []
@@ -195,6 +202,37 @@ test('a real worker keeps its record while the CLI moves other records and expla
     assert.match(done.note, /Keep local/)
     assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`])
     assert.deepEqual(await readdir(h.dir('Z')), [`local_${id(700)}.json`])
+  } finally {
+    const exited = once(child, 'exit')
+    child.kill()
+    await exited
+  }
+})
+
+test('a different-id destination worker reports idle waiting for its selected source', async () => {
+  const h = await home()
+  const target = id(700)
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.write(target, fork(entries, SOURCE, target, 'Carrier'))
+  await h.record('Z', target, rehomeRecord())
+  await h.write(id(701), [entry('user', 2, null, id(701))])
+  await h.record('P', id(701), rehomeRecord())
+  const executable = path.join(h.root, 'claude')
+  await symlink(process.execPath, executable)
+  const child = spawn(executable, ['-e', 'setInterval(() => {}, 1000)', target], { stdio: 'ignore' })
+  await once(child, 'spawn')
+  try {
+    const result = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--json'])
+    const done = lines(result.stdout).at(-1)
+    assert.equal(result.code, 1)
+    assert.equal(done.moved, 1)
+    assert.equal(done.waitingForIdle, true)
+    assert.equal(done.restarted, false)
+    assert.match(done.note, /Wait for Claude/)
+    assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`])
+    assert.deepEqual((await readdir(h.dir('Z'))).sort(), [`local_${target}.json`, `local_${id(701)}.json`].sort())
   } finally {
     const exited = once(child, 'exit')
     child.kill()

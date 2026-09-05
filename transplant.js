@@ -189,10 +189,11 @@ export async function withIdleDesktop(selected, paths, report, work, io = {}) {
       }
       state = again
     }
-    if (state.blocked && !stopped) report('waiting', `${WAIT_IDLE} Moving other eligible records now.`)
+    if (state.blocked && !stopped) report('waiting', selected === null ? 'Wait for Claude to be idle before restarting.' : `${WAIT_IDLE} Moving other eligible records now.`)
     result = await work(attempted)
   } finally {
-    if (attempted) {
+    if (attempted && !stopped) stopped = !(await (io.running ?? (async () => Boolean(desktopTree(paths, processTable()).app)))().catch(() => true))
+    if (attempted && stopped) {
       reopened = await (io.open ?? (() => desktopOpen(paths)))().catch(() => false)
       if (!reopened) report('desktop', 'Could not confirm Desktop reopened. If it is still closing, wait and reopen it manually.')
     }
@@ -1318,6 +1319,14 @@ const ownership = (row, liveWorkers, bridges = true) => {
 }
 const rehomeOwnership = (row, liveWorkers) => ownership(row, liveWorkers, false)
 const retirementOwnership = (inv, row, owner, liveWorkers) => owner.history.strategy === 'rehome' || inv.cloudRequested ? rehomeOwnership(row, liveWorkers) : ownership(row, liveWorkers)
+const blockedWorkers = (inv) => [...new Set([
+  ...inv.blocked.filter((row) => row.error === WORKER_OWNS),
+  ...inv.there.flatMap((source) => {
+    const target = inv.targets.find((row) => row.id === source.cloudTargetId)
+    if (!target || retirementOwnership(inv, { ...source, worker: false }, { history: target })) return []
+    return [...(source.members ?? [source]), target].filter((row) => row.worker && !rehomeOwnership({ ...row, worker: false }))
+  })
+].map((row) => row.id.toLowerCase()))]
 const inventoryFailure = (item) => ({
   id: item.id ?? null,
   title: item.members?.length > 1
@@ -3070,16 +3079,13 @@ async function main(argv) {
       return { inv, target }
     }
     let { inv, target } = await plan()
-    const selected = [...new Set([
-      ...inv.blocked.filter((row) => row.error === WORKER_OWNS),
-      ...inv.there.flatMap((row) => row.members ?? [row]).filter((row) => row.worker && !row.taskOwned && !row.record.scheduledTaskId && !row.record.notifySessionId)
-    ].map((row) => row.id.toLowerCase()))]
+    const selected = blockedWorkers(inv)
     const outcome = await withIdleDesktop(selected, paths, report, async (attempted) => {
       if (attempted) ({ inv, target } = await plan())
       summary(inv)
       return inv.move.length || inv.there.length || inv.cloud.matches.length || inventoryFailures(inv).length || inv.cloudRequested ? transfer(inv, target, paths, report) : null
     })
-    return outcome.result && { ...outcome.result, restarted: outcome.restarted, waitingForIdle: outcome.waiting, reopenFailed: outcome.reopenFailed }
+    return outcome.result && { ...outcome.result, restarted: outcome.restarted, waitingForIdle: blockedWorkers(inv).length > 0, reopenFailed: outcome.reopenFailed }
   })
   if (result?.deferred) {
     const labels = result.deferred.sources.map((source) => source.label)
