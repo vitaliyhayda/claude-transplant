@@ -504,8 +504,8 @@ test('a successful held phase cannot hide an earlier placement verification fail
   }
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   const target = path.join(h.dir('T'), `local_${cold}.json`)
-  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage) => {
-    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
   } })
   assert.equal(first.receipt.verification.ok, false)
   assert.deepEqual(first.receipt.failed, [])
@@ -523,8 +523,8 @@ test('Keep local reports earlier verification failure while cancelling held work
   }
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   const target = path.join(h.dir('T'), `local_${cold}.json`)
-  await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage) => {
-    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
   } })
   const kept = await keepLocal(h.paths)
   assert.equal(kept.heldCancelled, 1)
@@ -1186,8 +1186,8 @@ test('an unreadable scheduled task registry fails closed', async () => {
   await writeFile(taskFile, JSON.stringify({ scheduledTasks: [] }))
   by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
   const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
-  await assert.rejects(move(inv, by[h.acct.Z], h.paths, (stage) => {
-    if (stage === 'sidecars') writeFileSync(taskFile, '{broken')
+  await assert.rejects(move(inv, by[h.acct.Z], h.paths, (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(taskFile, '{broken')
   }), /unreadable scheduled task registry/)
   assert.equal((await readdir(h.dir('P'))).filter((file) => file.startsWith('local_')).length, 1)
 })
@@ -1229,8 +1229,8 @@ test('retirement records the exact bytes after harmless source focus drift', asy
   await h.record('P', id(928))
   const sourceRecord = path.join(h.dir('P'), `local_${id(928)}.json`)
   const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
-  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths, (stage) => {
-    if (stage !== 'sidecars') return
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths, (stage, _text, progress) => {
+    if (stage !== 'verify' || progress?.completed !== 0) return
     const focused = JSON.parse(readFileSync(sourceRecord, 'utf8'))
     writeFileSync(sourceRecord, JSON.stringify({ ...focused, lastFocusedAt: focused.lastFocusedAt + 1 }))
   })
@@ -2095,8 +2095,8 @@ test('a successful cloud phase preserves an earlier local verification failure',
   await h.record('T', id(997))
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.T), to = all.find((row) => row.account === h.acct.Z)
   const target = path.join(h.dir('Z'), `local_${SOURCE}.json`)
-  const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths, (stage) => {
-    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths, (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
   })
   assert.equal(first.receipt.verification.ok, false)
   const result = await finishPending(h.paths, { cloud: cloudFixture(h, { account: from.account, org: from.org }) })
@@ -3288,8 +3288,8 @@ test('rehome verification catches transcript and sidecar drift after placement',
   const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
   const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
   const inv = await inventory([from], to, h.paths)
-  const result = await move(inv, to, h.paths, (stage) => {
-    if (stage !== 'sidecars') return
+  const result = await move(inv, to, h.paths, (stage, _text, progress) => {
+    if (stage !== 'verify' || progress?.completed !== 0) return
     appendFileSync(transcript, `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
     appendFileSync(sidecar, '{"after":true}\n')
   })
@@ -3553,6 +3553,114 @@ test('inventory interrupts preparation at record boundaries when its deadline is
   assert.equal((await readdir(h.dir('T'))).length, 0)
 })
 
+test('a thousand source records finish one restart with bounded polling and a linear journal', async () => {
+  const h = await home(), amount = 1000
+  for (let i = 0; i < amount; i++) {
+    const session = id(10000 + i)
+    await h.write(session, [entry('user', 20000 + i, null, session)])
+    await h.record('P', session, rehomeRecord({ sessionSettings: { fixture: 'x'.repeat(4096) } }))
+  }
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(id(10000)), inspections = 0, journalBytes = 0, checkpointBytes = 0
+  const io = { inspect: () => { inspections++; return rows }, command: async file => {
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, _text, progress) => {
+    if (stage !== 'move' || progress?.completed !== amount) return
+    const log = readdirSync(h.paths.state).find(name => name.endsWith('.journal'))
+    journalBytes = readFileSync(path.join(h.paths.state, log)).length
+    checkpointBytes = readFileSync(path.join(h.paths.state, log.slice(0, -8))).length
+  } })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, amount)
+  assert.equal(result.receipt.superseded.length, amount)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.equal((await readdir(h.dir('T'))).length, amount)
+  assert.ok(inspections < 150, `Unexpected process scans: ${inspections}`)
+  assert.ok(checkpointBytes < 5000, `Receipt was rewritten during placement: ${checkpointBytes}`)
+  assert.ok(journalBytes < 12_000 * amount, `Journal grew beyond its per-record bound: ${journalBytes}`)
+  assert.equal((await readdir(h.paths.state)).some(name => name.endsWith('.journal')), false)
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal((await readdir(h.dir('P'))).length, amount)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
+test('interrupted placement replays complete journal entries and ignores only a torn final append', async () => {
+  for (const keep of [3, 4]) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    const original = await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const reported = []
+    await assert.rejects(move(await inventory([from], to, h.paths), to, h.paths, (stage, text, progress) => {
+      reported.push({ stage, text, progress })
+      if (stage === 'move' && progress?.completed === 1) throw new Error('fixture interrupted publication')
+    }), /fixture interrupted publication/)
+    const log = (await readdir(h.paths.state)).find(name => name.endsWith('.journal'))
+    const file = path.join(h.paths.state, log)
+    const patches = (await readFile(file, 'utf8')).trimEnd().split('\n')
+    assert.equal(patches.length, 4)
+    assert.ok(JSON.parse(patches[2]).pending.created)
+    await writeFile(file, patches.slice(0, keep).join('\n') + '\n{"sequence":')
+    assert.equal(reported.some(row => row.stage === 'move' && row.text.includes('✓')), false)
+    assert.equal(JSON.parse(await readFile(file.slice(0, -8))).sessions.length, 0)
+    const recovered = await sweep(h.paths)
+    assert.ok(recovered.recovered)
+    assert.equal((await readdir(h.dir('T'))).length, 0)
+    assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)), original)
+    assert.equal((await readdir(h.paths.state)).some(name => name.endsWith('.journal')), false)
+    assert.equal((await sweep(h.paths)).recovered, undefined)
+  }
+})
+
+test('a restart timeout before finalization never reports placed records as completed moves', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(), time = 0
+  const io = { now: () => time, budget: 1000, reserve: 200, inspect: () => rows, command: async file => {
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io }), reported = []
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, text, progress) => {
+    reported.push({ stage, text, progress })
+    if (stage === 'move' && progress?.completed === 1) time = 801
+  } })
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /mutation deadline/)
+  assert.equal(result.restarted, true)
+  assert.equal(reported.some(row => row.stage === 'move' && row.text.includes('✓')), false)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  await sweep(h.paths, { io })
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
+test('a forced boundary detects reopening before retirement even inside the polling interval', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(), opens = 0
+  const io = { now: () => 0, inspect: () => rows, command: async file => {
+    if (!file.endsWith('osascript')) opens++
+    rows = []
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 1) rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+  } })
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /reopened before/)
+  assert.equal(opens, 0)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
 test('restart warnings group a helper and its child as one session and resolve copied records', async () => {
   const h = await home(), other = id(400)
   await h.record('P', SOURCE, { title: 'First session' })
@@ -3715,11 +3823,44 @@ test('Swift queues the clicked command once and distinguishes metadata notices f
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 extension Model {
     func checkSweep() { sweep() }
+    func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
 }
 @main
 struct StateChecks {
     @MainActor
     static func main() {
+        var progress = MoveProgress(now: 0)
+        var previous = 0
+        for (stage, completed, total, at) in [("scan", 0, 100, 0.0), ("scan", 50, 100, 2.0), ("scan", 100, 100, 4.0), ("cloud scan", 1, 2, 5.0), ("desktop", 0, 1, 6.0), ("scan", 1, 100, 8.0), ("scan", 100, 100, 8.2), ("move", 1, 100, 8.3), ("move", 100, 100, 8.5), ("verify", 100, 100, 8.6), ("retire", 100, 100, 8.7), ("finalize", 0, 1, 8.8), ("reopen", 0, 1, 9.0), ("cloud", 1, 2, 10.0), ("cloud", 2, 2, 11.0)] {
+            progress.update(stage, completed: completed, total: total, now: at)
+            precondition(progress.percent >= previous && progress.percent <= 99)
+            previous = progress.percent
+        }
+        progress.refresh(10000)
+        precondition(progress.percent == 99)
+        var paused = MoveProgress(now: 0)
+        paused.paused = 2
+        paused.resume(102)
+        paused.record(103)
+        precondition(paused.observed["prepare"] == 3)
+        let progressModel = Model(demo: Demo.accounts)
+        progressModel.begin()
+        precondition(progressModel.badge == "0%")
+        progressModel.handle("{\"stage\":\"scan\",\"text\":\"50/100\",\"live\":true,\"completed\":50,\"total\":100}")
+        let percentage = progressModel.badge
+        precondition(percentage.hasSuffix("%") && !percentage.contains("/"))
+        progressModel.handle("{\"stage\":\"inventory\",\"text\":\"100 sessions\"}")
+        precondition(progressModel.badge == percentage)
+        progressModel.begin(resetProgress: false)
+        precondition(progressModel.badge == percentage)
+        progressModel.handle("{\"done\":true,\"ok\":false,\"moved\":0,\"reason\":\"fixture rollback\"}")
+        progressModel.checkFinish(1)
+        precondition(progressModel.badge.isEmpty && !progressModel.running)
+        progressModel.begin()
+        progressModel.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":100}")
+        progressModel.checkFinish(0)
+        precondition(progressModel.badge == "100%" && !progressModel.running)
+        requests = []
         let model = Model(demo: Demo.accounts)
         model.selectTarget(Demo.accounts[2].id)
         let selected = model.to

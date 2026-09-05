@@ -129,8 +129,14 @@ Safety:
 - Interrupted retirement or undo resumes from the receipt. A corrupt newest receipt stops undo.
 - Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. Undo, retirement, and source archival also ignore branch and PR bookkeeping.
 - Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
+- Demo rendering uses a fixed clock and its own warning preference, so local app settings cannot change the animation height or progress.
+- While a command runs, the menu bar shows one estimated completion percentage. Preparation, movement, verification, restart, and remote cleanup share that percentage. Successful runs teach the estimate local phase timings. Waiting for approval does not count, progress never goes backward, and 100% requires a successful command result.
+- Record placement appends small recovery entries to a receipt journal, then folds them into the receipt before verification. Complete entries replay after interruption. An incomplete final append is ignored because its following file mutation could not have started. Creation evidence still precedes publication, and source retirement keeps its separate rollback plan.
+- During a restart, every checkpoint checks the deadline. Process presence is polled at most once per 100ms between mandatory checks at mutation and retirement boundaries. The engine checks again before committing. A detected reopen or timeout prevents finalization. The success summary is emitted only after local finalization.
 - Lineage follows `forkedFrom` pointers to their roots. Duplicate message ids that differ only in runtime metadata count as sync replays, anything else is refused.
 - A disposable planning cache lives at `~/Library/Application Support/claude-transplant/cache.json`. Every write decision uses live files. Delete it any time.
+
+The September 5, 2026 live check on Claude Desktop 1.46388.4 moved all 167 selected sessions, retired all 167 source records, and completed the restart in 3.498 seconds, with Desktop closed for 2.124 seconds. All 1,441 transcript and sidecar files, 1.06GB, kept their bytes and inodes. Title, archive state, and starred state also matched after switching to the destination. The 3,000-source fixture completed placement and retirement in an 11.7-second simulated restart operation. These are measured examples, not a constant-time promise for every archive.
 
 ## Rules
 
@@ -153,6 +159,9 @@ Safety:
 | Merge sidecars across versions | Requires writing a new generation |
 | Move a record while its Desktop worker runs | Desktop rewrites the record from cache, title and turn count roll back |
 | Infer a restart-safe moment from activity logs | Cold records need no restart, held records get an explicit graceful shutdown |
+| Run a process-list subprocess at every record checkpoint | The 167-source benchmark spent 21.8 of 24 seconds in 1,352 process checks |
+| Rewrite the complete growing receipt for each placement step | The same benchmark wrote about 500MB of receipt data. Incremental journaling makes placement write volume linear |
+| Validate bulk restart performance by scanning many records and moving one | Missed the full-batch timeout. Regression coverage now moves and undoes 1,000 source records |
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 
