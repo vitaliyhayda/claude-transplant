@@ -13,6 +13,8 @@ struct Account: Decodable, Identifiable {
     let activeAt: Double?
     let pending: String?
     let pendingFailures: [Failure]?
+    var stats: String? = nil
+    var identityState: String? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
@@ -137,6 +139,7 @@ final class Model: ObservableObject {
     private var approvalAttempted = false
     private var poller: AnyCancellable?
     private var activeIdentity = ""
+    private var targetChosen = false
     private var panelOpen = false
     private var sweepNote: String?
 
@@ -167,6 +170,7 @@ final class Model: ObservableObject {
         settle()
     }
 
+    var identityLabel: String? { accounts.contains { $0.active == true } ? nil : accounts.first?.identityState == "logged-out" ? "signed out" : "unknown" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
     var canKeepLocal: Bool { !running && !sweeping && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
@@ -205,19 +209,18 @@ final class Model: ObservableObject {
             lanes[taken] = old
         }
         to = id
+        targetChosen = true
         settle()
     }
 
     private func settle() {
-        if to == nil || !accounts.contains(where: { $0.id == to }) {
+        if !accounts.contains(where: { $0.id == to }) {
+            to = nil
+            targetChosen = false
+        }
+        if !targetChosen {
             let recent = accounts.sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
-            if let current = accounts.first(where: { $0.active == true }) {
-                to = recent.first { $0.id != current.id }?.id
-            } else if let login = accounts.first(where: { $0.signedIn == true })?.account {
-                to = recent.first { $0.account != login }?.id
-            } else {
-                to = recent.dropFirst().first?.id
-            }
+            to = accounts.first(where: { $0.active == true }).flatMap { current in recent.first { $0.id != current.id }?.id }
         }
         let ids = accounts.map(\.id)
         var next = lanes.filter { ids.contains($0.key) && ids.contains($0.value) }
@@ -756,6 +759,7 @@ struct Panel: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text("Claude Transplant").font(.system(.title3, design: .rounded, weight: .semibold))
+                if let label = model.identityLabel { Tag(text: label, color: .gray) }
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
@@ -875,11 +879,12 @@ enum Snapshot {
 }
 
 enum Demo {
+    private static let at = Date().timeIntervalSince1970 * 1000
     static let accounts = [
-        Account(account: "alex-personal", org: "personal", email: "alex@example.com", orgName: "Personal", label: "alex@example.com · Personal", active: true, signedIn: true, activeAt: 400, pending: nil, pendingFailures: nil),
-        Account(account: "alex-team", org: "team", email: "alex@example.com", orgName: "Acme Inc.", label: "alex@example.com · Acme Inc.", active: false, signedIn: true, activeAt: 300, pending: nil, pendingFailures: nil),
-        Account(account: "sam-personal", org: "personal", email: "sam@example.com", orgName: "Personal", label: "sam@example.com · Personal", active: false, signedIn: false, activeAt: 200, pending: nil, pendingFailures: nil),
-        Account(account: "sam-team", org: "team", email: "sam@example.com", orgName: "Northwind", label: "sam@example.com · Northwind", active: false, signedIn: false, activeAt: 100, pending: nil, pendingFailures: nil)
+        Account(account: "work", org: "acme", email: "you@work.com", orgName: "Acme Inc.", label: "you@work.com · Acme Inc.", active: true, signedIn: true, activeAt: at - 2 * 3_600_000, pending: nil, pendingFailures: nil, stats: "161 | 2h ago | acme-api | active", identityState: "known"),
+        Account(account: "work", org: "work-personal", email: "you@work.com", orgName: "Personal", label: "you@work.com · Personal", active: false, signedIn: true, activeAt: at - 86_400_000, pending: nil, pendingFailures: nil, stats: "157 | 1d ago | acme-api", identityState: "known"),
+        Account(account: "home", org: "home-personal", email: "you@home.com", orgName: "Personal", label: "you@home.com · Personal", active: false, signedIn: false, activeAt: at - 5 * 86_400_000, pending: nil, pendingFailures: nil, stats: "3 | 5d ago | notes", identityState: "known"),
+        Account(account: "work2", org: "northwind", email: "you@work2.com", orgName: "Northwind", label: "you@work2.com · Northwind", active: false, signedIn: false, activeAt: at - 4 * 60_000, pending: nil, pendingFailures: nil, stats: "12 | 4m ago | northwind", identityState: "known")
     ]
 
     @MainActor
@@ -887,8 +892,9 @@ enum Demo {
         let root = URL(fileURLWithPath: directory)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var durations: [Int] = []
-        model.lines = [("inventory", "308 records | 3 already there | 305 to move"), ("move", "305 ✓ | zero-copy"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
-        model.note = "305 sessions moved"
+        model.selectTarget(accounts[2].id)
+        model.lines = [("inventory", "318 records | 3 already there | 307 to move"), ("move", "308 ✓ | 307 zero-copy | 1 rescued"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
+        model.note = "308 sessions moved"
         let size = ImageRenderer(content: Panel().environmentObject(model).environment(\.colorScheme, .dark)).nsImage?.size
         model.lines = []
         model.note = ""
@@ -899,28 +905,28 @@ enum Demo {
             durations.append(milliseconds)
         }
         snap(1200)
-        model.selectTarget(accounts[2].id)
+        model.toggle(accounts[3].id)
         snap(1200)
         model.toggle(accounts[0].id)
         snap(900)
         model.toggle(accounts[0].id)
         snap(600)
         model.begin()
-        model.lines = [("inventory", "308 records | 3 already there | 305 to move")]
+        model.lines = [("inventory", "318 records | 3 already there | 307 to move")]
         snap(300)
-        for completed in [75, 170, 250, 305] {
+        for completed in [75, 170, 250, 308] {
             model.progressCompleted = completed
-            model.progressTotal = 305
+            model.progressTotal = 308
             snap(180)
         }
         model.running = false
         model.badge = ""
         model.progressCompleted = nil
         model.progressTotal = nil
-        model.lines.append(("move", "305 ✓ | zero-copy"))
+        model.lines.append(("move", "308 ✓ | 307 zero-copy | 1 rescued"))
         model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
         model.symbol = "checkmark"
-        model.note = "305 sessions moved"
+        model.note = "308 sessions moved"
         snap(2400)
         try? JSONSerialization.data(withJSONObject: durations).write(to: root.appendingPathComponent("durations.json"))
         exit(0)

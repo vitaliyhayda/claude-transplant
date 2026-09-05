@@ -14,7 +14,6 @@ const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const UUID = new RegExp(`^${UUID_PATTERN}$`, 'i')
 const UUIDS = new RegExp(UUID_PATTERN, 'gi')
 const LOCAL_RECORD = new RegExp(`^local_${UUID_PATTERN}$`, 'i')
-const ORG_URL = new RegExp(`/(?:organizations|bootstrap)/(${UUID_PATTERN})(?:[/?#]|$)`, 'i')
 const NOTE = 'restart Claude Desktop to see them'
 const WORKER_OWNS = 'running worker owns the session'
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
@@ -24,7 +23,6 @@ const REOPEN_RESERVE = 8_000
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
 const CACHE_VERSION = 6
-const ACTIVE_WINDOW = 10 * 60 * 1000
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents']
@@ -78,7 +76,6 @@ const milliseconds = (value) => {
 }
 const typed = (e) => e && typeof e === 'object' && TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain
 const message = (e) => typed(e) && e.type !== 'progress'
-const recent = (time) => Date.now() - time >= 0 && Date.now() - time <= ACTIVE_WINDOW
 
 export function parseProcesses(processes, commands, app = '/Applications/Claude.app') {
   const pattern = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d+:\d+:\d+\s+\d{4})\s+(.+)$/
@@ -283,8 +280,7 @@ export function layout(home = os.homedir()) {
     records: path.join(support, 'Claude/claude-code-sessions'),
     agentSessions: path.join(support, 'Claude/local-agent-mode-sessions'),
     desktop: path.join(support, 'Claude/config.json'),
-    usage: path.join(support, 'Claude/plan-usage-history.json'),
-    scope: path.join(support, 'Claude/sentry/scope_v3.json'),
+    logs: path.join(home, 'Library/Logs/Claude'),
     cookies: path.join(support, 'Claude/Cookies'),
     claudeApp: '/Applications/Claude.app',
     pool: path.join(home, '.claude/projects'),
@@ -512,18 +508,42 @@ function mode(values) {
   return [...tally].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '-'
 }
 
-async function current(paths) {
-  const desktop = await readJson(paths.desktop).catch(() => ({}))
-  const samples = (await readJson(paths.usage).catch(() => ({}))).samples ?? []
-  const latest = samples.reduce((best, sample) => milliseconds(sample?.t) > best.time ? { org: sample.org, time: milliseconds(sample.t) } : best, { org: null, time: -1 })
-  const breadcrumbs = (await readJson(paths.scope).catch(() => ({}))).scope?.breadcrumbs ?? []
-  const seen = breadcrumbs.reduce((best, crumb) => {
-    const url = crumb?.data?.url
-    const match = typeof url === 'string' ? url.match(ORG_URL) : null
-    const time = milliseconds(crumb?.timestamp)
-    return match && Number.isFinite(time) && time > best.time ? { org: match[1], time } : best
-  }, { org: null, time: -1 })
-  return { account: desktop.lastKnownAccountUuid ?? null, org: recent(seen.time) ? seen.org : recent(latest.time) ? latest.org : null }
+export async function signedIn(paths, table = null) {
+  const unknown = (state = 'unknown', time = null) => ({ account: null, org: null, state, source: time === null ? 'unknown' : 'log', at: time === null ? null : new Date(time).toISOString() })
+  try {
+    if (table === null) {
+      const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], { encoding: 'utf8', timeout: 2000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } })
+      if (result.error || result.status !== 0) return unknown()
+      table = parseProcesses(result.stdout, '', paths.claudeApp)
+    }
+    const apps = table.filter((row) => desktopExecutable(row.executable) || row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+    if (apps.length !== 1) return unknown()
+    const started = Date.parse(apps[0].started)
+    if (!Number.isFinite(started) || started > Date.now()) return unknown()
+    const desktop = await readJson(paths.desktop).catch(() => ({}))
+    const files = (await readdir(paths.logs)).filter((name) => /^main(?:[1-9]\d*)?\.log$/.test(name))
+      .sort((a, b) => Number(a.slice(4, -4)) - Number(b.slice(4, -4)))
+    for (const file of files) {
+      const lines = (await readFile(path.join(paths.logs, file), 'utf8')).split('\n')
+      for (let index = lines.length - 1; index >= 0; index--) {
+        const line = lines[index]
+        const local = line.includes('[LocalSessionManager]')
+        const login = line.includes('[account] Login-state transition')
+        if (!login && !(local && /Initialization succeeded|Org changed|Account logged out|Cannot initialize sessions|loadSessions failed/.test(line))) continue
+        const entry = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,3})?) \[\w+\] (.*)$/)
+        const time = entry ? Date.parse(entry[1].replace(' ', 'T')) : NaN
+        if (index === lines.length - 1 || !Number.isFinite(time) || time < started || time > Date.now()) return unknown()
+        const body = entry[2]
+        if (login || body.includes('Account logged out')) return unknown(/loggedOut: .*?(?:\u2192|->) true(?:,|\))|Account logged out/.test(body) ? 'logged-out' : 'unknown', time)
+        const match = body.match(/^\[LocalSessionManager\] Initialization succeeded\b.*?accountId=([^,\s]+), orgId=([^,\s]+)/)
+        if (!match || !UUID.test(match[1]) || !UUID.test(match[2])) return unknown('unknown', time)
+        const account = match[1].toLowerCase(), org = match[2].toLowerCase()
+        if (desktop.lastKnownAccountUuid && desktop.lastKnownAccountUuid.toLowerCase() !== account) return unknown('unknown', time)
+        return { account, org, state: 'known', source: 'log', at: new Date(time).toISOString() }
+      }
+    }
+  } catch {}
+  return unknown()
 }
 
 const plistValue = (file, key) => {
@@ -624,7 +644,7 @@ export async function cloudClient(paths, expected = null) {
   const account = await raw('/api/account')
   if (!UUID.test(account?.uuid ?? '')) throw new Error('Claude Desktop account could not be verified')
   const organizations = await raw('/api/organizations')
-  const preferredOrg = expected?.org ?? cookies.get('lastActiveOrg') ?? (await current(paths)).org
+  const preferredOrg = expected?.org ?? cookies.get('lastActiveOrg') ?? (await signedIn(paths)).org
   const organization = Array.isArray(organizations) ? organizations.find((item) => item.uuid === preferredOrg) : null
   if (!organization) throw new Error('Claude Desktop organization could not be verified')
   if (expected && (account.uuid !== expected.account || organization.uuid !== expected.org)) throw new Error(`sign Claude Desktop into ${expected.label}`)
@@ -693,9 +713,9 @@ const desktopSession = (file, record) => ({
   record
 })
 
-export async function accounts(paths) {
+export async function accounts(paths, processes = null) {
   const { emails, orgs, pairs } = await logins(paths)
-  const cur = await current(paths)
+  const cur = await signedIn(paths, processes)
   const out = []
   const stored = await records(paths.records)
   const known = [...pairs.values()].filter((pair) => !stored.some((row) => sameAccount(row, pair))).map(({ account, org }) => ({ account, org, dir: path.join(paths.records, account, org), files: [] }))
@@ -717,11 +737,10 @@ export async function accounts(paths) {
     const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: account === cur.account })
+    out.push({ account, org, dir, email, orgName, sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: account === cur.account, identityState: cur.state })
   }
   const mine = out.filter((a) => a.account === cur.account)
-  const focused = mine.toSorted((a, b) => b.focusedAt - a.focusedAt)[0]
-  const chosen = mine.find((a) => a.org === cur.org) ?? (focused && recent(focused.focusedAt) ? focused : null)
+  const chosen = mine.find((a) => a.org === cur.org)
   if (chosen) Object.assign(chosen, { active: true, stats: `${chosen.stats} | active` })
   return out.sort((a, b) => b.activeAt - a.activeAt)
 }
@@ -2842,7 +2861,7 @@ export function executeMove(from, to, paths, options = {}) {
     if (plan && options.background) return { pendingLocal: true, ok: true }
     if (plan && !options.moveOnly) {
       if (!saved || saved.fingerprint !== plan.fingerprint) {
-        const active = options.cloud ?? await current(paths)
+        const active = options.cloud ?? await signedIn(paths)
         const proposal = { version: 1, ...plan, kind, resume: Boolean(existing), receiptFile: existing?.file ?? null, selection: chosen, requestedAt, createdAt: new Date().toISOString(), nonce: randomUUID(),
           deferredCloudSources: options.cloudRequested ? chosen?.from.filter((source) => (!active.account || source.account === active.account) && (!active.org || source.org === active.org)).map(accountRef) ?? [] : [] }
         proposal.token = sha(stable(proposal))
@@ -2943,10 +2962,10 @@ export async function sweep(paths, options = {}) {
   if (deferred?.mode === 'local') {
     const result = await finishHeld(paths, { ...options, background: true })
     const error = result.reason ?? result.problems?.map((row) => `${row.title}: ${row.check}`).join(', ') ?? result.receipt?.failed.map((row) => `${row.title}: ${row.error}`).join(', ')
-    return { verification, result, error: result.ok === false ? error || 'Pending local work needs attention' : null, refreshRequired: !result.receipt?.held.length && result.added > 0 && sameAccount(await current(paths), result.receipt?.toAccount), ok: result.ok !== false }
+    return { verification, result, error: result.ok === false ? error || 'Pending local work needs attention' : null, refreshRequired: !result.receipt?.held.length && result.added > 0 && sameAccount(await signedIn(paths), result.receipt?.toAccount), ok: result.ok !== false }
   }
   if (!deferred || deferred.mode !== 'cloud') return { verification, ok: !verification.error }
-  const active = options.active ?? await current(paths)
+  const active = options.active ?? await signedIn(paths, options.processes)
   const source = deferred.sources.find((row) => sameAccount(row, active))
   if (!source) return { verification, pending: true, ok: true }
   try {
@@ -3251,7 +3270,7 @@ async function main(argv) {
     const { file, receipt, checks = [], problems = [], ok } = result
     if (!ok) process.exitCode = 1
     const retired = retiredCount(receipt)
-    const active = await current(paths)
+    const active = await signedIn(paths)
     const refresh = !receipt.held?.length && sameAccount(active, receipt.toAccount) && result.targetChanged === true
     const note = result.reason ?? (result.restarted ? 'Claude Desktop reopened after the move' : refresh ? NOTE : null)
     if (args.json) {
@@ -3386,7 +3405,7 @@ async function main(argv) {
   if (args.cmd === 'accounts') {
     if (args.json) {
       const deferred = await deferredWorkflow(paths)
-      return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, sessions, unreadable, activeAt }) => {
+      return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         return {
           account,
@@ -3397,6 +3416,7 @@ async function main(argv) {
           stats,
           active,
           signedIn,
+          identityState,
           sessions: sessions.length,
           unreadable: unreadable.length,
           activeAt,

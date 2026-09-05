@@ -9,7 +9,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, executeMove, finishHeld, finishPending, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, semantic, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, executeMove, finishHeld, finishPending, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -386,7 +386,6 @@ test('failed source authentication stays pending after an approved restart', asy
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
   await h.record('P', SOURCE)
-  await writeFile(h.paths.usage, JSON.stringify({ samples: [] }))
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   let rows = desktopFixture()
   const io = { inspect: () => rows, command: async (file) => {
@@ -682,7 +681,8 @@ test('cli exits nonzero on partial failure and undoes over json', async () => {
   assert.ok(await readFile(orphan))
   assert.equal(await readdir(path.join(h.paths.state, 'quarantine')).catch(() => 'none'), 'none')
   const list = JSON.parse((await run(['accounts', '--json'])).stdout)
-  assert.equal(list.find((a) => a.account === h.acct.P).active, true)
+  assert.equal(list.some((a) => a.active), false)
+  assert.equal(list.every((a) => a.identityState === 'unknown'), true)
   assert.ok(await readFile(orphan))
   const recovered = await run(['--from', 'p@example.com', '--to', 'z@example.com', '--json'])
   assert.equal(recovered.code, 1)
@@ -1440,44 +1440,106 @@ test('picker reducer', () => {
   assert.equal(single.done, true)
 })
 
-test('active account follows the latest organization request, not background usage polling', async () => {
-  const h = await home()
+const localTime = (time) => {
+  const date = new Date(time)
+  const part = (value) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())} ${part(date.getHours())}:${part(date.getMinutes())}:${part(date.getSeconds())}`
+}
+
+async function identityFixture(h) {
+  const started = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) * 1000
+  const processes = [{ pid: 500, started: new Date(started).toString(), executable: '/Applications/Claude.app/Contents/MacOS/Claude' }]
+  const event = (offset, text) => `${localTime(started + offset * 1000)} [info] ${text}\n`
+  const init = (offset = 0, account = h.acct.P, org = h.org.P) => event(offset, `[LocalSessionManager] Initialization succeeded \u2014 accountId=${account}, orgId=${org}, existingSessions=0`)
+  await mkdir(h.paths.logs, { recursive: true })
+  const write = (text, name = 'main.log') => writeFile(path.join(h.paths.logs, name), text)
+  await write(init())
+  return { started, processes, event, init, write }
+}
+
+test('signed-in identity survives inactivity and ignores usage, focus, and allowlist refreshes', async () => {
+  const h = await home(), f = await identityFixture(h)
   const team = path.join(h.paths.records, h.acct.P, h.org.T)
-  const teamRecord = path.join(team, `local_${id(999)}.json`)
   await mkdir(team, { recursive: true })
-  await writeFile(teamRecord, JSON.stringify({
-    sessionId: `local_${id(999)}`,
-    cliSessionId: id(999),
-    cwd: '/tmp/fixture',
-    lastActivityAt: 1,
-    lastFocusedAt: 1,
-    title: 'Same account, team organization'
-  }))
-  await writeFile(h.paths.usage, JSON.stringify({ samples: [{ org: h.org.P, t: 1 }, { org: h.org.T, t: 2 }] }))
-  await mkdir(path.dirname(h.paths.scope), { recursive: true })
-  await writeFile(h.paths.scope, JSON.stringify({ scope: { breadcrumbs: [
-    { timestamp: Date.now() / 1000 - 1, data: { url: `https://claude.ai/api/organizations/${h.org.T}/usage` } },
-    { timestamp: new Date().toISOString(), data: { url: `https://claude.ai/api/bootstrap/${h.org.P}/current_user_access` } }
-  ] } }))
-  const withScope = await accounts(h.paths)
-  assert.equal(withScope.find((a) => a.account === h.acct.P && a.org === h.org.P).active, true)
-  assert.equal(withScope.find((a) => a.account === h.acct.P && a.org === h.org.T).active, false)
-  await unlink(h.paths.scope)
-  await writeFile(h.paths.usage, JSON.stringify({ samples: [{ org: h.org.P, t: Date.now() - 2 }, { org: h.org.T, t: Date.now() - 1 }] }))
-  const withoutScope = await accounts(h.paths)
-  assert.equal(withoutScope.find((a) => a.account === h.acct.P && a.org === h.org.T).active, true)
-  await writeFile(h.paths.usage, JSON.stringify({ samples: [{ org: h.org.T, t: 1 }] }))
-  const expired = await accounts(h.paths)
-  assert.equal(expired.some((a) => a.active), false)
-  assert.equal(expired.filter((a) => a.account === h.acct.P).every((a) => a.signedIn), true)
-  assert.equal(expired.filter((a) => a.account !== h.acct.P).some((a) => a.signedIn), false)
-  await writeFile(h.paths.scope, JSON.stringify({ scope: { breadcrumbs: [{ timestamp: Date.now() + 60000, data: { url: `https://claude.ai/api/organizations/${h.org.P}/usage` } }] } }))
-  const future = await accounts(h.paths)
-  assert.equal(future.some((a) => a.active), false)
-  const focused = JSON.parse(await readFile(teamRecord, 'utf8'))
-  await writeFile(teamRecord, JSON.stringify({ ...focused, lastFocusedAt: Date.now() + 60000 }))
-  const futureFocus = await accounts(h.paths)
-  assert.equal(futureFocus.some((a) => a.active), false)
+  await writeFile(path.join(team, `local_${id(999)}.json`), JSON.stringify({ sessionId: `local_${id(999)}`, cliSessionId: id(999), cwd: '/tmp/fixture', lastFocusedAt: Date.now() }))
+  await writeFile(path.join(path.dirname(h.paths.desktop), 'plan-usage-history.json'), JSON.stringify({ samples: [{ org: h.org.T, t: Date.now() }] }))
+  const scope = path.join(path.dirname(h.paths.desktop), 'sentry/scope_v3.json')
+  await mkdir(path.dirname(scope), { recursive: true })
+  await writeFile(scope, JSON.stringify({ scope: { breadcrumbs: [{ timestamp: Date.now(), data: { url: `https://claude.ai/api/organizations/${h.org.T}/usage` } }] } }))
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.P, [`dxt:allowlistLastUpdated:${h.org.T}`]: new Date().toISOString() }))
+  const result = await signedIn(h.paths, f.processes)
+  assert.deepEqual(result, { account: h.acct.P, org: h.org.P, state: 'known', source: 'log', at: new Date(f.started).toISOString() })
+  const list = await accounts(h.paths, f.processes)
+  assert.deepEqual(list.filter((row) => row.active).map((row) => row.org), [h.org.P])
+  assert.equal(list.filter((row) => row.account === h.acct.P).every((row) => row.signedIn), true)
+  assert.equal(list.filter((row) => row.account !== h.acct.P).some((row) => row.signedIn), false)
+})
+
+test('signed-in identity invalidates incomplete transitions, logout, and initialization failures', async () => {
+  const h = await home(), f = await identityFixture(h)
+  for (const [event, state] of [
+    [`[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`, 'unknown'],
+    [`[LocalSessionManager] Org changed from null to ${h.org.T}, reinitializing sessions`, 'unknown'],
+    [`[account] Login-state transition (loggedOut: false \u2192 true, uuid: ${h.acct.P} \u2192 <none>), clearing oauth cache`, 'logged-out'],
+    [`[account] Login-state transition (loggedOut: false \u2192 false, uuid: ${h.acct.P} \u2192 ${h.acct.T}), clearing oauth cache`, 'unknown'],
+    ['[LocalSessionManager] Account logged out, marking for re-init on next login', 'logged-out'],
+    ['[LocalSessionManager] Cannot initialize sessions: accountId=null, orgId=null. Keeping existing sessions.', 'unknown'],
+    ['[LocalSessionManager] loadSessions failed during account transition', 'unknown'],
+    ['[LocalSessionManager] Initialization succeeded, accountId=invalid, orgId=invalid', 'unknown']
+  ]) {
+    await f.write(f.init() + f.event(1, event))
+    const result = await signedIn(h.paths, f.processes)
+    assert.equal(result.state, state, event)
+    assert.equal(result.account, null)
+    assert.equal(result.org, null)
+    await f.write(f.init() + f.event(1, event) + f.init(2, h.acct.P, h.org.T))
+    assert.equal((await signedIn(h.paths, f.processes)).org, h.org.T)
+  }
+})
+
+test('signed-in identity reads rotations, accepts the launch second, and rejects a previous launch', async () => {
+  const h = await home(), f = await identityFixture(h)
+  await f.write(f.event(10, '[display] unrelated display event'))
+  await f.write(f.init(), 'main1.log')
+  await f.write(f.init(-30, h.acct.T, h.org.T), 'main2.log')
+  assert.equal((await signedIn(h.paths, f.processes)).org, h.org.P)
+  const restarted = [{ ...f.processes[0], started: new Date(f.started + 1000).toString() }]
+  assert.equal((await signedIn(h.paths, restarted)).state, 'unknown')
+  await f.write(f.event(15, '[LocalSessionManager] Initialization wording changed'))
+  assert.equal((await signedIn(h.paths, restarted)).state, 'unknown')
+  assert.equal((await signedIn(h.paths, [])).state, 'unknown')
+  assert.equal((await signedIn(h.paths, [...f.processes, { ...f.processes[0], pid: 501 }])).state, 'unknown')
+})
+
+test('signed-in identity rejects account conflicts and recovers only from a paired entry', async () => {
+  const h = await home(), f = await identityFixture(h)
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.T }))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await f.write(f.init() + f.event(1, `[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await f.write(f.init() + f.init(2, h.acct.T, h.org.T))
+  assert.equal((await signedIn(h.paths, f.processes)).account, h.acct.T)
+  await writeFile(h.paths.desktop, '{}')
+  assert.equal((await signedIn(h.paths, f.processes)).account, h.acct.T)
+})
+
+test('signed-in identity handles missing, future, and partially written log evidence', async () => {
+  const h = await home(), f = await identityFixture(h)
+  await f.write(f.init() + f.init(2, h.acct.P, h.org.T).trimEnd())
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await f.write(f.init(48 * 60 * 60))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await unlink(path.join(h.paths.logs, 'main.log'))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+})
+
+test('signed-in identity follows an offline switch without using network-dependent markers', async (t) => {
+  const h = await home(), f = await identityFixture(h)
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('offline') })
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.P, [`dxt:allowlistLastUpdated:${h.org.P}`]: new Date().toISOString() }))
+  await f.write(f.init() + f.event(1, `[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`) + f.init(2, h.acct.P, h.org.T) + f.event(3, 'Failed to check allowlist status: offline'))
+  assert.equal((await signedIn(h.paths, f.processes)).org, h.org.T)
+  assert.equal(network.mock.callCount(), 0)
 })
 
 async function home() {
@@ -1501,7 +1563,6 @@ async function home() {
   await mkdir(project, { recursive: true })
   await mkdir(paths.backups, { recursive: true })
   await writeFile(paths.desktop, JSON.stringify({ lastKnownAccountUuid: acct.P }))
-  await writeFile(paths.usage, JSON.stringify({ samples: [{ org: org.T, t: Date.now() - 1 }, { org: org.P, t: Date.now() }] }))
   await writeFile(paths.login, JSON.stringify({ oauthAccount: { accountUuid: acct.P, organizationUuid: org.P, emailAddress: 'p@example.com', organizationName: 'Personal P' } }))
   await writeFile(path.join(paths.backups, '.claude.json.backup.1'), JSON.stringify({
     oauthAccount: { accountUuid: acct.T, organizationUuid: org.T, emailAddress: 't@example.com', organizationName: 'Team T' }
@@ -1967,7 +2028,7 @@ test('Finish pending closes the same logical receipt under the matching source l
 })
 
 test('automatic cloud follow-up waits for its named source login and completes the same receipt', async () => {
-  const h = await home()
+  const h = await home(), f = await identityFixture(h)
   const entries = [entry('user', 1, null, SOURCE)]
   await h.write(SOURCE, entries)
   await h.record('T', SOURCE, rehomeRecord({ title: 'Automatic source' }))
@@ -1982,9 +2043,14 @@ test('automatic cloud follow-up waits for its named source login and completes t
     eventRows: async () => remoteRows(entries), session: async () => remoteState(status),
     archive: async () => { status = 'archived' }
   })
-  await sweep(h.paths, { active: { account: h.acct.P, org: h.org.P }, cloud })
+  await sweep(h.paths, { processes: f.processes, cloud })
   assert.equal(reads, 0)
-  const finished = await sweep(h.paths, { active: from, cloud })
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: from.account }))
+  await f.write(f.init() + f.event(1, `[account] Login-state transition (loggedOut: false \u2192 false, uuid: ${h.acct.P} \u2192 ${from.account}), clearing oauth cache`))
+  await sweep(h.paths, { processes: f.processes, cloud })
+  assert.equal(reads, 0)
+  await appendFile(path.join(h.paths.logs, 'main.log'), f.init(2, from.account, from.org))
+  const finished = await sweep(h.paths, { processes: f.processes, cloud })
   assert.equal(status, 'archived')
   assert.equal(finished.result.file, moved.file)
   assert.equal(finished.result.complete, true)
