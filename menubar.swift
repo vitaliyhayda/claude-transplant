@@ -1073,6 +1073,38 @@ enum Demo {
     }
 }
 
+struct MenuLabel: View {
+    let symbol: String
+    let badge: String
+
+    var image: NSImage {
+        let size = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)!.size
+        let image = NSImage(size: size, flipped: false) { rect in
+            if badge.isEmpty {
+                let glyph = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)!
+                let scale = min(rect.width / glyph.size.width, rect.height / glyph.size.height)
+                let width = glyph.size.width * scale, height = glyph.size.height * scale
+                glyph.draw(in: NSRect(x: (rect.width - width) / 2, y: (rect.height - height) / 2, width: width, height: height))
+            } else {
+                var font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+                let width = (badge as NSString).size(withAttributes: [.font: font]).width
+                if width > rect.width { font = NSFont.monospacedDigitSystemFont(ofSize: 10 * rect.width / width, weight: .semibold) }
+                let text = NSAttributedString(string: badge, attributes: [.font: font, .foregroundColor: NSColor.black])
+                let measured = text.size()
+                text.draw(at: NSPoint(x: (rect.width - measured.width) / 2, y: (rect.height - measured.height) / 2))
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    var body: some View {
+        Image(nsImage: image)
+            .accessibilityLabel(badge.isEmpty ? "Claude Transplant" : badge + " complete")
+    }
+}
+
 @main
 struct TransplantApp: App {
     @StateObject private var model: Model
@@ -1100,11 +1132,8 @@ struct TransplantApp: App {
         MenuBarExtra {
             Panel().environmentObject(model).environment(\.controlActiveState, .key).environment(\.colorScheme, .dark)
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: model.symbol)
-                if !model.badge.isEmpty { Text(model.badge).monospacedDigit() }
-            }
-            .help(model.running ? "Estimated completion" : "Claude Transplant")
+            MenuLabel(symbol: model.symbol, badge: model.badge)
+                .help(model.running ? "Estimated completion" : "Claude Transplant")
         }
         .menuBarExtraStyle(.window)
     }

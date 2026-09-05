@@ -3829,6 +3829,11 @@ extension Model {
 struct StateChecks {
     @MainActor
     static func main() {
+        let menuSize = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)!.size
+        for badge in ["", "0%", "9%", "10%", "47%", "99%", "100%"] {
+            let image = MenuLabel(symbol: "arrow.left.arrow.right", badge: badge).image
+            precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
+        }
         var progress = MoveProgress(now: 0)
         var previous = 0
         for (stage, completed, total, at) in [("scan", 0, 100, 0.0), ("scan", 50, 100, 2.0), ("scan", 100, 100, 4.0), ("cloud scan", 1, 2, 5.0), ("desktop", 0, 1, 6.0), ("scan", 1, 100, 8.0), ("scan", 100, 100, 8.2), ("move", 1, 100, 8.3), ("move", 100, 100, 8.5), ("verify", 100, 100, 8.6), ("retire", 100, 100, 8.7), ("finalize", 0, 1, 8.8), ("reopen", 0, 1, 9.0), ("cloud", 1, 2, 10.0), ("cloud", 2, 2, 11.0)] {
