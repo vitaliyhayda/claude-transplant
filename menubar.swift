@@ -986,7 +986,7 @@ struct TransplantApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            Panel().environmentObject(model).environment(\.controlActiveState, .key)
+            Panel().environmentObject(model).environment(\.controlActiveState, .key).environment(\.colorScheme, .dark)
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: model.symbol)
