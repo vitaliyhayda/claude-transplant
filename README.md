@@ -130,6 +130,7 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 | Treat sidebar Idle as an interruption inventory | An organization switch stopped two unrelated workers during the probe. The restart warning uses process ancestry and identities, and explicitly covers all Desktop windows |
 | Infer a restart-safe moment from private activity logs | Not required by this version. Cold records move normally and held records require an explicit graceful shutdown |
 | Repair every changed record from its old snapshot | Would overwrite legitimate titles, archive changes, and pins. Save evidence and report meaningful differences instead |
+| Multiline argv in macOS `ps` | The local canary escaped its newline as `\012`, and strict parsing passed |
 
 ## Limits
 
