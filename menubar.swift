@@ -817,6 +817,7 @@ struct Panel: View {
         }
         .padding(16)
         .frame(width: 2 * columnWidth + Panel.gap + 32)
+        .background(Color(white: 0.11))
         .onAppear { if !model.snapshot { model.panelVisibility(true) } }
         .onDisappear { if !model.snapshot { model.panelVisibility(false) } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in

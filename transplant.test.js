@@ -560,6 +560,8 @@ test('placed verification ignores activity and bridge registration but records t
   record.lastFocusedAt = Date.now()
   record.completedTurns = 100
   record.bridgeSessionIds = ['session_new']
+  record.writtenBranches = ['main', 'feature/anything']
+  record.prs = [{ prNumber: 1, url: 'https://github.com/example/repo/pull/1' }]
   await writeFile(file, JSON.stringify(record))
   assert.deepEqual((await verifyPlaced(h.paths)).changed, [])
   record.title = 'Different title after placement'

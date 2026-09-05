@@ -25,7 +25,7 @@ const SEMANTIC_VERSION = 3
 const CACHE_VERSION = 7
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
-const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents']
+const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
 const REMOTE_TAGS = new Set(['remote-control-sdk', 'remote-control-repl'])
 const HELP = `claude-transplant   move Claude Code history between accounts
 
