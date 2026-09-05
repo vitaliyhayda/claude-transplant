@@ -294,7 +294,7 @@ final class Model: ObservableObject {
             if moved == 0, retired > 0 { outcomes.append(quantity(retired, "source entry retired", "source entries retired")) }
             if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
             if !problems.isEmpty { outcomes.append("verification failed") }
-            if event.waitingForIdle == true { outcomes.append("Wait for Claude to be idle, then Move again") }
+            if event.waitingForIdle == true, let detail = event.note { outcomes.append(detail) }
             let summary = outcomes.isEmpty ? (event.note ?? "Nothing to move") : outcomes.joined(separator: ", ")
             restartAvailable = event.restart ?? false
             note = summary
@@ -325,8 +325,15 @@ final class Model: ObservableObject {
 
     func restartDesktop() {
         guard !running else { return }
-        begin()
-        run(["restart", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+        running = true
+        run(["restart", "--json"], line: { [weak self] line in
+            guard let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)), event.done == true else { return }
+            self?.note = event.note ?? ""
+            self?.restartAvailable = event.ok != true
+        }) { [weak self] status, error in
+            self?.running = false
+            if status != 0, !error.isEmpty { self?.note = error }
+        }
     }
 
     nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String? {

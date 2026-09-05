@@ -16,7 +16,9 @@ const UUIDS = new RegExp(UUID_PATTERN, 'gi')
 const LOCAL_RECORD = new RegExp(`^local_${UUID_PATTERN}$`, 'i')
 const ORG_URL = new RegExp(`/(?:organizations|bootstrap)/(${UUID_PATTERN})(?:[/?#]|$)`, 'i')
 const NOTE = 'restart Claude Desktop to see them'
-const WAIT_IDLE = 'Wait for Claude to be idle, then Move again. Other eligible sessions moved now.'
+const WAIT_IDLE = 'Wait for Claude to be idle before moving the remaining sessions.'
+const WORKER_OWNS = 'running worker owns the session'
+const FINISHED_STOPS = new Set(['end_turn', 'stop_sequence', 'refusal'])
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
 const CACHE_VERSION = 6
@@ -33,6 +35,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant finish      finish pending cloud work for the active source
   claude-transplant keep-local  cancel pending cloud checks, keep completed local work
   claude-transplant accounts    list accounts
+  claude-transplant restart     explicitly reload idle Desktop, never force quit
   claude-transplant menubar     install the menubar app, --snapshot <png>, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
@@ -92,33 +95,38 @@ function processTable() {
 
 const workers = () => new Set(processTable().filter((row) => row.claude).flatMap((row) => row.ids))
 
-// A completed transcript alone is not proof: a new prompt can be queued before it is written.
-// Require Desktop's global idle acknowledgement too, from this app lifetime, and fail closed.
+const logTime = (line = '') => Date.parse(line.slice(0, 19).replace(' ', 'T'))
+const desktopActivity = (log) => log.split('\n').findLast((line) => /^\d{4}-.+ \[(?:info|debug)\] (?:\[keep-awake\] code session hold |LocalSessions\.(?:sendMessage|start(?!ShellPty))|Sending message to session)/.test(line))
+
 export function desktopIdle({ started, log, workers, now = Date.now() }) {
-  const activity = log.split('\n').filter((line) => /code session hold |LocalSessions\.(?:sendMessage|start)|Sending message to session/.test(line)).at(-1)
+  if (!Number.isFinite(started)) return false
+  const activity = desktopActivity(log)
+  if (!workers.length && logTime(log) <= started && (!activity || logTime(activity) < started)) return true
   if (!activity?.includes('code session hold released (idle,')) return false
-  const idleAt = Date.parse(activity.slice(0, 19).replace(' ', 'T'))
-  return Number.isFinite(started) && idleAt >= started && idleAt <= now - 2000 && workers.length > 0 &&
-    workers.every((worker) => worker.known && worker.ended >= started && worker.ended <= idleAt && worker.modified <= now - 2000)
+  const idleAt = logTime(activity)
+  return idleAt >= started && idleAt <= now - 2000 &&
+    workers.every((worker) => worker.known && worker.ended >= started && worker.ended <= idleAt && (worker.activeAt ?? 0) <= idleAt && worker.modified <= now - 2000)
+}
+
+function desktopTree(paths, table) {
+  const apps = table.filter((row) => row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+  const app = apps.length === 1 ? apps[0] : null
+  const pids = new Set(app ? [app.pid] : [])
+  let size
+  do {
+    size = pids.size
+    for (const row of table) if (pids.has(row.parent)) pids.add(row.pid)
+  } while (size !== pids.size)
+  return { app, members: table.filter((row) => pids.has(row.pid)) }
 }
 
 export async function desktopState(selected, paths, table = processTable()) {
-  const blocking = table.filter((row) => row.claude && row.ids.some((id) => selected.includes(id)))
-  if (!blocking.length) return { blocked: false, idle: false }
-  const app = table.find((row) => row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
-  if (!app) return { blocked: true, idle: false }
-  const byPid = new Map(table.map((row) => [row.pid, row]))
-  const owned = (row) => {
-    const seen = new Set()
-    while (row && !seen.has(row.pid)) {
-      if (row.parent === app.pid) return true
-      seen.add(row.pid)
-      row = byPid.get(row.parent)
-    }
-    return false
-  }
-  if (!blocking.every(owned)) return { blocked: true, idle: false }
-  const active = table.filter((row) => row.claude && owned(row))
+  const blocking = selected === null ? [] : table.filter((row) => row.claude && row.ids.some((id) => selected.includes(id)))
+  if (selected !== null && !blocking.length) return { blocked: false, idle: false }
+  const { app, members } = desktopTree(paths, table)
+  if (!app) return { blocked: Boolean(blocking.length), idle: false }
+  if (!blocking.every((row) => members.includes(row))) return { blocked: true, idle: false }
+  const active = members.filter((row) => row.claude && row !== app)
   const all = await accounts(paths)
   const sessions = all.flatMap((account) => account.sessions.map((session) => ({ ...session, account })))
   const pool = await index(paths.pool)
@@ -126,28 +134,36 @@ export async function desktopState(selected, paths, table = processTable()) {
     const matches = sessions.filter((session) => worker.ids.includes(session.id?.toLowerCase()))
     if (matches.length !== 1) return { known: false }
     const session = matches[0]
-    if (session.account.taskError || session.account.taskSessions.has(session.record.sessionId) || session.record.scheduledTaskId || session.record.notifySessionId) return { known: false }
+    if (!validDesktopRecord(session) || session.account.taskError || session.account.taskSessions.has(session.record.sessionId) || session.record.scheduledTaskId || session.record.notifySessionId) return { known: false }
     const file = locate(pool, session.id, session.cwd)
     if (!file) return { known: false }
     const before = await fingerprint(file)
     const data = await load(file)
-    const last = data.entries.filter((entry) => !entry.isSidechain && ['user', 'assistant', 'progress'].includes(entry.type)).at(-1)
-    const ended = last?.type === 'assistant' && last.message?.stop_reason === 'end_turn' ? milliseconds(last.timestamp) : -1
+    const last = data.entries.findLast((entry) => !entry.isSidechain && ['user', 'assistant', 'progress'].includes(entry.type))
+    const ended = last?.type === 'assistant' && FINISHED_STOPS.has(last.message?.stop_reason) ? milliseconds(last.timestamp) : -1
     return { known: !data.invalid && before === await fingerprint(file) && ended >= worker.started,
-      ended, modified: (await stat(file)).mtimeMs, fingerprint: before, record: await fingerprint(session.file) }
+      ended, activeAt: session.activeAt, modified: (await stat(file)).mtimeMs, fingerprint: before, record: await fingerprint(session.file) }
   }))
   const log = await readFile(path.join(paths.home, 'Library/Logs/Claude/main.log'), 'utf8')
   return { blocked: true, idle: desktopIdle({ started: app.started, log, workers: checked }),
-    signature: sha(stable([app, active, checked, log])) }
+    signature: sha(stable([app, active, checked, desktopActivity(log)])) }
 }
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const desktopOpen = (paths) => spawnSync('/usr/bin/open', ['-g', '-a', paths.claudeApp], { timeout: 10000 }).status === 0
+async function desktopOpen(paths) {
+  if (desktopTree(paths, processTable()).app) return false
+  if (spawnSync('/usr/bin/open', ['-g', '-a', paths.claudeApp], { timeout: 10000 }).status !== 0) return false
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (desktopTree(paths, processTable()).app) return true
+    await pause(250)
+  }
+  return false
+}
 async function desktopQuit(paths) {
-  // A graceful quit flushes Desktop records. Never kill a session process or force termination.
+  const tracked = desktopTree(paths, processTable()).members
   const quit = spawnSync('/usr/bin/osascript', ['-e', 'tell application id "com.anthropic.claudefordesktop" to quit'], { timeout: 10000 })
   for (let attempt = 0; attempt < 40; attempt++) {
-    if (!processTable().some((row) => row.executable.startsWith(`${paths.claudeApp}/`))) return quit.status === 0
+    if (!processTable().some((row) => tracked.some((prior) => row.pid === prior.pid && row.started === prior.started))) return quit.status === 0
     await pause(250)
   }
   return false
@@ -156,7 +172,7 @@ async function desktopQuit(paths) {
 export async function withIdleDesktop(selected, paths, report, work, io = {}) {
   const inspect = io.inspect ?? (() => desktopState(selected, paths))
   const read = () => inspect().catch(() => ({ blocked: true, idle: false }))
-  let state = selected.length || io.inspect ? await read() : { blocked: false }
+  let state = selected === null || selected.length ? await read() : { blocked: false }
   let stopped = false
   let attempted = false
   let reopened = true
@@ -173,13 +189,15 @@ export async function withIdleDesktop(selected, paths, report, work, io = {}) {
       }
       state = again
     }
-    if (state.blocked && !stopped) report('waiting', WAIT_IDLE)
-    result = await work()
+    if (state.blocked && !stopped) report('waiting', `${WAIT_IDLE} Moving other eligible records now.`)
+    result = await work(attempted)
   } finally {
-    if (attempted) reopened = await (io.open ?? (() => desktopOpen(paths)))()
+    if (attempted) {
+      reopened = await (io.open ?? (() => desktopOpen(paths)))().catch(() => false)
+      if (!reopened) report('desktop', 'Could not confirm Desktop reopened. If it is still closing, wait and reopen it manually.')
+    }
   }
-  if (!reopened) report('desktop', 'Move finished. Reopen Claude Desktop manually.')
-  return { result, restarted: stopped && reopened, waiting: Boolean(state.blocked && !stopped) }
+  return { result, restarted: stopped && reopened, waiting: Boolean(state.blocked && !stopped), ...(!reopened ? { reopenFailed: true } : {}) }
 }
 
 export function layout(home = os.homedir()) {
@@ -1048,7 +1066,7 @@ const rehomeReason = (source, to, targetIds, targetNames) => {
   if (source.record.scheduledTaskId) return 'scheduled task owns the Desktop record'
   if (source.record.notifySessionId) return 'notification route owns the Desktop record'
   if (source.taskOwned) return 'scheduled task registry owns the Desktop record'
-  if (source.worker) return 'running worker owns the session'
+  if (source.worker) return WORKER_OWNS
   if (targetIds.has(source.id)) return 'target session id collision'
   if (targetNames.has(path.basename(source.file))) return 'target Desktop filename collision'
   return null
@@ -2049,7 +2067,7 @@ async function waitRemote(cloud, id, statuses) {
   for (let attempt = 0; attempt < 12; attempt++) {
     current = await cloud.session(id)
     if (statuses.includes(current.status)) return current
-    await new Promise((resolve) => setTimeout(resolve, 250))
+    await pause(250)
   }
   return current
 }
@@ -2831,10 +2849,10 @@ async function main(argv) {
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
   if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
   if (args.cmd === 'restart') {
-    const result = await locked(paths, () => withIdleDesktop([...workers()], paths, reporter(args.json), async () => null))
-    const note = result.waiting ? 'Wait for Claude to be idle before restarting.' : result.restarted ? 'Claude Desktop restarted' : 'No running Claude worker needs restarting'
-    if (result.waiting) process.exitCode = 1
-    return args.json ? emit({ done: true, ok: !result.waiting, note }) : out.write(`${note}\n`)
+    const result = await locked(paths, () => withIdleDesktop(null, paths, reporter(args.json), async () => null))
+    const note = result.reopenFailed ? 'Could not confirm Desktop reopened. Reopen it manually after it finishes closing.' : result.waiting ? 'Wait for Claude to be idle before restarting.' : result.restarted ? 'Claude Desktop restarted' : 'Claude Desktop is not running'
+    if (result.waiting || result.reopenFailed) process.exitCode = 1
+    return args.json ? emit({ done: true, ok: !process.exitCode, note }) : out.write(`${note}\n`)
   }
   if (args.cmd === 'keep-local') {
     const result = await keepLocal(paths)
@@ -2977,6 +2995,7 @@ async function main(argv) {
   if (new Set(from.map((account) => `${account.account}/${account.org}`)).size !== from.length) throw new Error('from accounts must be unique')
   if (from.includes(to)) throw new Error('to must differ from from')
   const report = reporter(args.json)
+  const requestedAt = new Date().toISOString()
   let cloud = null
   let cloudError = null
   if (args.cloud) {
@@ -3031,7 +3050,7 @@ async function main(argv) {
       process.exitCode = 1
       return args.json ? emit({ done: true, ok: false, dry: true, recoveryRequired: true, planned: null }) : out.write('  dry run     plan unavailable until the next move reconciles this state\n')
     }
-    const inv = await inventory(from, to, paths, report, { cloud, cloudRequested: args.cloud, cloudError })
+    const inv = await inventory(from, to, paths, report, { cloud, cloudRequested: args.cloud, cloudError, requestedAt })
     summary(inv)
     const retiring = owners(inv.sources, carrying(inv, inv.move.map((history) => ({ history })))).filter(({ s, owner }) => !retirementOwnership(inv, s, owner)).length
     if (retiring) report('retire', `${count(retiring)} source records once the target records verify`)
@@ -3047,21 +3066,20 @@ async function main(argv) {
     const plan = async () => {
       const latest = await accounts(paths)
       const target = fresh(latest, to)
-      const inv = await inventory(from.map((account) => fresh(latest, account)), target, paths, report, { writeCache: true, cloud, cloudRequested: args.cloud, cloudError })
+      const inv = await inventory(from.map((account) => fresh(latest, account)), target, paths, report, { writeCache: true, cloud, cloudRequested: args.cloud, cloudError, requestedAt })
       return { inv, target }
     }
     let { inv, target } = await plan()
     const selected = [...new Set([
-      ...inv.blocked.filter((row) => row.error === 'running worker owns the session'),
+      ...inv.blocked.filter((row) => row.error === WORKER_OWNS),
       ...inv.there.flatMap((row) => row.members ?? [row]).filter((row) => row.worker && !row.taskOwned && !row.record.scheduledTaskId && !row.record.notifySessionId)
     ].map((row) => row.id.toLowerCase()))]
-    const outcome = await withIdleDesktop(selected, paths, report, async () => {
-      // Quit flushes records. Never apply the pre-quit plan to the flushed state.
-      if (selected.length) ({ inv, target } = await plan())
+    const outcome = await withIdleDesktop(selected, paths, report, async (attempted) => {
+      if (attempted) ({ inv, target } = await plan())
       summary(inv)
       return inv.move.length || inv.there.length || inv.cloud.matches.length || inventoryFailures(inv).length || inv.cloudRequested ? transfer(inv, target, paths, report) : null
     })
-    return outcome.result && { ...outcome.result, restarted: outcome.restarted, waitingForIdle: outcome.waiting }
+    return outcome.result && { ...outcome.result, restarted: outcome.restarted, waitingForIdle: outcome.waiting, reopenFailed: outcome.reopenFailed }
   })
   if (result?.deferred) {
     const labels = result.deferred.sources.map((source) => source.label)
@@ -3079,11 +3097,11 @@ async function main(argv) {
   }
   if (!result) return args.json ? emit({ done: true, ok: true, moved: 0 }) : out.write('  nothing to move\n')
   const { file, receipt, checks, problems, ok } = result
-  if (!ok) process.exitCode = 1
+  if (!ok || result.reopenFailed) process.exitCode = 1
   const retired = retiredCount(receipt)
-  const note = result.waitingForIdle ? WAIT_IDLE : result.restarted ? 'Claude Desktop reopened after the move' : receipt.sessions.length || receipt.superseded.length || receipt.remote.length ? NOTE : null
+  const note = result.reopenFailed ? 'Could not confirm Desktop reopened. Reopen it manually after it finishes closing.' : result.waitingForIdle ? `${WAIT_IDLE}${result.pendingCloud ? ' Finish pending or Keep local before the next Move.' : ''}` : result.restarted ? 'Claude Desktop reopened after the move' : receipt.sessions.length || receipt.superseded.length || receipt.remote.length ? NOTE : null
   if (args.json) {
-    return emit({ done: true, ok, complete: result.complete, receipt: file, moved: receipt.sessions.length, rescued: receipt.sessions.filter((row) => row.strategy === 'remote').length, cloudArchived: receipt.remote.length, newerCloud: result.newerCloud, pendingCloud: result.pendingCloud, pendingLabels: result.pendingLabels, superseded: receipt.superseded.length - retired, retired, failed: receipt.failed, problems, checks, note, waitingForIdle: result.waitingForIdle, restarted: result.restarted, restart: Boolean(note) && !result.restarted && !result.waitingForIdle })
+    return emit({ done: true, ok: ok && !result.reopenFailed, complete: result.complete, receipt: file, moved: receipt.sessions.length, rescued: receipt.sessions.filter((row) => row.strategy === 'remote').length, cloudArchived: receipt.remote.length, newerCloud: result.newerCloud, pendingCloud: result.pendingCloud, pendingLabels: result.pendingLabels, superseded: receipt.superseded.length - retired, retired, failed: receipt.failed, problems, checks, note, waitingForIdle: result.waitingForIdle, restarted: result.restarted, restart: Boolean(note) && !result.restarted && !result.waitingForIdle && !result.reopenFailed })
   }
   const troubles = [
     ...receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`),

@@ -71,6 +71,7 @@ test('Desktop idle evidence requires a fresh global idle release and completed w
   const worker = { ended: started + 60000, modified: started + 60000, known: true }
   const frame = { started, log, workers: [worker], now: started + 130000 }
   assert.equal(desktopIdle(frame), true)
+  assert.equal(desktopIdle({ ...frame, log: log + '2026-09-04 10:02:01 [info] LocalSessions.startShellPty: sessionId=local_test\n' }), true)
   for (const extra of [
     { log: '' },
     { started: started + 180000 },
@@ -94,7 +95,7 @@ test('only selected blocking workers trigger an idle restart, held closed throug
     open: async () => { calls.push('open'); return true }
   }
   const work = async () => { calls.push('move'); return 'moved' }
-  const run = () => withIdleDesktop([], {}, () => {}, work, io)
+  const run = () => withIdleDesktop([SOURCE], {}, () => {}, work, io)
   assert.deepEqual(await run(), { result: 'moved', restarted: true, waiting: false })
   assert.deepEqual(calls.splice(0), ['quit', 'move', 'open'])
   state.blocked = false
@@ -110,11 +111,18 @@ test('only selected blocking workers trigger an idle restart, held closed throug
   assert.equal((await run()).waiting, true)
   assert.deepEqual(calls.splice(0), ['move'])
   io.inspect = async () => state
-  await assert.rejects(withIdleDesktop([], {}, () => {}, async () => { throw new Error('move failed') }, io), /move failed/)
+  await assert.rejects(withIdleDesktop([SOURCE], {}, () => {}, async () => { throw new Error('move failed') }, io), /move failed/)
   assert.deepEqual(calls.splice(0), ['quit', 'open'])
   io.quit = async () => { calls.push('quit'); return false }
   assert.equal((await run()).waiting, true)
   assert.deepEqual(calls.splice(0), ['quit', 'move', 'open'])
+  io.open = async () => false
+  const reports = []
+  await assert.rejects(withIdleDesktop([SOURCE], {}, (...line) => reports.push(line), async () => { throw new Error('move failed') }, io), /move failed/)
+  assert.ok(reports.some(([stage, text]) => stage === 'desktop' && text.includes('Could not confirm')))
+  calls.splice(0)
+  await withIdleDesktop([], {}, () => {}, work, io)
+  assert.deepEqual(calls, ['move'], 'an automatic move with no blocking sessions never inspects or restarts Desktop')
 })
 
 test('Desktop restart checks real record and transcript metadata for every owned worker', async () => {
@@ -136,6 +144,16 @@ test('Desktop restart checks real record and transcript metadata for every owned
   ]
   const inspect = () => desktopState([SOURCE], h.paths, table)
   assert.equal((await inspect()).idle, true)
+  for (const stop_reason of ['stop_sequence', 'refusal', 'max_tokens', 'tool_use', 'pause_turn', 'unknown']) {
+    await h.write(SOURCE, [entry('assistant', 1, null, SOURCE, { timestamp: new Date(ended).toISOString(), message: { role: 'assistant', content: 'Done', stop_reason } })])
+    await utimes(file, new Date(ended), new Date(ended))
+    assert.equal((await inspect()).idle, ['stop_sequence', 'refusal'].includes(stop_reason), stop_reason)
+  }
+  await h.write(SOURCE, [entry('assistant', 1, null, SOURCE, { timestamp: new Date(ended).toISOString(), message: { role: 'assistant', content: 'Done', stop_reason: 'end_turn' } })])
+  await utimes(file, new Date(ended), new Date(ended))
+  await h.record('P', SOURCE, rehomeRecord({ sessionId: `local_${id(700)}` }))
+  assert.equal((await inspect()).idle, false, 'an invalid record identity never proves worker ownership')
+  await h.record('P', SOURCE, rehomeRecord())
   assert.equal((await desktopState([id(700)], h.paths, table)).blocked, false)
   table.push({ ...table[1], pid: 12, ids: [id(700)] })
   assert.equal((await inspect()).idle, false, 'an unidentified worker in any account blocks restart')
@@ -148,6 +166,40 @@ test('Desktop restart checks real record and transcript metadata for every owned
   table[1].parent = 10
   await appendFile(file, JSON.stringify(entry('user', 2, 1, SOURCE)) + '\n')
   assert.equal((await inspect()).idle, false, 'a new local turn invalidates old idle evidence')
+  const empty = [table[0]]
+  assert.equal((await desktopState(null, h.paths, empty)).idle, true, 'an explicit restart can reload idle Desktop with no workers')
+  assert.equal((await desktopState([], h.paths, empty)).blocked, false, 'an automatic move never restarts without selected workers')
+  await appendFile(log, `${local} [info] LocalSessions.sendMessage: sessionId=local_new\n`)
+  assert.equal((await desktopState(null, h.paths, empty)).idle, false, 'new queued input blocks even before its worker spawns')
+  await writeFile(log, `${local} [info] unrelated log\n`)
+  assert.equal((await desktopState(null, h.paths, empty)).idle, false, 'a rotated log cannot prove a workerless app idle')
+})
+
+test('a real worker keeps its record while the CLI moves other records and explains cloud pending', async () => {
+  const h = await home()
+  const executable = path.join(h.root, 'claude')
+  await symlink(process.execPath, executable)
+  const child = spawn(executable, ['-e', 'setInterval(() => {}, 1000)', SOURCE], { stdio: 'ignore' })
+  await once(child, 'spawn')
+  try {
+    for (const [i, sid] of [SOURCE, id(700)].entries()) {
+      await h.write(sid, [entry('user', i + 1, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const result = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--cloud', '--json'])
+    const done = lines(result.stdout).at(-1)
+    assert.equal(result.code, 1)
+    assert.equal(done.moved, 1)
+    assert.equal(done.waitingForIdle, true)
+    assert.equal(done.restarted, false)
+    assert.match(done.note, /Keep local/)
+    assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`])
+    assert.deepEqual(await readdir(h.dir('Z')), [`local_${id(700)}.json`])
+  } finally {
+    const exited = once(child, 'exit')
+    child.kill()
+    await exited
+  }
 })
 
 async function hold(file) {

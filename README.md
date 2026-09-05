@@ -54,6 +54,7 @@ To    ↑↓ move · enter confirm
 | `claude-transplant finish` | check the active pending source, retry its failures, or continue a staged cloud Undo |
 | `claude-transplant keep-local` | cancel pending or failed cloud sources without reversing completed local movement |
 | `claude-transplant accounts` | list accounts |
+| `claude-transplant restart` | explicitly reload idle Desktop, including when it has no workers, never force quit |
 | `claude-transplant menubar` | install the menubar app, `--snapshot <png>` renders live accounts, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
 | `--cloud` | reconcile the active source and queue only inaccessible sources that still have unreadable or unarchived local records |
@@ -88,7 +89,9 @@ One receipt owns the local move, completed cloud checks, failures, retries, and 
 
 A move is eligible when the history is a single comparable version, the record filename and identity are valid, no scheduled task, notification route, or running worker owns it, the parent record is already in the target or moves first in the same batch, and the target has no id collision. Everything else is refused with a named reason.
 
-Remote Control can keep an idle Desktop worker alive, so process presence is not the same as an active response. If a selected record is blocked only by a worker, the CLI and menubar check every Desktop-owned Claude worker, including other accounts. An automatic graceful restart requires completed transcript turns plus Desktop's global idle acknowledgement from the current app lifetime, unchanged across two checks. Unknown workers, unreadable activity, a newer prompt, or active work mean no restart. Eligible records still move, and the result asks you to wait for Claude to be idle before moving the rest. Desktop stays closed while records are re-inventoried and moved, then reopens even if the move fails. No process is force-killed and no Remote Control default is changed. The existing manual restart link uses the same idle check.
+Remote Control can keep an idle Desktop worker alive, so process presence is not the same as an active response. An automatic restart is considered only when a selected record is worker-blocked. Every Desktop-owned Claude worker must map to a valid, unowned record and a completed turn (`end_turn`, `stop_sequence`, or `refusal`), followed by Desktop's global idle acknowledgement, unchanged across two checks. Unknown workers, unreadable activity, newer prompts, or active work mean wait, while eligible records still move. If cloud work is pending, finish it or choose Keep local before the next Move. No Remote Control default is changed.
+
+After a graceful quit, the tool waits for Desktop and its tracked children, rebuilds the inventory with the original cloud-history cutoff, then moves. It attempts to reopen Desktop even if the move fails and verifies a new app process, not just an `open` exit code. A slow or failed shutdown is never force-killed or mistaken for a successful restart. The result asks you to reopen manually if it cannot confirm that state. The explicit restart link uses the same idle check, but can reload a workerless app when the log covers its lifetime without newer activity. It preserves the move summary and account choices.
 
 Before writing, the transcript is hashed against its analyzed bytes and both records are reread. Sources and destinations are checked again before retirement, and a change after parking begins restores the plan. Undo verifies the target record and every restore path before recording its plan, then moves only Desktop records. A receipt journals every phase, interrupted retirement or undo resumes from it, and a corrupt newest receipt stops undo before it can reach the previous batch.
 
@@ -117,6 +120,7 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 | Delete the source | Removes the rollback |
 | Merge sidecars across versions | Requires writing a new generation |
 | Trust one `forkedFrom` hop | Misses second-generation copies |
+| Atomic external idle-and-quit API | None exposed. Use two fresh checks and an ordinary guarded quit, never override Desktop's busy dialog |
 
 ## Limits
 
@@ -128,6 +132,8 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 - Remote Control uses private Claude endpoints and fails closed if their response shape, organization, history, status, or authentication changes.
 - File layouts and Remote Control endpoints are undocumented. Verified with Claude Desktop 1.46388.1, bundled Claude Code 2.1.260, and transcript 2.1.258.
 - Automatic restart also depends on Desktop's private activity log. Missing, rotated, changed, or inconclusive activity evidence means wait, never assume idle. Desktop's idle acknowledgement can arrive about 30 seconds after a response ends.
+- Opening the embedded terminal logs `startShellPty`, not a model turn. That event does not invalidate an idle acknowledgement by itself.
+- On the tested Desktop version, its installed quit guard checks both Code and Cowork activity before accepting a normal quit. New work can therefore veto the quit after our snapshot. The tool never accepts its Quit anyway option. Resumed workers without a completed turn from their current process remain unverified, so they may need a manual quit once idle.
 - Moving history out of a Team organization is your organization's decision.
 - Unofficial. Not affiliated with Anthropic.
 
