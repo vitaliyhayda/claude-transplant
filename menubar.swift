@@ -132,7 +132,7 @@ final class Model: ObservableObject {
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
     @Published private(set) var sweeping = false
-    private var queued: (() -> Void)?
+    private var queued: [String]?
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var progressCompleted: Int?
@@ -216,7 +216,7 @@ final class Model: ObservableObject {
     func canSource(_ account: Account) -> Bool { account.id != to }
 
     func toggle(_ id: String) {
-        guard let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
+        guard !running, let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
         if selectionComplete { excluded = Set(accounts.map(\.id)) }
         clearResult()
         if from.contains(id) { excluded.insert(id) } else { excluded.remove(id) }
@@ -224,6 +224,7 @@ final class Model: ObservableObject {
     }
 
     func selectTarget(_ id: String) {
+        guard !running else { return }
         if selectionComplete { excluded = [] }
         clearResult()
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
@@ -288,32 +289,24 @@ final class Model: ObservableObject {
     }
 
     func move() {
-        if sweeping { queued = { [weak self] in self?.move() }; return }
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
         let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--cloud", "--json"]
-        begin()
-        runOperation(args)
+        start(args)
     }
 
     func undo() {
-        if sweeping { queued = { [weak self] in self?.undo() }; return }
         guard !running else { return }
-        begin()
-        run(["undo", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+        start(["undo", "--json"])
     }
 
     func finishPending() {
-        if sweeping { queued = { [weak self] in self?.finishPending() }; return }
         guard pendingReady else { return }
-        begin()
-        runOperation(["finish", "--json"])
+        start(["finish", "--json"])
     }
 
     func keepLocal() {
-        if sweeping { queued = { [weak self] in self?.keepLocal() }; return }
         guard canKeepLocal else { return }
-        begin()
-        run(["keep-local", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+        start(["keep-local", "--json"])
     }
 
     func begin() {
@@ -403,15 +396,24 @@ final class Model: ObservableObject {
     }
 
     func restartDesktop() {
-        if sweeping { queued = { [weak self] in self?.restartDesktop() }; return }
         guard !running else { return }
-        begin()
-        runOperation(["restart", "--json"])
+        start(["restart", "--json"])
     }
 
     func restoreRestartWarning() {
         skipRestartWarning = false
         UserDefaults.standard.set(false, forKey: "skipRestartWarning")
+    }
+
+    private func start(_ args: [String]) {
+        begin()
+        if sweeping {
+            queued = args
+            progressLabel = "Waiting for background check"
+            badge = "Waiting"
+        } else {
+            runOperation(args)
+        }
     }
 
     private func runOperation(_ args: [String], remember: Bool = true) {
@@ -465,13 +467,19 @@ final class Model: ObservableObject {
         }) { [weak self] status, error in
             guard let self else { return }
             sweeping = false
-            defer { let next = queued; queued = nil; next?() }
+            defer {
+                if let args = queued {
+                    queued = nil
+                    progressLabel = "Preparing sessions"
+                    runOperation(args)
+                }
+            }
             if result == nil, error.contains("another run holds the lock") { return }
             if result != nil, let sweepNote, note == sweepNote {
                 note = ""
                 symbol = "arrow.left.arrow.right"
             }
-            if result != nil { sweepNote = nil }
+            if result != nil { sweepNote = nil; lines.removeAll { $0.0 == "metadata" } }
             let previousNote = note
             if result == nil, status != 0 {
                 lines.append(("background", error))
@@ -482,10 +490,16 @@ final class Model: ObservableObject {
                 note = "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"
             } else if let changed = result?.changed, !changed.isEmpty {
-                note = quantity(changed.count, "moved session changed", "moved sessions changed") + " title or archive state after the move. Snapshots are in the receipt."
-                symbol = "info.circle"
+                let unavailable = changed.filter { $0.fields.contains("record unavailable") }
+                let names = ["title": "title", "isArchived": "archive state", "isStarred": "starred state"]
+                let fields = Set(changed.flatMap(\.fields)).sorted().map { names[$0] ?? $0 }.joined(separator: ", ")
+                note = unavailable.isEmpty
+                    ? quantity(changed.count, "moved session changed", "moved sessions changed") + " " + fields + ". Snapshots are in the receipt."
+                    : quantity(unavailable.count, "moved session record cannot be read", "moved session records cannot be read") + ". Check Details."
+                symbol = unavailable.isEmpty ? "info.circle" : "exclamationmark.triangle"
+                lines.append(("metadata", changed.map { self.identity($0.title, $0.id) + " | " + $0.fields.map { names[$0] ?? $0 }.joined(separator: ", ") }.joined(separator: "\n")))
             }
-            if result?.ok != false, result?.restart == true {
+            if result?.ok != false, result?.restart == true, result?.changed?.contains(where: { $0.fields.contains("record unavailable") }) != true {
                 restartAvailable = true
                 note = "Pending sessions moved. Restart Claude Desktop to refresh this account."
             }

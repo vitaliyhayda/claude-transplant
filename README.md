@@ -127,7 +127,8 @@ Safety:
 - One receipt owns the move, held records, cloud checks, failures, and retries. Another move cannot start until it is complete, kept local, or undone.
 - Records are written to a private temp inode, journaled, then exposed by an atomic no-clobber hard link. A record is either absent or complete.
 - Interrupted retirement or undo resumes from the receipt. A corrupt newest receipt stops undo.
-- Later moves and sweeps compare placed records with their snapshots. Durable differences (title, archive, pin) are saved under `drift/<receipt>` and reported, not overwritten.
+- Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. These display checks do not change the v4.0.0 receipt hashes used by Undo and recovery.
+- Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
 - Lineage follows `forkedFrom` pointers to their roots. Duplicate message ids that differ only in runtime metadata count as sync replays, anything else is refused.
 - A disposable planning cache lives at `~/Library/Application Support/claude-transplant/cache.json`. Every write decision uses live files. Delete it any time.
 
