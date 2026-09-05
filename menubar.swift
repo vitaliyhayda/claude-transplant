@@ -41,7 +41,41 @@ struct Reconciliation: Decodable {
     let error: String
 }
 
+struct RestartWorker: Decodable {
+    let pid: Int
+    let started: String
+    let recordId: String?
+    let title: String?
+    let cwd: String?
+}
+
+struct HeldRecord: Decodable {
+    let id: String
+    let title: String
+}
+
+struct MetadataChange: Decodable {
+    let id: String
+    let title: String?
+    let fields: [String]
+}
+
+struct SweepResult: Decodable {
+    let swept: Bool?
+    let ok: Bool?
+    let error: String?
+    let changed: [MetadataChange]?
+    let cloudChecked: Int?
+    let restart: Bool?
+}
+
 struct Event: Decodable {
+    let plan: Bool?
+    let token: String?
+    let kind: String?
+    let resume: Bool?
+    let affected: [RestartWorker]?
+    let held: [HeldRecord]?
     let stage: String?
     let text: String?
     let live: Bool?
@@ -64,6 +98,7 @@ struct Event: Decodable {
     let problems: [Problem]?
     let note: String?
     let restart: Bool?
+    let restarted: Bool?
     let reconciled: Reconciliation?
     let retry: Bool?
     let undone: String?
@@ -90,6 +125,8 @@ final class Model: ObservableObject {
     @Published var badge = ""
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
+    @Published private var sweeping = false
+    @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var progressCompleted: Int?
     @Published var progressTotal: Int?
@@ -99,11 +136,17 @@ final class Model: ObservableObject {
     private let config: Config?
     private var refreshing = false
     private var pendingResult = false
+    private var pendingPlan: Event?
+    private var operationArgs: [String] = []
+    private var approvalAttempted = false
+    private var poller: AnyCancellable?
+    private var activeIdentity = ""
+    private var panelOpen = false
 
     init(snapshot: Bool = false, config supplied: Config? = nil) {
         self.snapshot = snapshot
         demo = false
-        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
+        let file = Bundle.main.url(forResource: "menubar", withExtension: "json") ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
         config = supplied ?? (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
         if snapshot {
             guard let config, let text = Model.capture(node(config.node), [config.script, "accounts", "--json"]), let decoded = try? JSONDecoder().decode([Account].self, from: Data(text.utf8)) else { snapshotFailed = true; return }
@@ -113,6 +156,10 @@ final class Model: ObservableObject {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         refresh()
+        poller = Timer.publish(every: 15, on: .main, in: .common).autoconnect().sink { [weak self] _ in
+            guard let self, !self.running, !self.sweeping else { return }
+            self.refresh()
+        }
     }
 
     init(demo accounts: [Account]) {
@@ -126,10 +173,11 @@ final class Model: ObservableObject {
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
     var canKeepLocal: Bool { !running && pendingAccounts.contains { $0.pending == "cloud" } }
-    var pendingReady: Bool { !running && activePendingAccount != nil && (config != nil || demo) }
-    var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
+    var pendingReady: Bool { !running && !sweeping && (activePendingAccount != nil || pendingAccounts.contains { $0.pending == "local" }) && (config != nil || demo) }
+    var ready: Bool { !running && !sweeping && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
+        if pendingAccounts.contains(where: { $0.pending == "local" }) { return "Some sessions are still held. Finish pending can restart Claude Desktop." }
         let labels = pendingAccounts.map(\.label).joined(separator: " or ")
         let failures = activePendingAccount?.pendingFailures ?? []
         if let first = failures.first {
@@ -184,6 +232,7 @@ final class Model: ObservableObject {
     }
 
     func panelVisibility(_ visible: Bool) {
+        panelOpen = visible
         if visible { refresh() }
         else if !running { clearResult() }
     }
@@ -195,7 +244,7 @@ final class Model: ObservableObject {
     }
 
     func refresh() {
-        guard !refreshing else { return }
+        guard !refreshing, !running, !sweeping else { return }
         refreshing = true
         var text = ""
         run(["accounts", "--json"], line: { text += $0 }) { [weak self] _, _ in
@@ -204,6 +253,10 @@ final class Model: ObservableObject {
             guard let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             settle()
+            let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
+            let changed = identity != activeIdentity
+            activeIdentity = identity
+            if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty) { sweep() }
         }
     }
 
@@ -211,7 +264,7 @@ final class Model: ObservableObject {
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
         let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--cloud", "--json"]
         begin()
-        run(args, line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+        runOperation(args)
     }
 
     func undo() {
@@ -223,7 +276,7 @@ final class Model: ObservableObject {
     func finishPending() {
         guard pendingReady else { return }
         begin()
-        run(["finish", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+        runOperation(["finish", "--json"])
     }
 
     func keepLocal() {
@@ -242,11 +295,14 @@ final class Model: ObservableObject {
         progressCompleted = nil
         progressTotal = nil
         pendingResult = false
+        pendingPlan = nil
     }
 
     private func handle(_ line: String) {
         guard let data = line.data(using: .utf8), let event = try? JSONDecoder().decode(Event.self, from: data) else { return }
-        if let stage = event.stage, let text = event.text {
+        if event.plan == true {
+            pendingPlan = event
+        } else if let stage = event.stage, let text = event.text {
             if event.live == true {
                 progressCompleted = event.completed
                 progressTotal = event.total
@@ -263,6 +319,12 @@ final class Model: ObservableObject {
             note = event.retry == true ? "Run Undo last again if still wanted" : ""
             restartAvailable = false
         } else if event.done == true {
+            if event.moved == nil, event.note != nil || event.reason != nil {
+                note = event.note ?? event.reason ?? ""
+                pendingResult = event.ok == false
+                restartAvailable = operationArgs.first == "restart" && event.ok == false
+                return
+            }
             let moved = event.moved ?? 0
             let rescued = event.rescued ?? 0
             let cloudArchived = event.cloudArchived ?? 0
@@ -272,6 +334,7 @@ final class Model: ObservableObject {
             let pendingCloud = event.pendingCloud ?? 0
             let pendingUndo = event.pendingUndo ?? []
             let keptLocal = event.keptLocal ?? 0
+            let held = event.held ?? []
             pendingResult = event.complete == false || pendingCloud > 0 || !pendingUndo.isEmpty
             let failed = event.failed ?? []
             if !failed.isEmpty {
@@ -288,6 +351,7 @@ final class Model: ObservableObject {
             if cloudRestored > 0 { outcomes.append(quantity(cloudRestored, "cloud mirror restored", "cloud mirrors restored")) }
             if newerCloud > 0 { outcomes.append(quantity(newerCloud, "newer cloud session left for next move", "newer cloud sessions left for next move")) }
             if pendingCloud > 0 { outcomes.append(quantity(pendingCloud, "cloud check pending", "cloud checks pending")) }
+            if !held.isEmpty { outcomes.append(quantity(held.count, "session held", "sessions held")) }
             if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
             if keptLocal > 0 { outcomes.append("Local move kept, " + quantity(keptLocal, "cloud check cancelled", "cloud checks cancelled")) }
             if moved == 0, retired > 0 { outcomes.append(quantity(retired, "source entry retired", "source entries retired")) }
@@ -296,6 +360,7 @@ final class Model: ObservableObject {
             let summary = outcomes.isEmpty ? "Nothing to move" : outcomes.joined(separator: ", ")
             restartAvailable = event.restart ?? false
             note = summary
+            if event.ok == false, let reason = event.reason { note += ". " + reason }
             notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
         } else if event.undone != nil {
             restartAvailable = event.restart ?? false
@@ -322,29 +387,76 @@ final class Model: ObservableObject {
     }
 
     func restartDesktop() {
-        note = "restarting Claude Desktop"
-        restartAvailable = false
-        DispatchQueue.global().async { [weak self] in
-            let quit = Model.shell("/usr/bin/osascript", ["-e", "quit app \"Claude\""]) == 0
-            var gone = false
-            for _ in 0..<40 {
-                if Model.shell("/usr/bin/pgrep", ["-x", "Claude"]) != 0 { gone = true; break }
-                Thread.sleep(forTimeInterval: 0.25)
-            }
-            let opened = gone && Model.shell("/usr/bin/open", ["-a", "Claude"]) == 0
-            DispatchQueue.main.async { self?.note = quit && opened ? "" : "could not restart Claude Desktop, quit and reopen it yourself" }
+        guard !running, !sweeping else { return }
+        begin()
+        runOperation(["restart", "--json"])
+    }
+
+    func restoreRestartWarning() {
+        skipRestartWarning = false
+        UserDefaults.standard.set(false, forKey: "skipRestartWarning")
+    }
+
+    private func runOperation(_ args: [String], remember: Bool = true) {
+        if remember { operationArgs = args; approvalAttempted = false }
+        run(args, line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+    }
+
+    private func confirmRestart(_ plan: Event) {
+        guard let token = plan.token else { running = false; note = "Restart plan is missing its approval token"; return }
+        var response = NSApplication.ModalResponse.alertFirstButtonReturn
+        var suppress = false
+        if !skipRestartWarning {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = plan.kind == "refresh" ? "Restart Claude Desktop?" : "Restart Claude Desktop to finish moving?"
+            var seen: Set<String> = []
+            let names = (plan.affected ?? []).filter { seen.insert($0.recordId ?? "pid/\($0.pid)").inserted }.map { $0.title ?? "Unidentified Claude session" }
+            alert.informativeText = "All Claude Desktop windows will close, including Chat, Cowork, and background commands. These Code sessions have running workers:\n\n" + (names.isEmpty ? "No Code workers were found." : names.joined(separator: "\n")) + "\n\nRestart begins immediately. Any native Claude quit confirmation remains yours to answer."
+            alert.addButton(withTitle: "Stop and restart")
+            if plan.kind == "move" { alert.addButton(withTitle: "Move only the rest") }
+            alert.addButton(withTitle: "Cancel")
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "Don't show again"
+            NSApp.activate(ignoringOtherApps: true)
+            response = alert.runModal()
+            suppress = alert.suppressionButton?.state == .on
+        }
+        pendingPlan = nil
+        if response == .alertFirstButtonReturn {
+            if suppress { skipRestartWarning = true; UserDefaults.standard.set(true, forKey: "skipRestartWarning") }
+            begin()
+            approvalAttempted = true
+            runOperation(operationArgs + ["--restart-approved", token], remember: false)
+        } else if plan.kind == "move", response == .alertSecondButtonReturn {
+            begin()
+            runOperation(operationArgs + ["--move-only"], remember: false)
+        } else {
+            running = false
+            badge = ""
+            note = "Restart cancelled. No additional sessions moved."
+            refresh()
         }
     }
 
-    nonisolated private static func shell(_ executable: String, _ arguments: [String]) -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return 1 }
-        process.waitUntilExit()
-        return process.terminationStatus
+    private func sweep() {
+        guard !running, !sweeping, !snapshot else { return }
+        sweeping = true
+        var result: SweepResult?
+        run(["sweep", "--json"], line: { line in
+            if let data = line.data(using: .utf8), let decoded = try? JSONDecoder().decode(SweepResult.self, from: data), decoded.swept == true { result = decoded }
+        }) { [weak self] _, _ in
+            guard let self else { return }
+            sweeping = false
+            if let changed = result?.changed, !changed.isEmpty {
+                note = "\(changed.count) moved session(s) have changed metadata. Evidence is saved with the receipt."
+                symbol = "exclamationmark.triangle"
+            }
+            if result?.restart == true {
+                restartAvailable = true
+                note = "Pending sessions moved. Restart Claude Desktop to refresh this account."
+            }
+        }
     }
 
     nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String? {
@@ -362,12 +474,23 @@ final class Model: ObservableObject {
     }
 
     private func finish(_ status: Int32, _ error: String) {
+        if let plan = pendingPlan, status == 0 {
+            if approvalAttempted {
+                pendingPlan = nil
+                running = false
+                badge = ""
+                note = "Open sessions changed after approval. Click Move or Finish pending to review them again."
+                symbol = "exclamationmark.triangle"
+                return
+            }
+            confirmRestart(plan)
+            return
+        }
         running = false
         badge = ""
         progressCompleted = nil
         progressTotal = nil
-        excluded = []
-        to = nil
+        if !pendingResult && status == 0 { excluded = []; to = nil }
         symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
         if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.symbol = "arrow.left.arrow.right" }
@@ -648,6 +771,9 @@ struct Panel: View {
                 Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
+            }
+            if model.skipRestartWarning {
+                Button("Show restart warnings", action: model.restoreRestartWarning).buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(16)
