@@ -132,6 +132,7 @@ final class Model: ObservableObject {
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
     @Published private(set) var sweeping = false
+    private var queued: (() -> Void)?
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var progressCompleted: Int?
@@ -182,10 +183,10 @@ final class Model: ObservableObject {
     var identityLabel: String? { accounts.contains { $0.active == true } ? nil : accounts.first?.identityState == "logged-out" ? "signed out" : "unknown" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
-    var canKeepLocal: Bool { !running && !sweeping && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
-    var pendingReady: Bool { !running && !sweeping && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.active == true ? "finish" : "sign-in")) } && (config != nil || demo) }
+    var canKeepLocal: Bool { !running && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
+    var pendingReady: Bool { !running && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.active == true ? "finish" : "sign-in")) } && (config != nil || demo) }
     var pendingButtonTitle: String { pendingAccounts.contains { $0.pendingAction == "restart" } ? "Stop and restart" : pendingAccounts.contains { $0.pending == "undo" } ? "Finish Undo" : "Finish move" }
-    var ready: Bool { !running && !sweeping && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
+    var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
         let moved = pendingAccounts.compactMap(\.receiptMoved).max() ?? 0
@@ -287,6 +288,7 @@ final class Model: ObservableObject {
     }
 
     func move() {
+        if sweeping { queued = { [weak self] in self?.move() }; return }
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
         let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--cloud", "--json"]
         begin()
@@ -294,18 +296,21 @@ final class Model: ObservableObject {
     }
 
     func undo() {
-        guard !running, !sweeping else { return }
+        if sweeping { queued = { [weak self] in self?.undo() }; return }
+        guard !running else { return }
         begin()
         run(["undo", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
 
     func finishPending() {
+        if sweeping { queued = { [weak self] in self?.finishPending() }; return }
         guard pendingReady else { return }
         begin()
         runOperation(["finish", "--json"])
     }
 
     func keepLocal() {
+        if sweeping { queued = { [weak self] in self?.keepLocal() }; return }
         guard canKeepLocal else { return }
         begin()
         run(["keep-local", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
@@ -398,7 +403,8 @@ final class Model: ObservableObject {
     }
 
     func restartDesktop() {
-        guard !running, !sweeping else { return }
+        if sweeping { queued = { [weak self] in self?.restartDesktop() }; return }
+        guard !running else { return }
         begin()
         runOperation(["restart", "--json"])
     }
@@ -459,6 +465,7 @@ final class Model: ObservableObject {
         }) { [weak self] status, error in
             guard let self else { return }
             sweeping = false
+            defer { let next = queued; queued = nil; next?() }
             if result == nil, error.contains("another run holds the lock") { return }
             if result != nil, let sweepNote, note == sweepNote {
                 note = ""
@@ -775,7 +782,7 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            accountBoard.disabled(model.running || model.sweeping || !model.pendingAccounts.isEmpty)
+            accountBoard.disabled(model.running || !model.pendingAccounts.isEmpty)
             if !model.displaySummary.isEmpty { Divider() }
             if model.running {
                 if let progress = model.progress { Bar(value: progress) } else { ActivityBar() }
@@ -807,7 +814,7 @@ struct Panel: View {
                     if model.pendingReady { Pill(title: model.pendingButtonTitle, prominent: true, enabled: true) { model.finishPending() } }
                     if model.canKeepLocal { Pill(title: "Keep completed", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
                 }
-                Pill(title: "Undo last", prominent: false, enabled: !model.running && !model.sweeping) { model.undo() }
+                Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
