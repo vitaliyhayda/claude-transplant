@@ -889,7 +889,6 @@ enum Demo {
         var durations: [Int] = []
         model.lines = [("inventory", "308 records | 3 already there | 305 to move"), ("move", "305 ✓ | zero-copy"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
         model.note = "305 sessions moved"
-        model.restartAvailable = true
         let size = ImageRenderer(content: Panel().environmentObject(model).environment(\.colorScheme, .dark)).nsImage?.size
         model.lines = []
         model.note = ""
@@ -922,7 +921,6 @@ enum Demo {
         model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
         model.symbol = "checkmark"
         model.note = "305 sessions moved"
-        model.restartAvailable = true
         snap(2400)
         try? JSONSerialization.data(withJSONObject: durations).write(to: root.appendingPathComponent("durations.json"))
         exit(0)

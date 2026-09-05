@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
 import { createReadStream, realpathSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, open, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, link, mkdir, mkdtemp, open, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -110,7 +110,7 @@ export function parseProcesses(processes, commands, app = '/Applications/Claude.
 }
 
 const processTable = (app) => {
-  const options = { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }
+  const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000, env: { ...process.env, LC_ALL: 'C' } }
   const processes = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
   const commands = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
   if ([processes, commands].some((result) => result.error || result.status !== 0)) throw new Error('cannot inspect running workers')
@@ -405,13 +405,18 @@ async function saveAnalysisCache(cache) {
   }, 0)
 }
 
-async function writeNew(file, text, created = () => {}) {
+export async function writeNew(file, text, created = () => {}) {
   await mkdir(path.dirname(file), { recursive: true })
-  const handle = await open(file, 'wx', 0o600)
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`)
+  const handle = await open(temp, 'wx', 0o600)
   try {
-    await created(await handle.stat())
     await handle.writeFile(text)
-  } finally { await handle.close() }
+    await created(await handle.stat())
+    await link(temp, file)
+  } finally {
+    await handle.close()
+    await unlink(temp).catch(() => {})
+  }
 }
 
 async function quarantine(items, dest) {
@@ -909,7 +914,11 @@ const conversation = (entries) => entries.flatMap((entry) => {
   return []
 })
 
-const conversationFromRows = (rows) => conversation(rows.filter((row) => ['user', 'assistant'].includes(row.event_type)).map((row) => row.payload))
+const conversationFromRows = (rows) => {
+  const messages = rows.filter((row) => ['user', 'assistant'].includes(row.event_type))
+  if (messages.some((row) => row.payload?.type !== row.event_type || !row.payload.message || typeof row.payload.message !== 'object' || Array.isArray(row.payload.message))) throw new Error('Remote Control message payload is unreadable')
+  return conversation(messages.map((row) => row.payload))
+}
 
 const orderedConversation = (source, target) => {
   if (!Array.isArray(source) || !Array.isArray(target) || !source.length) return false
@@ -2041,7 +2050,7 @@ const REMOTE_IDLE = new Set([
 const remoteBusy = (session) => session?.connection_status !== 'disconnected' ||
   !Array.isArray(session?.client_presence) || session.client_presence.length > 0 ||
   !REMOTE_IDLE.has(session?.worker_status)
-const remoteInputSha = (rows) => sha(stable(rows.filter((row) => row.event_type === 'user' || row.event_type.startsWith('control_'))))
+const remoteStateSha = (rows) => sha(stable(rows.filter((row) => ['user', 'assistant'].includes(row.event_type) || row.event_type.startsWith('control_'))))
 
 function remoteActionsPending(session) {
   const metadata = session.external_metadata
@@ -2067,7 +2076,7 @@ async function stableRemoteRows(cloud, id) {
   const after = await cloud.session(id)
   assertRemoteIdle(after)
   if (after.last_event_at !== marker) throw new Error('Remote Control history changed while reading')
-  return { rows, marker, inputSha: remoteInputSha(rows), session: after }
+  return { rows, marker, stateSha: remoteStateSha(rows), session: after }
 }
 
 const REMOTE_BLOCKS = new Set(['text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'tool_reference', 'image', 'document'])
@@ -2375,11 +2384,11 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       progress(report, 'cloud', ++archived, matches.length)
       continue
     }
-    let lastEventAt = null, inputSha = null
+    let lastEventAt = null, stateSha = null
     try {
       const current = await stableRemoteRows(cloud, match.session.id)
       lastEventAt = current.marker
-      inputSha = current.inputSha
+      stateSha = current.stateSha
       const currentConversation = conversationFromRows(current.rows)
       if (sha(stable(currentConversation)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
     } catch (error) {
@@ -2395,7 +2404,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       progress(report, 'cloud', ++archived, matches.length)
       continue
     }
-    const pending = { ...remoteReceipt(match), lastEventAt, inputSha, activation }
+    const pending = { ...remoteReceipt(match), lastEventAt, stateSha, activation }
     receipt.remotePending = pending
     await save()
     let attempted = false
@@ -2404,7 +2413,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       await save()
       const current = await stableRemoteRows(cloud, pending.id)
       if (current.marker !== pending.lastEventAt) throw new Error('Remote Control history changed before archival')
-      if (current.inputSha !== pending.inputSha) throw new Error('Remote Control input changed before archival')
+      if (current.stateSha !== pending.stateSha) throw new Error('Remote Control history or input changed before archival')
       attempted = true
       await cloud.archive(pending.id)
       const after = await waitRemote(cloud, pending.id, ['archived'])
@@ -2741,7 +2750,7 @@ export function keepLocal(paths) {
       if (!heldCancelled) return { nothing: true, file, receipt }
       receipt.held = []
       await saveJson(file, receipt)
-      return { file, receipt, cancelled: 0, heldCancelled, labels: [], ok: true, complete: true }
+      return { file, receipt, cancelled: 0, heldCancelled, labels: [], ok: receiptOkay(receipt), complete: true }
     }
     const unsafe = (receipt.verification?.problems ?? []).filter((problem) => checks.some((check) => cloudTagged(problem, check)))
     const refused = unsafe.map((problem) => `${problem.title ?? problem.id} | ${problem.check} verification failed`)
@@ -2777,7 +2786,7 @@ export function keepLocal(paths) {
     receipt.failed = (receipt.failed ?? []).filter((failure) => !checks.some((check) => cloudTagged(failure, check)))
     receipt.cloudError = null
     await saveJson(file, receipt)
-    return { file, receipt, cancelled: checks.length, heldCancelled, labels: checks.map((check) => check.label), ok: true, complete: true }
+    return { file, receipt, cancelled: checks.length, heldCancelled, labels: checks.map((check) => check.label), ok: receiptOkay(receipt), complete: true }
   })
 }
 
@@ -3277,7 +3286,7 @@ async function main(argv) {
       if (result.nothing) return emit({ nothing: true })
       if (result.recoveryRequired) return emit({ done: true, ok: false, recoveryRequired: true, reason: 'Recovery must finish before cloud checks can be cancelled' })
       if (result.refused) return emit({ refused: result.refused, reason: 'Keep local refused because a rescued target failed verification' })
-      return emit({ done: true, ok: result.ok, complete: result.complete, keptLocal: result.cancelled, heldCancelled: result.heldCancelled, labels: result.labels, failed: [] })
+      return emit({ done: true, ok: result.ok, complete: result.complete, keptLocal: result.cancelled, heldCancelled: result.heldCancelled, labels: result.labels, failed: result.receipt.failed, problems: result.receipt.verification?.problems ?? [] })
     }
     if (result.nothing) return out.write('nothing pending\n')
     if (result.recoveryRequired) return out.write('  refused     recovery must finish before cloud checks can be cancelled\n')

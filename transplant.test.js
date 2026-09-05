@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
@@ -9,7 +9,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, executeMove, finishHeld, finishPending, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, semantic, step, sweep, undo, verifyPlaced, withDesktopRestart } from './transplant.js'
+import { accounts, executeMove, finishHeld, finishPending, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, semantic, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -92,6 +92,32 @@ test('process identity separates Desktop descendants, external workers, and reus
   const alternate = parseProcesses(table.replaceAll('/Applications/Claude.app', '/Users/fixture/Applications/Claude.app'), commands)
   assert.equal(alternate.find((row) => row.pid === 11).worker, true)
   assert.equal(alternate.find((row) => row.pid === 12).desktopPid, 10)
+})
+
+test('process inventory handles more than one megabyte of unrelated argv', async () => {
+  const h = await home()
+  const children = Array.from({ length: 9 }, () => spawn('/usr/bin/python3', ['-c', 'import time; time.sleep(30)', 'x'.repeat(120 * 1024)], { stdio: 'ignore' }))
+  try {
+    await Promise.all(children.map((child) => once(child, 'spawn')))
+    const listing = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000 })
+    assert.equal(listing.status, 0)
+    assert.ok(Buffer.byteLength(listing.stdout) > 1024 * 1024)
+    const to = (await accounts(h.paths)).find((row) => row.account === h.acct.T)
+    assert.equal((await inventory([], to, h.paths)).move.length, 0)
+  } finally {
+    for (const child of children) child.kill('SIGTERM')
+    await Promise.all(children.filter((child) => child.pid && child.exitCode === null && child.signalCode === null).map((child) => once(child, 'exit')))
+  }
+})
+
+test('publication exposes complete bytes only after creation evidence is saved', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-publish-')), file = path.join(root, 'record.json'), payload = '{"title":"complete"}\n'
+  await writeNew(file, payload, async (created) => {
+    assert.equal(created.size, Buffer.byteLength(payload))
+    assert.equal(await readFile(file).catch(() => null), null)
+  })
+  assert.equal(await readFile(file, 'utf8'), payload)
+  assert.deepEqual(await readdir(root), ['record.json'])
 })
 
 test('inventory recognizes a live Desktop record id before its CLI uuid enters argv', async () => {
@@ -337,6 +363,25 @@ test('an approved plan moves only after shutdown and keeps cloud calls outside i
   assert.equal(result.receipt.restart.outcome, 'reopened')
 })
 
+test('wrong, modified, and malformed restart approvals never quit Desktop', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const calls = [], io = { inspect: () => desktopFixture(), command: async (file) => { calls.push(file); return { status: 0 } } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  assert.equal((await executeMove([from], to, h.paths, { io, approve: '0'.repeat(64) })).ok, false)
+  const file = path.join(h.paths.state, 'restart-plan.json'), changed = JSON.parse(await readFile(file))
+  changed.held = []
+  await writeFile(file, JSON.stringify(changed))
+  assert.equal((await executeMove([from], to, h.paths, { io, approve: planned.plan.token })).ok, false)
+  assert.deepEqual(calls, [])
+  const malformed = await cli(h.root, ['restart', '--restart-approved', 'invalid', '--json'])
+  assert.equal(malformed.code, 1)
+  assert.match(malformed.stderr, /approval token/)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
 test('failed source authentication stays pending after an approved restart', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -469,6 +514,24 @@ test('a successful held phase cannot hide an earlier placement verification fail
   assert.equal(result.ok, false)
   assert.equal(result.receipt.verification.ok, false)
   assert.ok(result.problems.some((row) => row.id === cold))
+})
+
+test('Keep local reports earlier verification failure while cancelling held work', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const target = path.join(h.dir('T'), `local_${cold}.json`)
+  await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage) => {
+    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  } })
+  const kept = await keepLocal(h.paths)
+  assert.equal(kept.heldCancelled, 1)
+  assert.equal(kept.ok, false)
+  assert.equal(kept.receipt.verification.ok, false)
+  assert.deepEqual(kept.receipt.held, [])
 })
 
 test('Keep local can abandon held work without undoing completed cold moves', async () => {
@@ -2572,6 +2635,23 @@ test('an unsupported remote content block is never rescued or archived', async (
   assert.deepEqual((await readdir(h.dir('Z'))).filter((name) => name.endsWith('.json')), [`local_${SOURCE}.json`])
 })
 
+test('an unreadable assistant payload cannot disappear from remote containment checks', async () => {
+  const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE)
+  let archived = false
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_unreadable_message', title: 'Session 001' })],
+    eventRows: async () => [...remoteRows(entries), { event_type: 'assistant', sequence_num: 2, payload: { type: 'assistant', unknown_body: 'new data' } }],
+    session: async () => remoteState('active'), archive: async () => { archived = true }
+  })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(archived, false)
+  assert.equal(result.ok, false)
+  assert.ok(result.receipt.failed.some((row) => row.error.includes('payload is unreadable')))
+})
+
 test('pending remote actions are refused even when worker status says idle', async () => {
   for (const extra of [{ requires_action_details_list: [{ request_id: 'queued' }] }, { external_metadata: { pending_action: { request_id: 'queued' } } }, { external_metadata: { pending_actions: '[{"request_id":"queued"}]' } }]) {
     const h = await home(), entries = [entry('user', 1, null, SOURCE)]
@@ -2587,21 +2667,23 @@ test('pending remote actions are refused even when worker status says idle', asy
   }
 })
 
-test('changed remote input is refused even when its event marker is unchanged', async () => {
+test('changed remote history or input is refused even when its event marker is unchanged', async () => {
+  for (const added of [{ event_type: 'assistant', sequence_num: 2, payload: entry('assistant', 2, 1, SOURCE) }, { event_type: 'control_request', sequence_num: 2, payload: { type: 'control_request', request_id: 'new', request: { subtype: 'interrupt' } } }]) {
   const h = await home(), entries = [entry('user', 1, null, SOURCE)]
   await h.write(SOURCE, entries)
   await h.record('P', SOURCE)
   let reads = 0, archived = false
   const cloud = cloudFixture(h, {
     list: async () => [remoteSession({ id: 'cse_input', title: 'Session 001' })],
-    eventRows: async () => [...remoteRows(entries), ...(++reads >= 3 ? [{ event_type: 'control_request', sequence_num: 2, payload: { type: 'control_request', request_id: 'new', request: { subtype: 'interrupt' } } }] : [])],
+    eventRows: async () => [...remoteRows(entries), ...(++reads >= 3 ? [added] : [])],
     session: async () => remoteState('active'), archive: async () => { archived = true }
   })
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
   const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
   assert.equal(archived, false)
   assert.equal(result.ok, false)
-  assert.ok(result.receipt.failed.some((row) => row.error.includes('input changed')))
+  assert.ok(result.receipt.failed.some((row) => row.error.includes('history or input changed')))
+  }
 })
 
 test('missing Remote Control readiness fields fail closed', async () => {
