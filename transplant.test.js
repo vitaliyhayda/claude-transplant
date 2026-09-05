@@ -172,6 +172,28 @@ test('a destination arriving after planning is never quarantined by a failed pla
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
 })
 
+test('independent destination arrivals preserve Undo for successfully moved siblings', async () => {
+  for (const identical of [false, true]) {
+    const h = await home(), sibling = id(300)
+    for (const session of [SOURCE, sibling]) {
+      await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+      await h.record('P', session)
+    }
+    const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+    const target = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const record = JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    const foreign = identical ? JSON.stringify(record, null, 2) + '\n' : '{"title":"foreign sibling"}\n'
+    const result = await executeMove([from], to, h.paths, { processes: [], summary: () => writeFileSync(target, foreign) })
+    assert.equal(result.ok, false)
+    assert.equal(result.receipt.sessions.length, 1)
+    assert.equal(await readFile(target, 'utf8'), foreign)
+    assert.equal(result.receipt.retained, undefined)
+    assert.ok((await undo(h.paths)).dest)
+    assert.equal(await readFile(target, 'utf8'), foreign)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${sibling}.json`)))
+  }
+})
+
 test('restart waits for children, moves only after exit, and reopens on move failure', async () => {
   const h = await home()
   let rows = desktopFixture(), time = 0
@@ -228,6 +250,24 @@ test('post-quit deadline exhaustion still sends a bounded reopen request', async
   assert.ok(calls.at(-1).timeout > 0)
   assert.equal(result.ok, false)
   assert.match(result.error, /exceeded its deadline/)
+})
+
+test('a journal failure after quit cannot prevent the reopen request', async () => {
+  const h = await home()
+  let rows = desktopFixture()
+  const plan = await restartPlan(null, h.paths, rows), calls = []
+  const result = await withDesktopRestart(plan, h.paths, async () => {
+    await rename(h.paths.state, h.paths.state + '.saved')
+    await writeFile(h.paths.state, 'state path is unavailable')
+  }, () => {}, { inspect: () => rows, command: async (file) => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } })
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.equal(result.ok, false)
+  assert.match(result.restart.error, /journal could not be saved/)
 })
 
 test('new workers invalidate the reviewed restart scope before any quit', async () => {
@@ -301,6 +341,7 @@ test('failed source authentication stays pending after an approved restart', asy
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
   await h.record('P', SOURCE)
+  await writeFile(h.paths.usage, JSON.stringify({ samples: [] }))
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   let rows = desktopFixture()
   const io = { inspect: () => rows, command: async (file) => {
@@ -409,6 +450,25 @@ test('completed cold records may grow before the held phase finishes', async () 
   const result = await finishHeld(h.paths, { processes: [] })
   assert.equal(result.ok, true)
   assert.equal(result.receipt.sessions.length, 2)
+})
+
+test('a successful held phase cannot hide an earlier placement verification failure', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const target = path.join(h.dir('T'), `local_${cold}.json`)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage) => {
+    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  } })
+  assert.equal(first.receipt.verification.ok, false)
+  assert.deepEqual(first.receipt.failed, [])
+  const result = await finishHeld(h.paths, { processes: [] })
+  assert.equal(result.ok, false)
+  assert.equal(result.receipt.verification.ok, false)
+  assert.ok(result.problems.some((row) => row.id === cold))
 })
 
 test('Keep local can abandon held work without undoing completed cold moves', async () => {
@@ -913,6 +973,19 @@ test('a contained destination supersedes only its Desktop record', async () => {
   assert.ok(await readFile(olderTranscript))
   assert.deepEqual((await readdir(h.dir('Z'))).map((f) => f.slice(6, -5)), [id(945)])
   assert.equal((await readdir(h.dir('P'))).length, 1)
+})
+
+test('an existing bridge makes target supersession a separate refusal, not a restart', async () => {
+  const h = await home()
+  const entries = [entry('user', 940, null, id(940)), entry('assistant', 941, 940, id(940))]
+  await h.write(id(940), [...entries, entry('user', 942, 941, id(940))])
+  await h.record('P', id(940))
+  await h.write(id(945), fork(entries, id(940), id(945), 'Q'))
+  await h.record('Z', id(945), { bridgeSessionIds: ['session_existing'] })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+  const rows = desktopFixture(id(945))
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: rows })
+  assert.equal(await restartPlan(inv, h.paths, rows), null)
 })
 
 test('a target without a Desktop record id never covers and retires a valid source', async () => {
@@ -1877,6 +1950,23 @@ test('automatic cloud retries bind their receipt and claim backoff under the mut
   assert.equal(receipt.automaticCloudAttempt.key, `${from.account}/${from.org}`)
 })
 
+test('a successful cloud phase preserves an earlier local verification failure', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE)
+  await h.record('T', id(997))
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.T), to = all.find((row) => row.account === h.acct.Z)
+  const target = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths, (stage) => {
+    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  })
+  assert.equal(first.receipt.verification.ok, false)
+  const result = await finishPending(h.paths, { cloud: cloudFixture(h, { account: from.account, org: from.org }) })
+  assert.equal(result.ok, false)
+  assert.equal(result.receipt.verification.ok, false)
+  assert.ok(result.problems.some((row) => row.id === SOURCE))
+})
+
 test('Finish pending preserves a record-only bridge identity after local rehome', async () => {
   const h = await home()
   const session = id(709)
@@ -2480,6 +2570,38 @@ test('an unsupported remote content block is never rescued or archived', async (
   assert.equal(archived, false)
   assert.match(result.receipt.failed[0].error, /unsupported content block/)
   assert.deepEqual((await readdir(h.dir('Z'))).filter((name) => name.endsWith('.json')), [`local_${SOURCE}.json`])
+})
+
+test('pending remote actions are refused even when worker status says idle', async () => {
+  for (const extra of [{ requires_action_details_list: [{ request_id: 'queued' }] }, { external_metadata: { pending_action: { request_id: 'queued' } } }, { external_metadata: { pending_actions: '[{"request_id":"queued"}]' } }]) {
+    const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+    await h.write(SOURCE, entries)
+    await h.record('P', SOURCE)
+    let archived = false
+    const cloud = cloudFixture(h, { list: async () => [remoteSession({ id: 'cse_queued', title: 'Session 001' })], eventRows: async () => remoteRows(entries), session: async () => remoteState('active', extra), archive: async () => { archived = true } })
+    const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+    const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+    assert.equal(archived, false)
+    assert.equal(result.ok, false)
+    assert.ok(result.receipt.failed.some((row) => row.error.includes('pending actions')))
+  }
+})
+
+test('changed remote input is refused even when its event marker is unchanged', async () => {
+  const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE)
+  let reads = 0, archived = false
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_input', title: 'Session 001' })],
+    eventRows: async () => [...remoteRows(entries), ...(++reads >= 3 ? [{ event_type: 'control_request', sequence_num: 2, payload: { type: 'control_request', request_id: 'new', request: { subtype: 'interrupt' } } }] : [])],
+    session: async () => remoteState('active'), archive: async () => { archived = true }
+  })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(archived, false)
+  assert.equal(result.ok, false)
+  assert.ok(result.receipt.failed.some((row) => row.error.includes('input changed')))
 })
 
 test('missing Remote Control readiness fields fail closed', async () => {
@@ -3098,6 +3220,34 @@ test('an interrupted rehome removes only its unchanged target record', async () 
   assert.equal(await readFile(targetRecord).catch(() => null), null)
   assert.deepEqual(await readdir(path.join(h.paths.state, 'quarantine', at, 'failed')), [`local_${SOURCE}.json`])
   assert.equal(JSON.parse(await readFile(path.join(h.paths.state, `${at}.json`), 'utf8')).cloudChecks[0].status, 'cancelled')
+})
+
+test('interrupted placement leaves a foreign byte-identical target untouched', async () => {
+  for (const replaced of [false, true]) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE)
+    const target = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const text = JSON.stringify(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))), null, 2) + '\n'
+    await writeFile(target, text)
+    const identity = await stat(target)
+    if (replaced) {
+      await rename(target, target + '.original')
+      await writeFile(target, text)
+    }
+    const at = '2099-01-02T00-00-00-000'
+    const receipt = { at, sessions: [], superseded: [], failed: [], finalizing: true, pending: {
+      strategy: 'rehome', id: SOURCE, title: 'Interrupted', targetId: SOURCE, made: [target],
+      recordSha: createHash('sha256').update(text).digest('hex'), creationRequired: true,
+      ...(replaced ? { created: { dev: identity.dev, ino: identity.ino } } : {})
+    } }
+    await mkdir(h.paths.state, { recursive: true })
+    const file = path.join(h.paths.state, at + '.json')
+    await writeFile(file, JSON.stringify(receipt))
+    assert.ok((await undo(h.paths)).reconciled)
+    assert.equal(await readFile(target, 'utf8'), text)
+    assert.equal(JSON.parse(await readFile(file)).retained, undefined)
+  }
 })
 
 test('interrupted rehome rollback keeps shared transcript and sidecar changes', async () => {

@@ -138,6 +138,7 @@ final class Model: ObservableObject {
     private var poller: AnyCancellable?
     private var activeIdentity = ""
     private var panelOpen = false
+    private var sweepNote: String?
 
     init(snapshot: Bool = false, config supplied: Config? = nil) {
         self.snapshot = snapshot
@@ -446,8 +447,14 @@ final class Model: ObservableObject {
         }) { [weak self] status, error in
             guard let self else { return }
             sweeping = false
+            if result == nil, error.contains("another run holds the lock") { return }
+            if result != nil, let sweepNote, note == sweepNote {
+                note = ""
+                symbol = "arrow.left.arrow.right"
+            }
+            if result != nil { sweepNote = nil }
+            let previousNote = note
             if result == nil, status != 0 {
-                if error.contains("another run holds the lock") { return }
                 note = error.isEmpty ? "Background check stopped before reporting a result. Reopen the panel to retry." : error
                 symbol = "exclamationmark.triangle"
             } else if let error = result?.error, !error.isEmpty {
@@ -461,6 +468,7 @@ final class Model: ObservableObject {
                 restartAvailable = true
                 note = "Pending sessions moved. Restart Claude Desktop to refresh this account."
             }
+            if note != previousNote, !note.isEmpty { sweepNote = note }
         }
     }
 
@@ -540,7 +548,7 @@ final class Model: ObservableObject {
             done(1, error.localizedDescription)
             return
         }
-        if ["accounts", "sweep"].contains(args.first ?? "") {
+        if args.first == "accounts" {
             DispatchQueue.global().asyncAfter(deadline: .now() + 60) { if process.isRunning { process.terminate() } }
         }
         DispatchQueue.global().async {

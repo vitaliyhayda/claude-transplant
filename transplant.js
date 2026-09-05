@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
 import { createReadStream, realpathSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, open, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -18,7 +18,7 @@ const ORG_URL = new RegExp(`/(?:organizations|bootstrap)/(${UUID_PATTERN})(?:[/?
 const NOTE = 'restart Claude Desktop to see them'
 const WORKER_OWNS = 'running worker owns the session'
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
-const desktopExecutable = (file) => file.endsWith('/Claude.app/Contents/MacOS/Claude')
+const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
 const RESTART_BUDGET = 30_000
 const REOPEN_RESERVE = 8_000
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
@@ -65,6 +65,7 @@ const localCloudPending = (account, retiring = new Set()) => Boolean(account && 
 const accountLabel = (row) => row.accountLabel ?? row.label ?? `${short(row.account)} · ${short(row.org)}`
 const openCloudChecks = (receipt) => (receipt.cloudChecks ?? []).filter((check) => !['complete', 'cancelled'].includes(check.status))
 const cloudCheckLabels = (receipt) => [...new Set(openCloudChecks(receipt).map((check) => check.label))]
+const receiptOkay = (receipt) => receipt.verification?.ok !== false && !receipt.failed?.length
 const cancelCloudChecks = (receipt) => {
   for (const check of openCloudChecks(receipt)) {
     check.status = 'cancelled'
@@ -145,7 +146,7 @@ export async function restartPlan(inv, paths, table = processTable(paths.claudeA
       return target && !retirementOwnership(inv, release(source), { history: target })
         ? [...(source.members ?? [source]), target].filter((row) => row.worker && !rehomeOwnership(release(row))).map((row) => ({ row, source })) : []
     }),
-    ...inv.move.flatMap((source) => inv.targets.filter((row) => row.worker && included(row, source) && !rehomeOwnership(release(row))).map((row) => ({ row, source })))
+    ...inv.move.flatMap((source) => inv.targets.filter((row) => row.worker && included(row, source) && !ownership(release(row))).map((row) => ({ row, source })))
   ] : []
   const held = []
   const add = (row, source, matches) => {
@@ -253,8 +254,6 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!remaining || !appProcess(paths, remaining)) {
       state.outcomeBeforeReopen = state.outcome
       state.outcome = 'reopening'
-      await save()
-      report('desktop', 'Reopening Claude Desktop', { live: true })
       const remaining = deadline - now()
       if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
       const opened = await run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining))
@@ -263,10 +262,15 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       if (state.outcome === 'reopened') state.reopenedAt = new Date().toISOString()
       else state.error = 'Could not confirm Claude Desktop reopened. Reopen it manually.'
     }
-    await save()
-    if (result?.file && result.receipt) {
-      result.receipt.restart = { ...state }
-      await saveJson(result.file, result.receipt)
+    try {
+      await save()
+      if (result?.file && result.receipt) {
+        result.receipt.restart = { ...state }
+        await saveJson(result.file, result.receipt)
+      }
+    } catch (error) {
+      state.error = `Restart journal could not be saved: ${error.message}`
+      failure ??= error
     }
   }
   return { result, restart: state, error: failure?.message ?? state.error, ok: state.outcome === 'reopened' && !state.error && result?.ok !== false }
@@ -401,9 +405,13 @@ async function saveAnalysisCache(cache) {
   }, 0)
 }
 
-async function writeNew(file, text) {
+async function writeNew(file, text, created = () => {}) {
   await mkdir(path.dirname(file), { recursive: true })
-  await writeFile(file, text, { flag: 'wx', mode: 0o600 })
+  const handle = await open(file, 'wx', 0o600)
+  try {
+    await created(await handle.stat())
+    await handle.writeFile(text)
+  } finally { await handle.close() }
 }
 
 async function quarantine(items, dest) {
@@ -1341,7 +1349,10 @@ async function rehomeOne(s, to, journal, guard) {
   const recordSha = sha(recordText)
   await journal({ strategy: 'rehome', recordSha })
   guard.check?.()
-  await writeNew(record, recordText)
+  await writeNew(record, recordText, async ({ dev, ino }) => {
+    guard.created.set(record, { dev, ino })
+    await journal({ created: { dev, ino } })
+  })
   const [afterTranscriptFingerprint, afterRecord, afterSidecars] = await Promise.all([
     fingerprint(s.transcript),
     readFile(s.file, 'utf8'),
@@ -1792,16 +1803,18 @@ async function reconcileFiles(paths, options = {}) {
   }
   const recovered = []
   if (receipt.pending) {
-    const { id, title, targetId, made, strategy } = receipt.pending
+    const { id, title, targetId, made, strategy, creationRequired, created } = receipt.pending
     if (!['rehome', 'remote'].includes(strategy)) throw new Error('unsupported pending receipt strategy')
+    const found = creationRequired ? await stat(made[0]).catch(() => null) : null
+    const foreign = creationRequired && found && (!created || found.dev !== created.dev || found.ino !== created.ino)
     const used = strategy === 'rehome'
       ? await readFile(made[0]).then((raw) => Boolean(receipt.pending.recordSha && sha(raw) !== receipt.pending.recordSha), () => false)
       : await changed(made[0], targetId, knownOf(receipt.pending))
-    if (!used) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
+    if (!used && !foreign) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
     const changedCopy = strategy === 'rehome' ? 'target record' : 'remote rescue'
-    const error = used ? `interrupted, ${changedCopy} changed since, left in place` : 'interrupted'
-    receipt.failed.push({ id, title, targetId, artifacts: made, retained: used, error })
-    if (used) receipt.retained = [...(receipt.retained ?? []), { id, title, targetId, artifacts: made }]
+    const error = foreign ? 'interrupted, independently created target left in place' : used ? `interrupted, ${changedCopy} changed since, left in place` : 'interrupted'
+    receipt.failed.push({ id, title, targetId, artifacts: made, retained: used && !foreign, error })
+    if (used && !foreign) receipt.retained = [...(receipt.retained ?? []), { id, title, targetId, artifacts: made }]
     receipt.pending = null
     recovered.push({ title, error })
   }
@@ -2028,10 +2041,21 @@ const REMOTE_IDLE = new Set([
 const remoteBusy = (session) => session?.connection_status !== 'disconnected' ||
   !Array.isArray(session?.client_presence) || session.client_presence.length > 0 ||
   !REMOTE_IDLE.has(session?.worker_status)
+const remoteInputSha = (rows) => sha(stable(rows.filter((row) => row.event_type === 'user' || row.event_type.startsWith('control_'))))
+
+function remoteActionsPending(session) {
+  const metadata = session.external_metadata
+  if (metadata != null && (typeof metadata !== 'object' || Array.isArray(metadata))) return true
+  return [session.requires_action_details_list, metadata?.pending_action, metadata?.pending_actions].some((value) => {
+    if (typeof value === 'string') { try { value = JSON.parse(value) } catch { return true } }
+    return value != null && !(Array.isArray(value) && value.length === 0)
+  })
+}
 
 function assertRemoteIdle(session) {
   if (!REMOTE_OPEN.has(session?.status)) throw new Error(`Remote Control status changed to ${session?.status ?? 'unknown'}`)
   if (remoteBusy(session)) throw new Error('Remote Control session is not proven disconnected and idle')
+  if (remoteActionsPending(session)) throw new Error('Remote Control has pending actions or unreadable action state')
   if (!['string', 'number'].includes(typeof session.last_event_at)) throw new Error('Remote Control event marker is missing')
   return session.last_event_at
 }
@@ -2043,7 +2067,7 @@ async function stableRemoteRows(cloud, id) {
   const after = await cloud.session(id)
   assertRemoteIdle(after)
   if (after.last_event_at !== marker) throw new Error('Remote Control history changed while reading')
-  return { rows, marker, session: after }
+  return { rows, marker, inputSha: remoteInputSha(rows), session: after }
 }
 
 const REMOTE_BLOCKS = new Set(['text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'tool_reference', 'image', 'document'])
@@ -2351,10 +2375,11 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       progress(report, 'cloud', ++archived, matches.length)
       continue
     }
-    let lastEventAt = null
+    let lastEventAt = null, inputSha = null
     try {
       const current = await stableRemoteRows(cloud, match.session.id)
       lastEventAt = current.marker
+      inputSha = current.inputSha
       const currentConversation = conversationFromRows(current.rows)
       if (sha(stable(currentConversation)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
     } catch (error) {
@@ -2370,16 +2395,16 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       progress(report, 'cloud', ++archived, matches.length)
       continue
     }
-    const pending = { ...remoteReceipt(match), lastEventAt, activation }
+    const pending = { ...remoteReceipt(match), lastEventAt, inputSha, activation }
     receipt.remotePending = pending
     await save()
     let attempted = false
     try {
       await applyActivation(pending.activation, row)
       await save()
-      const current = await cloud.session(pending.id)
-      assertRemoteIdle(current)
-      if (current.last_event_at !== pending.lastEventAt) throw new Error('Remote Control history changed before archival')
+      const current = await stableRemoteRows(cloud, pending.id)
+      if (current.marker !== pending.lastEventAt) throw new Error('Remote Control history changed before archival')
+      if (current.inputSha !== pending.inputSha) throw new Error('Remote Control input changed before archival')
       attempted = true
       await cloud.archive(pending.id)
       const after = await waitRemote(cloud, pending.id, ['archived'])
@@ -2521,7 +2546,7 @@ async function transfer(inv, to, paths, report, context = {}) {
   const previousSuperseded = receipt.superseded.length
   const save = () => saveJson(file, receipt)
   let events = 0
-  const rehomeGuard = { workers: workers(), taskSessions: new Map(), check: context.check }
+  const rehomeGuard = { workers: workers(), taskSessions: new Map(), created: new Map(), check: context.check }
   for (const file of new Set([...inv.move.map((row) => row.account.taskFile), to.taskFile])) {
     rehomeGuard.taskSessions.set(file, await taskSessions(file))
   }
@@ -2531,7 +2556,7 @@ async function transfer(inv, to, paths, report, context = {}) {
     context.check?.()
     const targetId = s.id
     const made = [path.join(to.dir, path.basename(s.file))]
-    receipt.pending = { strategy: 'rehome', id: s.id, title: s.title, targetId, made, recordSha: null }
+    receipt.pending = { strategy: 'rehome', id: s.id, title: s.title, targetId, made, recordSha: null, creationRequired: true }
     await save()
     try {
       if (s.record.forkedFromSessionId && !landedRecordIds.has(s.record.forkedFromSessionId)) throw new Error('parent Desktop record did not move')
@@ -2541,9 +2566,12 @@ async function transfer(inv, to, paths, report, context = {}) {
       events += row.events
     } catch (error) {
       const raw = await readFile(made[0]).catch(() => null)
-      const ours = raw && receipt.pending.recordSha && sha(raw) === receipt.pending.recordSha
-      if (ours) await quarantine(made, path.join(paths.state, 'quarantine', at, 'failed'))
-      const retained = Boolean(raw && !ours)
+      const created = rehomeGuard.created.get(made[0])
+      const found = await stat(made[0]).catch(() => null)
+      const ours = created && found?.dev === created.dev && found?.ino === created.ino
+      const unchanged = ours && raw && receipt.pending.recordSha && sha(raw) === receipt.pending.recordSha
+      if (unchanged) await quarantine(made, path.join(paths.state, 'quarantine', at, 'failed'))
+      const retained = Boolean(ours && raw && !unchanged)
       if (retained) receipt.retained = [...(receipt.retained ?? []), { id: s.id, title: s.title, targetId, artifacts: made }]
       receipt.failed.push({ id: s.id, title: s.title, error: error.message, ...(retained ? { retained, targetId, artifacts: made } : {}) })
     }
@@ -2572,7 +2600,7 @@ async function transfer(inv, to, paths, report, context = {}) {
   const rescueIds = new Set(rescued.rows.map((row) => row.targetId))
   const recordedProblems = problems.map((problem) => rescueIds.has(problem.id) ? taggedCloudFailure(inv.cloud, problem) : problem)
   const priorProblems = context.existing ? receipt.appendCheckpoint.verification?.problems ?? [] : []
-  receipt.verification = { ok: ok && !priorProblems.length, problems: [...priorProblems, ...recordedProblems] }
+  receipt.verification = { ok: ok && receipt.appendCheckpoint?.verification?.ok !== false && !priorProblems.length, problems: [...priorProblems, ...recordedProblems] }
   await save()
   await retire(inv, receipt, paths, at, problems, save, report, context.check)
   if (inv.cloudRequested) {
@@ -2609,9 +2637,9 @@ async function transfer(inv, to, paths, report, context = {}) {
     report('verify', [...lines, `${Math.round((Date.now() - started) / 1000)}s`].join(' | '))
   }
   if (retired) report('retired', `${count(retired)} source records → quarantine | transcripts untouched`)
-  const resultOkay = ok && receipt.failed.length === 0
+  const resultOkay = receiptOkay(receipt)
   const newerCloud = receipt.cloudChecks.reduce((total, check) => total + (check.later?.length ?? 0), 0)
-  return { file, receipt, checks: lines, problems, ok: resultOkay, complete: pendingCloud === 0 && !receipt.held.length, added: receipt.sessions.length - previousCount, targetChanged: receipt.sessions.length > previousCount || receipt.superseded.slice(previousSuperseded).some((row) => !row.source), held: receipt.held, pendingCloud, pendingLabels: cloudCheckLabels(receipt), newerCloud }
+  return { file, receipt, checks: lines, problems: receipt.verification.problems, ok: resultOkay, complete: pendingCloud === 0 && !receipt.held.length, added: receipt.sessions.length - previousCount, targetChanged: receipt.sessions.length > previousCount || receipt.superseded.slice(previousSuperseded).some((row) => !row.source), held: receipt.held, pendingCloud, pendingLabels: cloudCheckLabels(receipt), newerCloud }
 }
 
 export function finishPending(paths, options = {}) {
@@ -2680,7 +2708,7 @@ export function finishPending(paths, options = {}) {
     const completedRemote = receipt.remote.slice(beforeRemote)
     const pendingCloud = openCloudChecks(receipt).length
     const failed = receipt.failed.filter((failure) => cloudTagged(failure, cloud))
-    const ok = verification.ok && failed.length === 0
+    const ok = receiptOkay(receipt)
     return {
       file,
       receipt,
@@ -2693,7 +2721,7 @@ export function finishPending(paths, options = {}) {
       cloudChecked: 1,
       newerCloud: inv.cloud.later.length,
       failed,
-      problems: verification.problems,
+      problems: receipt.verification.problems,
       checks: verification.lines,
       restart: rescued.rows.length > 0 || completedRemote.length > 0
     }
@@ -2759,6 +2787,7 @@ export const move = (inv, to, paths, report = () => {}) => locked(paths, async (
 })
 
 export function executeMove(from, to, paths, options = {}) {
+  options = { ...options, cloudRequested: options.cloudRequested === true || Boolean(options.cloud) }
   const report = options.report ?? (() => {})
   const now = options.io?.now ?? (() => performance.now())
   const approvedAt = options.approve ? options.approvalStartedAt ?? now() : null
@@ -2806,7 +2835,7 @@ export function executeMove(from, to, paths, options = {}) {
       if (!saved || saved.fingerprint !== plan.fingerprint) {
         const active = options.cloud ?? await current(paths)
         const proposal = { version: 1, ...plan, kind, resume: Boolean(existing), receiptFile: existing?.file ?? null, selection: chosen, requestedAt, createdAt: new Date().toISOString(), nonce: randomUUID(),
-          deferredCloudSources: options.cloudRequested && chosen?.from.some((source) => sameAccount(source, active)) ? [accountRef(chosen.from.find((source) => sameAccount(source, active)))] : [] }
+          deferredCloudSources: options.cloudRequested ? chosen?.from.filter((source) => (!active.account || source.account === active.account) && (!active.org || source.org === active.org)).map(accountRef) ?? [] : [] }
         proposal.token = sha(stable(proposal))
         await saveJson(planFile, proposal)
         return { plan: proposal, ok: true }
@@ -2825,7 +2854,9 @@ export function executeMove(from, to, paths, options = {}) {
       return { ...(restarted.result ?? {}), ok: restarted.ok && restarted.result?.ok !== false,
         restartOutcome: restarted.restart, restarted: restarted.restart.outcome === 'reopened', reason: restarted.error }
     }
-    if (!chosen) return { nothing: true, ok: true }
+    if (!chosen) return inspect().filter((row) => desktopExecutable(row.executable)).length > 1
+      ? { ok: false, reason: 'More than one Claude Desktop instance is running. Close the extra instance before restarting.' }
+      : { nothing: true, ok: true }
     const { inv, target } = initial
     inv.held = plan?.held ?? []
     const heldFiles = new Set(inv.held.flatMap((row) => row.sources.map((source) => source.file)))
@@ -2870,6 +2901,7 @@ async function inspectPlaced(paths) {
   for (const row of receipt.sessions ?? []) {
     if (!row.recordSnapshot || !destination || path.dirname(row.record) !== destination || !UUID.test(row.targetId)) continue
     const raw = await readFile(row.record).catch(() => null)
+    if (raw && sha(raw) === row.recordSha) continue
     let record
     try { if (raw) record = JSON.parse(raw) } catch {}
     const before = observedRecord(row.recordSnapshot)
