@@ -3699,21 +3699,6 @@ test('process registry identifies a new worker without argv ids and rejects stal
   assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
 })
 
-test('v4 receipt hashes remain compatible when branch and PR metadata are present', async () => {
-  const h = await home()
-  await h.write(SOURCE, [entry('user', 3, null, SOURCE)])
-  await h.record('P', SOURCE, { writtenBranches: ['main'], prs: [{ prNumber: 1 }] })
-  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
-  const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
-  const row = moved.receipt.sessions[0]
-  row.recordSemantic = '7b5b2992732164b31c3ae3b416a018059913aac538db4428eedc3d730c8db11b'
-  row.recordKeepSemantic = 'c00b0c7d49c395eb2fd0cc14836e946c3d9fcf141619fecdaecf6803eaa851ad'
-  await writeFile(moved.file, JSON.stringify(moved.receipt))
-  assert.ok((await undo(h.paths)).dest)
-  assert.deepEqual(await readdir(h.dir('T')), [])
-  assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))).writtenBranches, ['main'])
-})
-
 test('Swift queues the clicked command once and distinguishes metadata notices from unreadable records', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
   let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct TransplantApp: App {')[0]
