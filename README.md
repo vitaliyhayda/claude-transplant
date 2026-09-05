@@ -6,7 +6,7 @@
 
 ## What it does
 
-Claude Desktop lists each Claude Code session under the account and organization that created it. Switch accounts and the history stays behind. claude-transplant moves every eligible local Desktop record immediately, regardless of which account is signed in. The transcript and sidecars stay where they are, the session keeps its id, nothing is copied. Remote Control runs for the active source. An inactive source creates no pending check when every readable unarchived local conversation moved, while unreadable or unarchived records left behind remain pending. No model runs and no artifact is recreated. `undo` restores completed work and cancels unfinished cloud sources as one logical move. macOS only.
+Claude Desktop lists each Claude Code session under the account and organization that created it. Switch accounts and the history stays behind. claude-transplant moves every eligible local Desktop record immediately, regardless of which account is signed in. The transcript and sidecars stay where they are, the session keeps its id, nothing is copied. A session owned by a Desktop worker offers an explicit restart or Move only the rest. There is no idle detector or idle wait. Remote Control runs for the active source, and an inactive source is left pending only when unreadable or unarchived local records remain. No model runs and no artifact is recreated. `undo` restores completed work and cancels unfinished cloud sources as one logical move. macOS only.
 
 ## Install
 
@@ -17,15 +17,16 @@ npx claude-transplant menubar
 npx claude-transplant
 ```
 
-To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v3.0.1` or a commit hash to pin.
+To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, append a published tag or commit hash to pin.
 
-The menubar shows two columns of email over plan, with FROM on the left and TO on the right. TO starts on the most recently used account other than the signed-in one, while every other account starts selected as a source. Uncheck only the accounts to leave behind. Curves converge on TO, chevrons show direction, destination changes swap lane identity, and source changes fade only that lane. Long inventories scroll together. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one is active. Keep local abandons pending cloud work without reversing successful local movement. It starts at login, shows progress in the icon, and posts a notification when done. The app bundles its own CLI, so run the menubar command again after upgrading. Use `menubar --snapshot panel.png` to render the live panel without installing it, or use `menubar --remove` to uninstall. The animation above is rendered from the same Swift panel.
+The menubar shows two columns of email over plan, FROM on the left and TO on the right. When the active identity is known, TO starts on the most recently used account other than the signed-in one and every other account starts selected as a source. When it is unknown, choose TO yourself. Uncheck only the accounts to leave behind. Curves converge on TO, chevrons show direction, and a destination change swaps lane identity while a source change fades only that lane. The active account is tagged, pending sources are tagged, an open local session offers Stop and restart, and Finish move continues the same receipt. The app quietly retries held local work when its workers stop and source cleanup when the source account becomes active. Keep completed cancels the remaining work without reversing completed moves. Results are one sentence with Details collapsed, and the selection clears after a completed operation. It starts at login, shows progress in the icon, and posts a notification when done. The app bundles its own CLI, so run the menubar command again after upgrading. `menubar --snapshot panel.png` renders the live panel without installing it, `menubar --remove` uninstalls, and `--demo <dir>` renders the animation above from the same panel.
 
 ```
 From  ↑↓ move · space select · enter next
   ❯ ◉ you@work.com · Acme Inc.    161 | 2h ago | acme-api | active
     ◉ you@work.com · Personal     157 | 1d ago | acme-api
     ○ you@home.com · Personal       3 | 5d ago | notes
+    ○ you@work2.com · Northwind     12 | 4m ago | northwind
 
 To    ↑↓ move · enter confirm
   ❯ ● you@home.com · Personal       3 | 5d ago | notes
@@ -41,7 +42,6 @@ To    ↑↓ move · enter confirm
 
   receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11-208.json
   undo        npx claude-transplant undo
-  then        restart Claude Desktop to see them
 ```
 
 ## Commands
@@ -51,8 +51,12 @@ To    ↑↓ move · enter confirm
 | `claude-transplant` | pick From and To, move, print a receipt |
 | `claude-transplant --dry-run` | plan only and write nothing, refuses crash recovery or an open move, with `--cloud` it reads remote metadata and history |
 | `claude-transplant undo` | quarantine the last move, restore the source entries, refused if a target changed or a source cannot be restored |
-| `claude-transplant finish` | check the active pending source, retry its failures, or continue a staged cloud Undo |
-| `claude-transplant keep-local` | cancel pending or failed cloud sources without reversing completed local movement |
+| `claude-transplant finish` | finish held local records, check the active pending cloud source, or continue a staged cloud Undo |
+| `claude-transplant sweep` | verify placed metadata and quietly retry eligible pending work, never request a new restart |
+| `claude-transplant restart` | display a plan for the existing Desktop refresh action |
+| `--move-only` | move eligible records and leave Desktop-owned records held in the same receipt |
+| `--restart-approved <token>` | approve the exact engine plan printed by the prior move, finish, or restart call |
+| `claude-transplant keep-local` | cancel held work and pending cloud checks without reversing completed moves |
 | `claude-transplant accounts` | list accounts |
 | `claude-transplant menubar` | install the menubar app, `--snapshot <png>` renders live accounts, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
@@ -68,7 +72,8 @@ To    ↑↓ move · enter confirm
 - compatible source versions: the same history exists in several transcript files, blocked unless the target already holds every version, since moving it would mean merging
 - grew apart: overlapping versions with different messages or state, all move
 - already there: the target already holds every message and sidecar file
-- blocked: needs merging, has a collision, an unresolved parent, or is owned by a scheduled task, notification route, or running worker, named and left untouched
+- held: a Desktop worker owns a required source or destination record, restart approval is offered and declined work stays in the receipt
+- blocked: needs merging, has a collision, an unresolved parent, or is owned by a scheduled task, notification route, or external CLI worker, named and left untouched
 - retired: source entries moved to quarantine after verification, including already-there ones
 - cloud mirrors: active or paused Remote Control rows found under the signed-in source
 - cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads, with no model call
@@ -78,17 +83,25 @@ To    ↑↓ move · enter confirm
 
 Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, and Desktop's agent-mode records. Known login pairs appear even before their Desktop record directory exists. Personal-plan organizations show as Personal. An account with no known email shows a uuid prefix, session count, last activity, and most common project folder.
 
+Active identity comes from the newest complete account and organization initialization entry in Claude Desktop's `main.log` and its numbered rotations, accepted only from the current Desktop process lifetime. A newer logout, an unfinished switch, an initialization failure, a conflict with Desktop's account configuration, or no usable entry clears the answer, and the panel shows unknown or signed out. There is no inactivity expiry, no Sentry or usage inference, no Keychain access, and no network request for the badge. One resolver supplies the badge, the destination suggestion, and pending-source detection. Cloud mutations authenticate the account and organization independently before writing. Desktop must be running to resolve its active identity.
+
 ## How it works
 
 A session is three files that can disagree: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. The transcript pool is shared by every account on the Mac, so a move writes the same record into the target organization with the same `cliSessionId`, verifies the transcript, sidecars, and both records are unchanged, then parks the source record in quarantine. Ten round trips keep one transcript.
 
-Remote Control adds a fourth, server-owned layer. With `--cloud`, claude-transplant reads whichever selected source is active through Claude Desktop's authenticated session and hashes durable user and assistant message shapes. An inaccessible source becomes pending only when unreadable or unarchived local records remain after the move. Sign into a pending source and run `finish`, or click Finish pending, to inspect it without repeating the local move. A failed source keeps its remote session active and remains retryable. If one local target contains the remote history, that record becomes the destination. A bridge id links the remote row to its local session when available. Otherwise, one same-title target must share eight consecutive exact remote messages before it can anchor a separate companion whose supported remote message payloads are copied exactly into a new local transcript. The anchor supplies local project metadata and a narrow allowlist of project, display, and model settings because the remote endpoint does not expose a local working directory. Anchor-only prompt, browser, permission, spawn, and runtime state is discarded, and permission mode resets to default. The tool checks that the remote worker is disconnected and unchanged before archiving its source mirror. Cookies are decrypted in memory through macOS Keychain, sent only to `claude.ai`, and never printed or stored.
+Remote Control adds a fourth, server-owned layer. With `--cloud`, claude-transplant reads whichever selected source is active through Claude Desktop's authenticated session and hashes durable user and assistant message shapes. An inaccessible source becomes pending only when unreadable or unarchived local records remain after the move. Sign into a pending source and the menubar retries it automatically. CLI users run `finish` or `sweep`. Each retry uses the original receipt and checks the active authenticated identity, history, persisted user and control input, pending-action fields, and connection state before changing a remote row. A failed source keeps its remote session active and remains retryable. If one local target contains the remote history, that record becomes the destination. A bridge id links the remote row to its local session when available. Otherwise one same-title target must share eight consecutive exact remote messages before it can anchor a separate companion whose supported remote message payloads are copied exactly into a new local transcript. The anchor supplies local project metadata and a narrow allowlist of project, display, and model settings, because the remote endpoint does not expose a local working directory. Anchor-only prompt, browser, permission, spawn, and runtime state is discarded, and permission mode resets to default. The tool checks that the remote worker is disconnected and unchanged before archiving its source mirror. Cookies are decrypted in memory through macOS Keychain, sent only to `claude.ai`, and never printed or stored.
 
-One receipt owns the local move, completed cloud checks, failures, retries, and unfinished sources. A delayed check includes only Remote Control sessions created no later than that original Move, so it never sweeps later work into an older instruction. Rows created later are named and left for the next move. Another move cannot start until that receipt is complete, kept local, or undone. Keep local cancels pending or failed cloud work without reversing completed local movement. Undo cancels unfinished cloud sources and reverses the whole move. If several source accounts already archived cloud mirrors, Undo restores the mirrors available under the current login and asks for each remaining source login before reversing the local records. No completed layer is silently abandoned.
+One receipt owns the local move, held records, completed cloud checks, failures, retries, and unfinished sources. A later local phase appends to that receipt only if it is still current under the lock, so Undo cannot be followed by a stale retry that starts another move. Only the new phase is verified against placement bytes, so older sessions may continue normally. A crash during an append rolls back only that phase. A delayed check includes only Remote Control sessions created no later than the original Move. Rows created later are named and left for the next move. Another move cannot start until that receipt is complete, kept local, or undone. Keep local cancels held records and pending or failed cloud checks without reversing completed local movement. Undo cancels unfinished cloud sources and reverses the whole move. If several source accounts already archived cloud mirrors, Undo restores the mirrors available under the current login and asks for each remaining source login before reversing the local records.
 
-A move is eligible when the history is a single comparable version, the record filename and identity are valid, no scheduled task, notification route, or running worker owns it, the parent record is already in the target or moves first in the same batch, and the target has no id collision. Everything else is refused with a named reason.
+A move is eligible when the history is a single comparable version, the record filename and identity are valid, no scheduled task, notification route, or running worker owns it, the parent record is already in the target or moves first in the same batch, and the target has no id collision. Worker identity includes the Desktop record id, CLI session id, PID, process start time, and ancestry. New CLI workers can omit the session id from argv, so the tool also reads `~/.claude/sessions/<pid>.json` and accepts the registered session id only when the filename, PID, and process start match the live process. Helper and child processes appear as one session in the restart warning. An external CLI worker stays a separate refusal because restarting Desktop does not stop it. Everything else is refused with a named reason.
 
-Before writing, the transcript is hashed against its analyzed bytes and both records are reread. Sources and destinations are checked again before retirement, and a change after parking begins restores the plan. Undo verifies the target record and every restore path before recording its plan, then moves only Desktop records. A receipt journals every phase, interrupted retirement or undo resumes from it, and a corrupt newest receipt stops undo before it can reach the previous batch.
+When a selected operation needs Desktop to close, the engine emits a plan before moving records. The menubar shows a native warning listing known Code workers and stating that all Desktop windows, Chat, Cowork, and background commands will close. Stop and restart approves that exact process inventory, Move only the rest keeps held records pending, and Cancel starts no additional work. Don't show again suppresses future warnings only for user-initiated actions, and Show restart warnings restores them. A changed process inventory invalidates approval. The ordinary cold path has no dialog. While held local work remains, Finish pending is the only restart action shown. The existing refresh link uses this same explicit restart flow.
+
+An approved restart begins immediately, budgets 30 seconds from the approved CLI invocation, and reserves the last eight seconds for reopening. The engine sends a graceful quit, waits for the recorded Desktop process and its descendants to exit, re-inventories only the original selection, moves through the existing rehome and retirement paths, and sends the reopen request before any fallible final journal write. No force kill and no cloud API work run in this interval. If Claude asks for its own quit confirmation, the tool does not answer it. A veto or a missed deadline leaves the held records untouched and reports the failure with the recovery receipt. A later invocation may finish reopening a previously approved interrupted restart, but a background retry never starts a new shutdown.
+
+The next Move and menubar sweep compare the latest receipt's placed records with their snapshots. Focus timestamps, turn counters, and new bridge registrations are expected runtime changes. Durable differences such as title, archive state, or pin state save both versions under `drift/<receipt>` and appear in the panel. A legitimate user edit is indistinguishable from a cache rewrite, so the tool reports the difference without overwriting it.
+
+Before writing, the transcript is hashed against its analyzed bytes and both records are reread. A private temporary inode is fully written and journaled before an atomic no-clobber hard link exposes the completed record, so a record is either absent or complete. Sources and destinations are checked again before retirement, and a change after parking begins restores the plan. Undo verifies the target record and every restore path before recording its plan, then moves only Desktop records. A receipt journals every phase, interrupted retirement or undo resumes from it, and a corrupt newest receipt stops undo before it can reach the previous batch.
 
 Planning reuses a disposable cache at `~/Library/Application Support/claude-transplant/cache.json`, keyed by path, device, inode, size, and nanosecond mtime and ctime. Dry runs read it, real moves refresh it, and every decision that writes is made from live files. Delete the cache at any time.
 
@@ -98,10 +111,10 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 
 - Rehome local history or refuse. Never duplicate an existing local transcript and never merge histories. A divergent remote-only branch may become one separate verified companion.
 - No transcript or sidecar is renamed, edited, or deleted. The quarantined record is the rollback.
-- No confirmation prompt. Runs are idempotent, writes are journaled, undo refuses before changing anything it cannot restore.
+- Cold moves need no confirmation. Desktop restarts require an exact plan approval or the saved warning preference. Writes are journaled, and Undo refuses before changing anything it cannot restore.
 - Remote rescue copies supported payloads exactly. It does not ask a model to reconstruct history.
 - Local transcripts stay local. Remote Control reconciliation uses Claude Desktop's current `claude.ai` session only when `--cloud` is present, with no credential persistence.
-- Pending cloud checks never run automatically. The user signs into the named source and clicks Finish pending.
+- Automatic retries cover the receipt's named work only. They never initiate a new Desktop restart, store account credentials, or create destination Remote Control bridges.
 - Keep local cancels pending or failed checks only after completed local targets still verify.
 - One JavaScript file, no dependencies, Node 22. The menubar is one Swift file.
 
@@ -115,17 +128,23 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 | Delete the source | Removes the rollback |
 | Merge sidecars across versions | Requires writing a new generation |
 | Trust one `forkedFrom` hop | Misses second-generation copies |
+| Move a record while its Desktop worker runs | Desktop rewrites the record from its cache, so the title and turn count can roll back after a switch |
+| Treat the sidebar's Idle as an interruption inventory | An organization switch stops every worker in the app, so the restart warning uses process ancestry instead |
+| Infer a restart-safe moment from private activity logs | Cold records need no restart and held records get an explicit graceful shutdown |
+| Repair every changed record from its old snapshot | Would overwrite legitimate titles, archive changes, and pins, so differences are reported instead |
+| Read the active organization from Desktop's extensions allowlist timestamp | Written after a network request without rechecking the selection, so a failed refresh can point at another organization |
 
 ## Limits
 
 - macOS 13 or newer with Claude Desktop. Sign Desktop into the target account to see moved history.
-- Remote Control ownership does not transfer. The menubar archives a disconnected source mirror only after an existing or newly materialized local target verifies. A new target bridge starts lazily when that local session is resumed there.
+- Remote Control ownership does not transfer. The menubar archives a disconnected source mirror only after an existing or newly materialized local target verifies. Enable Remote Control per session under the destination account yourself.
 - Artifact ownership, versions, comments, and share links stay with the original account. Artifacts are neither copied nor recreated.
 - Embedded base64, text, and HTTP or HTTPS images and documents can be rescued. Account-owned file ids and unknown source shapes are refused.
 - Sign Claude Desktop into a named pending source to finish its Remote Control check or cloud Undo. Local movement never waits for that login.
 - Remote Control uses private Claude endpoints and fails closed if their response shape, organization, history, status, or authentication changes.
-- File layouts and Remote Control endpoints are undocumented. Verified with Claude Desktop 1.46388.1, bundled Claude Code 2.1.260, and transcript 2.1.258.
+- File layouts, log wording, and Remote Control endpoints are undocumented and may change. Verified with Claude Desktop 1.46388.4 and bundled Claude Code 2.1.260.
+- An OS stall can exceed the cooperative restart deadline, and a failed launch can prevent reopening. Both are reported with the recovery receipt.
 - Moving history out of a Team organization is your organization's decision.
 - Unofficial. Not affiliated with Anthropic.
 
-Receipts, quarantine, the cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. The `quarantine` folder can be deleted once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
+Receipts, quarantine, drift evidence, the cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. The `quarantine` folder can be deleted once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.

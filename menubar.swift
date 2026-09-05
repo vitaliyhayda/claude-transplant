@@ -13,6 +13,12 @@ struct Account: Decodable, Identifiable {
     let activeAt: Double?
     let pending: String?
     let pendingFailures: [Failure]?
+    var stats: String? = nil
+    var identityState: String? = nil
+    var pendingAction: String? = nil
+    var pendingWaiting: [HeldRecord]? = nil
+    var receiptMoved: Int? = nil
+    var receiptDestination: String? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
@@ -41,7 +47,38 @@ struct Reconciliation: Decodable {
     let error: String
 }
 
+struct RestartWorker: Decodable {
+    let pid: Int
+    let started: String
+    let recordId: String?
+    let title: String?
+    let cwd: String?
+}
+
+struct HeldRecord: Decodable {
+    let id: String
+    let title: String
+}
+
+struct MetadataChange: Decodable {
+    let id: String
+    let title: String?
+    let fields: [String]
+}
+
+
 struct Event: Decodable {
+    let swept: Bool?
+    let error: String?
+    let changed: [MetadataChange]?
+    let plan: Bool?
+    let token: String?
+    let kind: String?
+    let resume: Bool?
+    let affected: [RestartWorker]?
+    let held: [HeldRecord]?
+    let waiting: [HeldRecord]?
+    let pendingLabels: [String]?
     let stage: String?
     let text: String?
     let live: Bool?
@@ -57,6 +94,7 @@ struct Event: Decodable {
     let cloudRestored: Int?
     let newerCloud: Int?
     let keptLocal: Int?
+    let heldCancelled: Int?
     let pendingCloud: Int?
     let pendingUndo: [String]?
     let retired: Int?
@@ -64,6 +102,7 @@ struct Event: Decodable {
     let problems: [Problem]?
     let note: String?
     let restart: Bool?
+    let restarted: Bool?
     let reconciled: Reconciliation?
     let retry: Bool?
     let undone: String?
@@ -86,10 +125,14 @@ final class Model: ObservableObject {
     @Published var excluded: Set<String> = []
     @Published var lanes: [String: String] = [:]
     @Published var lines: [(String, String)] = []
+    @Published var detailsExpanded = false
+    @Published var progressLabel = "Preparing sessions"
     @Published var note = ""
     @Published var badge = ""
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
+    @Published private(set) var sweeping = false
+    @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var progressCompleted: Int?
     @Published var progressTotal: Int?
@@ -99,11 +142,20 @@ final class Model: ObservableObject {
     private let config: Config?
     private var refreshing = false
     private var pendingResult = false
+    private var pendingPlan: Event?
+    private var operationArgs: [String] = []
+    private var approvalAttempted = false
+    private var poller: AnyCancellable?
+    private var activeIdentity = ""
+    private var targetChosen = false
+    private var selectionComplete = false
+    private var panelOpen = false
+    private var sweepNote: String?
 
     init(snapshot: Bool = false, config supplied: Config? = nil) {
         self.snapshot = snapshot
         demo = false
-        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
+        let file = Bundle.main.url(forResource: "menubar", withExtension: "json") ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
         config = supplied ?? (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
         if snapshot {
             guard let config, let text = Model.capture(node(config.node), [config.script, "accounts", "--json"]), let decoded = try? JSONDecoder().decode([Account].self, from: Data(text.utf8)) else { snapshotFailed = true; return }
@@ -113,6 +165,10 @@ final class Model: ObservableObject {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         refresh()
+        poller = Timer.publish(every: 15, on: .main, in: .common).autoconnect().sink { [weak self] _ in
+            guard let self, !self.running, !self.sweeping else { return }
+            self.refresh()
+        }
     }
 
     init(demo accounts: [Account]) {
@@ -123,22 +179,34 @@ final class Model: ObservableObject {
         settle()
     }
 
+    var identityLabel: String? { accounts.contains { $0.active == true } ? nil : accounts.first?.identityState == "logged-out" ? "signed out" : "unknown" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
-    var canKeepLocal: Bool { !running && pendingAccounts.contains { $0.pending == "cloud" } }
-    var pendingReady: Bool { !running && activePendingAccount != nil && (config != nil || demo) }
-    var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
+    var canKeepLocal: Bool { !running && !sweeping && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
+    var pendingReady: Bool { !running && !sweeping && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.active == true ? "finish" : "sign-in")) } && (config != nil || demo) }
+    var pendingButtonTitle: String { pendingAccounts.contains { $0.pendingAction == "restart" } ? "Stop and restart" : pendingAccounts.contains { $0.pending == "undo" } ? "Finish Undo" : "Finish move" }
+    var ready: Bool { !running && !sweeping && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
-        let labels = pendingAccounts.map(\.label).joined(separator: " or ")
-        let failures = activePendingAccount?.pendingFailures ?? []
-        if let first = failures.first {
-            let title = identity(first.title, first.id)
-            if !pendingReady { return "Sign Claude Desktop into \(labels) to retry pending" }
-            return failures.count == 1 ? "Retry \(title)" : "Retry \(failures.count) cloud sessions"
-        }
-        return pendingReady ? "Pending work is ready for this account" : "Sign Claude Desktop into \(labels) to finish pending"
+        let moved = pendingAccounts.compactMap(\.receiptMoved).max() ?? 0
+        let waiting = Set(pendingAccounts.flatMap { $0.pendingWaiting ?? [] }.map(\.id)).count
+        let issues = pendingAccounts.reduce(0) { $0 + ($1.pendingFailures?.count ?? 0) }
+        let signIn = pendingAccounts.filter { $0.pendingAction == "sign-in" }.map(\.label)
+        var parts = moved > 0 ? [quantity(moved, "session moved", "sessions moved")] : []
+        if waiting > 0 { parts.append("\(waiting) still open") }
+        if issues > 0 { parts.append("\(issues) need attention") }
+        if !signIn.isEmpty { parts.append("sign into \(signIn.joined(separator: " or ")) to finish") }
+        if waiting == 0 && issues == 0 && signIn.isEmpty { parts.append("remaining sessions are ready to move") }
+        return parts.isEmpty ? "Remaining sessions are ready to move" : parts.joined(separator: ", ")
     }
+    var detailLines: [(String, String)] {
+        if !lines.isEmpty { return lines }
+        return pendingAccounts.flatMap { account in
+            (account.pendingWaiting ?? []).map { ("open", $0.title) } +
+            (account.pendingFailures ?? []).map { ("issue", identity($0.title, $0.id) + " | " + $0.error) }
+        }
+    }
+    var displaySummary: String { running ? progressLabel : note.isEmpty ? pendingPrompt : note }
     var progress: Double? {
         guard let completed = progressCompleted, let total = progressTotal, total > 0 else { return nil }
         return Double(completed) / Double(total)
@@ -148,31 +216,36 @@ final class Model: ObservableObject {
 
     func toggle(_ id: String) {
         guard let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
+        if selectionComplete { excluded = Set(accounts.map(\.id)) }
         clearResult()
         if from.contains(id) { excluded.insert(id) } else { excluded.remove(id) }
         settle()
     }
 
     func selectTarget(_ id: String) {
+        if selectionComplete { excluded = [] }
         clearResult()
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
             lanes[vacated] = id
             lanes[taken] = old
         }
         to = id
+        targetChosen = true
         settle()
     }
 
     private func settle() {
-        if to == nil || !accounts.contains(where: { $0.id == to }) {
+        if !accounts.contains(where: { $0.id == to }) {
+            to = nil
+            targetChosen = false
+        }
+        if selectionComplete && pendingAccounts.isEmpty {
+            to = nil
+        } else if let destination = pendingAccounts.compactMap(\.receiptDestination).first {
+            to = destination
+        } else if !targetChosen {
             let recent = accounts.sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
-            if let current = accounts.first(where: { $0.active == true }) {
-                to = recent.first { $0.id != current.id }?.id
-            } else if let login = accounts.first(where: { $0.signedIn == true })?.account {
-                to = recent.first { $0.account != login }?.id
-            } else {
-                to = recent.dropFirst().first?.id
-            }
+            to = accounts.first(where: { $0.active == true }).flatMap { current in recent.first { $0.id != current.id }?.id }
         }
         let ids = accounts.map(\.id)
         var next = lanes.filter { ids.contains($0.key) && ids.contains($0.value) }
@@ -180,22 +253,24 @@ final class Model: ObservableObject {
         for id in ids where next[id] == nil { if let source = free.next() { next[id] = source } }
         lanes = next
         excluded = excluded.filter { ids.contains($0) }
-        from = Set(accounts.filter(canSource).map(\.id)).subtracting(excluded)
+        from = selectionComplete && pendingAccounts.isEmpty ? [] : Set(accounts.filter(canSource).map(\.id)).subtracting(excluded)
     }
 
     func panelVisibility(_ visible: Bool) {
+        panelOpen = visible
         if visible { refresh() }
-        else if !running { clearResult() }
     }
 
     private func clearResult() {
+        selectionComplete = false
         lines = []
+        detailsExpanded = false
         note = ""
         restartAvailable = false
     }
 
     func refresh() {
-        guard !refreshing else { return }
+        guard !refreshing, !running, !sweeping else { return }
         refreshing = true
         var text = ""
         run(["accounts", "--json"], line: { text += $0 }) { [weak self] _, _ in
@@ -204,6 +279,10 @@ final class Model: ObservableObject {
             guard let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             settle()
+            let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
+            let changed = identity != activeIdentity
+            activeIdentity = identity
+            if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty) { sweep() }
         }
     }
 
@@ -211,11 +290,11 @@ final class Model: ObservableObject {
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
         let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--cloud", "--json"]
         begin()
-        run(args, line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+        runOperation(args)
     }
 
     func undo() {
-        guard !running else { return }
+        guard !running, !sweeping else { return }
         begin()
         run(["undo", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
@@ -223,7 +302,7 @@ final class Model: ObservableObject {
     func finishPending() {
         guard pendingReady else { return }
         begin()
-        run(["finish", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+        runOperation(["finish", "--json"])
     }
 
     func keepLocal() {
@@ -234,23 +313,29 @@ final class Model: ObservableObject {
 
     func begin() {
         lines = []
+        detailsExpanded = false
         note = ""
         running = true
         restartAvailable = false
         symbol = "arrow.triangle.2.circlepath"
-        badge = "starting"
+        progressLabel = "Preparing sessions"
+        badge = "Preparing"
         progressCompleted = nil
         progressTotal = nil
         pendingResult = false
+        pendingPlan = nil
     }
 
-    private func handle(_ line: String) {
+    func handle(_ line: String) {
         guard let data = line.data(using: .utf8), let event = try? JSONDecoder().decode(Event.self, from: data) else { return }
-        if let stage = event.stage, let text = event.text {
+        if event.plan == true {
+            pendingPlan = event
+        } else if let stage = event.stage, let text = event.text {
             if event.live == true {
                 progressCompleted = event.completed
                 progressTotal = event.total
-                badge = event.completed != nil && event.total != nil ? "\(stage) \(text)" : stage
+                progressLabel = ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : stage == "desktop" ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
+                badge = event.completed != nil && event.total != nil ? "\(progressLabel) \(text)" : progressLabel
             } else {
                 progressCompleted = nil
                 progressTotal = nil
@@ -263,40 +348,31 @@ final class Model: ObservableObject {
             note = event.retry == true ? "Run Undo last again if still wanted" : ""
             restartAvailable = false
         } else if event.done == true {
-            let moved = event.moved ?? 0
-            let rescued = event.rescued ?? 0
-            let cloudArchived = event.cloudArchived ?? 0
-            let cloudChecked = event.cloudChecked ?? 0
-            let cloudRestored = event.cloudRestored ?? 0
-            let newerCloud = event.newerCloud ?? 0
+            let failed = event.failed ?? [], problems = event.problems ?? []
+            let waiting = event.waiting ?? event.held ?? []
             let pendingCloud = event.pendingCloud ?? 0
-            let pendingUndo = event.pendingUndo ?? []
-            let keptLocal = event.keptLocal ?? 0
-            pendingResult = event.complete == false || pendingCloud > 0 || !pendingUndo.isEmpty
-            let failed = event.failed ?? []
-            if !failed.isEmpty {
-                lines.append(("failed", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n")))
-            }
-            let problems = event.problems ?? []
+            pendingResult = event.complete == false || pendingCloud > 0 || !(event.pendingUndo ?? []).isEmpty || !waiting.isEmpty
+            if !failed.isEmpty { lines.append(("issue", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
             for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
-            let retired = event.retired ?? 0
-            var outcomes: [String] = []
-            if moved - rescued > 0 { outcomes.append(quantity(moved - rescued, "session moved", "sessions moved")) }
-            if rescued > 0 { outcomes.append(quantity(rescued, "remote branch rescued", "remote branches rescued")) }
-            if cloudArchived > 0 { outcomes.append(quantity(cloudArchived, "cloud mirror archived", "cloud mirrors archived")) }
-            if cloudChecked > 0 { outcomes.append(quantity(cloudChecked, "cloud source checked", "cloud sources checked")) }
-            if cloudRestored > 0 { outcomes.append(quantity(cloudRestored, "cloud mirror restored", "cloud mirrors restored")) }
-            if newerCloud > 0 { outcomes.append(quantity(newerCloud, "newer cloud session left for next move", "newer cloud sessions left for next move")) }
-            if pendingCloud > 0 { outcomes.append(quantity(pendingCloud, "cloud check pending", "cloud checks pending")) }
-            if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
-            if keptLocal > 0 { outcomes.append("Local move kept, " + quantity(keptLocal, "cloud check cancelled", "cloud checks cancelled")) }
-            if moved == 0, retired > 0 { outcomes.append(quantity(retired, "source entry retired", "source entries retired")) }
-            if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
-            if !problems.isEmpty { outcomes.append("verification failed") }
-            let summary = outcomes.isEmpty ? "Nothing to move" : outcomes.joined(separator: ", ")
+            if !waiting.isEmpty { lines.append(("open", waiting.map(\.title).joined(separator: "\n"))) }
+            if let reason = event.reason ?? (event.ok == false ? event.note : nil) { lines.append(("reason", reason)) }
+            let moved = event.moved ?? 0
+            var parts: [String] = []
+            if moved > 0 { parts.append(quantity(moved, "session moved", "sessions moved")) }
+            if !waiting.isEmpty { parts.append("\(waiting.count) still open") }
+            let issues = failed.count + problems.count
+            if issues > 0 { parts.append("\(issues) need attention") }
+            else if event.ok == false { parts.append("remaining work needs attention") }
+            if pendingCloud > 0 && waiting.isEmpty && issues == 0 { parts.append("remaining sessions will finish when their account is available") }
+            if !(event.pendingUndo ?? []).isEmpty { parts.append("sign into \(event.pendingUndo!.joined(separator: " or ")) to finish Undo") }
+            if (event.keptLocal ?? 0) > 0 || (event.heldCancelled ?? 0) > 0 { parts = ["Completed moves kept, remaining work cancelled"] }
+            if parts.isEmpty {
+                parts = [event.restarted == true ? "Claude Desktop restarted" : event.complete == true ? "Move complete" : "Nothing to move"]
+            }
+            note = parts.joined(separator: ", ")
             restartAvailable = event.restart ?? false
-            note = summary
-            notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
+            if !pendingResult && event.ok != false { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
+            notify(note, "")
         } else if event.undone != nil {
             restartAvailable = event.restart ?? false
             note = restartAvailable ? "" : event.note ?? ""
@@ -308,7 +384,7 @@ final class Model: ObservableObject {
             restartAvailable = false
             lines = refused.map { ("kept", $0) }
         } else if event.nothing == true {
-            note = "Nothing to undo"
+            note = operationArgs.first == "undo" ? "Nothing to undo" : "No remaining work"
             restartAvailable = false
         }
     }
@@ -322,29 +398,92 @@ final class Model: ObservableObject {
     }
 
     func restartDesktop() {
-        note = "restarting Claude Desktop"
-        restartAvailable = false
-        DispatchQueue.global().async { [weak self] in
-            let quit = Model.shell("/usr/bin/osascript", ["-e", "quit app \"Claude\""]) == 0
-            var gone = false
-            for _ in 0..<40 {
-                if Model.shell("/usr/bin/pgrep", ["-x", "Claude"]) != 0 { gone = true; break }
-                Thread.sleep(forTimeInterval: 0.25)
-            }
-            let opened = gone && Model.shell("/usr/bin/open", ["-a", "Claude"]) == 0
-            DispatchQueue.main.async { self?.note = quit && opened ? "" : "could not restart Claude Desktop, quit and reopen it yourself" }
+        guard !running, !sweeping else { return }
+        begin()
+        runOperation(["restart", "--json"])
+    }
+
+    func restoreRestartWarning() {
+        skipRestartWarning = false
+        UserDefaults.standard.set(false, forKey: "skipRestartWarning")
+    }
+
+    private func runOperation(_ args: [String], remember: Bool = true) {
+        if remember { operationArgs = args; approvalAttempted = false }
+        run(args, line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
+    }
+
+    private func confirmRestart(_ plan: Event) {
+        guard let token = plan.token else { running = false; note = "Restart plan is missing its approval token"; return }
+        var response = NSApplication.ModalResponse.alertFirstButtonReturn
+        var suppress = false
+        if !skipRestartWarning {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = plan.kind == "refresh" ? "Restart Claude Desktop?" : "Restart Claude Desktop to finish moving?"
+            var seen: Set<String> = []
+            let names = (plan.affected ?? []).filter { seen.insert($0.recordId ?? "pid/\($0.pid)").inserted }.map { $0.title ?? "Another open Claude session" }
+            alert.informativeText = "All Claude Desktop windows will close, including Chat, Cowork, and background commands. These sessions are open:\n\n" + (names.isEmpty ? "No Code sessions are open." : names.joined(separator: "\n")) + "\n\nRestart begins immediately. Any native Claude quit confirmation remains yours to answer."
+            alert.addButton(withTitle: "Stop and restart")
+            if plan.kind == "move" { alert.addButton(withTitle: "Move the rest") }
+            alert.addButton(withTitle: "Cancel")
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "Don't show again"
+            NSApp.activate(ignoringOtherApps: true)
+            response = alert.runModal()
+            suppress = alert.suppressionButton?.state == .on
+        }
+        pendingPlan = nil
+        if response == .alertFirstButtonReturn {
+            if suppress { skipRestartWarning = true; UserDefaults.standard.set(true, forKey: "skipRestartWarning") }
+            begin()
+            approvalAttempted = true
+            runOperation(operationArgs + ["--restart-approved", token], remember: false)
+        } else if plan.kind == "move", response == .alertSecondButtonReturn {
+            begin()
+            runOperation(operationArgs + ["--move-only"], remember: false)
+        } else {
+            running = false
+            badge = ""
+            note = "Restart cancelled. No additional sessions moved."
+            refresh()
         }
     }
 
-    nonisolated private static func shell(_ executable: String, _ arguments: [String]) -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return 1 }
-        process.waitUntilExit()
-        return process.terminationStatus
+    private func sweep() {
+        guard !running, !sweeping, !snapshot else { return }
+        sweeping = true
+        var result: Event?
+        run(["sweep", "--json"], line: { line in
+            if let data = line.data(using: .utf8), let decoded = try? JSONDecoder().decode(Event.self, from: data), decoded.swept == true { result = decoded }
+        }) { [weak self] status, error in
+            guard let self else { return }
+            sweeping = false
+            if result == nil, error.contains("another run holds the lock") { return }
+            if result != nil, let sweepNote, note == sweepNote {
+                note = ""
+                symbol = "arrow.left.arrow.right"
+            }
+            if result != nil { sweepNote = nil }
+            let previousNote = note
+            if result == nil, status != 0 {
+                lines.append(("background", error))
+                note = "The remaining work needs attention"
+                symbol = "exclamationmark.triangle"
+            } else if let error = result?.error, !error.isEmpty {
+                lines.append(("background", error))
+                note = "The remaining work needs attention"
+                symbol = "exclamationmark.triangle"
+            } else if let changed = result?.changed, !changed.isEmpty {
+                note = "\(changed.count) moved session(s) have changed metadata. Evidence is saved with the receipt."
+                symbol = "exclamationmark.triangle"
+            }
+            if result?.ok != false, result?.restart == true {
+                restartAvailable = true
+                note = "Pending sessions moved. Restart Claude Desktop to refresh this account."
+            }
+            if note != previousNote, !note.isEmpty { sweepNote = note }
+        }
     }
 
     nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String? {
@@ -362,19 +501,31 @@ final class Model: ObservableObject {
     }
 
     private func finish(_ status: Int32, _ error: String) {
+        if let plan = pendingPlan, status == 0 {
+            if approvalAttempted {
+                pendingPlan = nil
+                running = false
+                badge = ""
+                note = "Open sessions changed after approval. Click Move or Finish pending to review them again."
+                symbol = "exclamationmark.triangle"
+                return
+            }
+            confirmRestart(plan)
+            return
+        }
         running = false
         badge = ""
         progressCompleted = nil
         progressTotal = nil
-        excluded = []
-        to = nil
+        if !pendingResult && status == 0 { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
         symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
-        if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
+        if status != 0, note.isEmpty { lines.append(("reason", error)); note = "The move needs attention" }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.symbol = "arrow.left.arrow.right" }
         refresh()
     }
 
     private func notify(_ title: String, _ body: String) {
+        if demo || snapshot { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body.sentence
@@ -411,6 +562,9 @@ final class Model: ObservableObject {
             try? FileManager.default.removeItem(at: errorURL)
             done(1, error.localizedDescription)
             return
+        }
+        if args.first == "accounts" {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 60) { if process.isRunning { process.terminate() } }
         }
         DispatchQueue.global().async {
             let handle = pipe.fileHandleForReading
@@ -460,7 +614,7 @@ struct Row: View {
                     HStack(spacing: 6) {
                         Text(account.plan).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                         if account.active == true { Tag(text: "active", color: .green) }
-                        if account.pending != nil { Tag(text: account.pendingFailures?.isEmpty == false ? "retry" : "pending", color: .orange) }
+                        if account.pending != nil { Tag(text: account.pendingFailures?.isEmpty == false ? "attention" : account.pendingAction == "sign-in" ? "sign in" : "waiting", color: .orange) }
                     }
                 }
                 Spacer(minLength: 0)
@@ -617,23 +771,31 @@ struct Panel: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text("Claude Transplant").font(.system(.title3, design: .rounded, weight: .semibold))
+                if let label = model.identityLabel { Tag(text: label, color: .gray) }
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            accountBoard
-            if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
-            ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(item.element.0).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                    Text(item.element.1).fixedSize(horizontal: false, vertical: true)
-                }
-                .font(.system(.caption, design: .monospaced))
-            }
+            accountBoard.disabled(model.running || model.sweeping || !model.pendingAccounts.isEmpty)
+            if !model.displaySummary.isEmpty { Divider() }
             if model.running {
                 if let progress = model.progress { Bar(value: progress) } else { ActivityBar() }
             }
-            if !model.note.isEmpty || !model.pendingPrompt.isEmpty {
-                Text((model.note.isEmpty ? model.pendingPrompt : model.note).sentence).font(.callout.weight(.medium))
+            if !model.displaySummary.isEmpty {
+                Text(model.displaySummary.sentence).font(.callout.weight(.medium))
+            }
+            if !model.detailLines.isEmpty {
+                DisclosureGroup("Details", isExpanded: $model.detailsExpanded) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(model.detailLines.enumerated()), id: \.offset) { item in
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(item.element.0).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+                                    Text(item.element.1).fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }.font(.system(.caption, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(height: 200)
+                }.font(.caption)
             }
             if model.restartAvailable {
                 Button(action: { model.restartDesktop() }) { Text("Restart Claude Desktop to see them").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
@@ -642,12 +804,15 @@ struct Panel: View {
                 if model.pendingAccounts.isEmpty {
                     Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
                 } else {
-                    Pill(title: "Finish pending", prominent: true, enabled: model.pendingReady) { model.finishPending() }
-                    if model.canKeepLocal { Pill(title: "Keep local", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
+                    if model.pendingReady { Pill(title: model.pendingButtonTitle, prominent: true, enabled: true) { model.finishPending() } }
+                    if model.canKeepLocal { Pill(title: "Keep completed", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
                 }
-                Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
+                Pill(title: "Undo last", prominent: false, enabled: !model.running && !model.sweeping) { model.undo() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
+            }
+            if model.skipRestartWarning {
+                Button("Show restart warnings", action: model.restoreRestartWarning).buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(16)
@@ -733,11 +898,12 @@ enum Snapshot {
 }
 
 enum Demo {
+    private static let at = Date().timeIntervalSince1970 * 1000
     static let accounts = [
-        Account(account: "alex-personal", org: "personal", email: "alex@example.com", orgName: "Personal", label: "alex@example.com · Personal", active: true, signedIn: true, activeAt: 400, pending: nil, pendingFailures: nil),
-        Account(account: "alex-team", org: "team", email: "alex@example.com", orgName: "Acme Inc.", label: "alex@example.com · Acme Inc.", active: false, signedIn: true, activeAt: 300, pending: nil, pendingFailures: nil),
-        Account(account: "sam-personal", org: "personal", email: "sam@example.com", orgName: "Personal", label: "sam@example.com · Personal", active: false, signedIn: false, activeAt: 200, pending: nil, pendingFailures: nil),
-        Account(account: "sam-team", org: "team", email: "sam@example.com", orgName: "Northwind", label: "sam@example.com · Northwind", active: false, signedIn: false, activeAt: 100, pending: nil, pendingFailures: nil)
+        Account(account: "work", org: "acme", email: "you@work.com", orgName: "Acme Inc.", label: "you@work.com · Acme Inc.", active: true, signedIn: true, activeAt: at - 2 * 3_600_000, pending: nil, pendingFailures: nil, stats: "161 | 2h ago | acme-api | active", identityState: "known"),
+        Account(account: "work", org: "work-personal", email: "you@work.com", orgName: "Personal", label: "you@work.com · Personal", active: false, signedIn: true, activeAt: at - 86_400_000, pending: nil, pendingFailures: nil, stats: "157 | 1d ago | acme-api", identityState: "known"),
+        Account(account: "home", org: "home-personal", email: "you@home.com", orgName: "Personal", label: "you@home.com · Personal", active: false, signedIn: false, activeAt: at - 5 * 86_400_000, pending: nil, pendingFailures: nil, stats: "3 | 5d ago | notes", identityState: "known"),
+        Account(account: "work2", org: "northwind", email: "you@work2.com", orgName: "Northwind", label: "you@work2.com · Northwind", active: false, signedIn: false, activeAt: at - 4 * 60_000, pending: nil, pendingFailures: nil, stats: "12 | 4m ago | northwind", identityState: "known")
     ]
 
     @MainActor
@@ -745,9 +911,9 @@ enum Demo {
         let root = URL(fileURLWithPath: directory)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var durations: [Int] = []
-        model.lines = [("inventory", "308 records | 3 already there | 305 to move"), ("move", "305 ✓ | zero-copy"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
-        model.note = "305 sessions moved"
-        model.restartAvailable = true
+        model.selectTarget(accounts[2].id)
+        model.lines = [("inventory", "318 records | 3 already there | 307 to move"), ("move", "308 ✓ | 307 zero-copy | 1 rescued"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
+        model.note = "308 sessions moved"
         let size = ImageRenderer(content: Panel().environmentObject(model).environment(\.colorScheme, .dark)).nsImage?.size
         model.lines = []
         model.note = ""
@@ -758,29 +924,29 @@ enum Demo {
             durations.append(milliseconds)
         }
         snap(1200)
-        model.selectTarget(accounts[2].id)
+        model.toggle(accounts[3].id)
         snap(1200)
         model.toggle(accounts[0].id)
         snap(900)
         model.toggle(accounts[0].id)
         snap(600)
         model.begin()
-        model.lines = [("inventory", "308 records | 3 already there | 305 to move")]
+        model.lines = [("inventory", "318 records | 3 already there | 307 to move")]
         snap(300)
-        for completed in [75, 170, 250, 305] {
+        model.progressLabel = "Moving sessions"
+        for completed in [75, 170, 250, 308] {
             model.progressCompleted = completed
-            model.progressTotal = 305
+            model.progressTotal = 308
             snap(180)
         }
         model.running = false
         model.badge = ""
         model.progressCompleted = nil
         model.progressTotal = nil
-        model.lines.append(("move", "305 ✓ | zero-copy"))
+        model.lines.append(("move", "308 ✓ | 307 zero-copy | 1 rescued"))
         model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
         model.symbol = "checkmark"
-        model.note = "305 sessions moved"
-        model.restartAvailable = true
+        model.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":308,\"failed\":[],\"waiting\":[]}")
         snap(2400)
         try? JSONSerialization.data(withJSONObject: durations).write(to: root.appendingPathComponent("durations.json"))
         exit(0)
@@ -812,7 +978,7 @@ struct TransplantApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            Panel().environmentObject(model)
+            Panel().environmentObject(model).environment(\.controlActiveState, .key)
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: model.symbol)
