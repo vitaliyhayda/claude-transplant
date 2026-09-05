@@ -3,13 +3,13 @@ import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { appendFile, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, finishPending, inventory, keepLocal, layout, move, normalize, semantic, step, undo } from './transplant.js'
+import { accounts, desktopIdle, desktopState, finishPending, inventory, keepLocal, layout, move, normalize, semantic, step, undo, withIdleDesktop } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -64,6 +64,91 @@ const cli = (home, args) => promisify(execFile)(process.execPath, [path.join(her
   env: { ...process.env, HOME: home },
   cwd: here
 }).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }))
+
+test('Desktop idle evidence requires a fresh global idle release and completed worker turns', () => {
+  const started = new Date('2026-09-04T10:00:00').getTime()
+  const log = '2026-09-04 10:02:00 [info] [keep-awake] code session hold released (idle, held 60000ms)\n'
+  const worker = { ended: started + 60000, modified: started + 60000, known: true }
+  const frame = { started, log, workers: [worker], now: started + 130000 }
+  assert.equal(desktopIdle(frame), true)
+  for (const extra of [
+    { log: '' },
+    { started: started + 180000 },
+    { workers: [{ ...worker, known: false }] },
+    { workers: [{ ...worker, ended: null }] },
+    { workers: [{ ...worker, modified: started + 129999 }] },
+    { workers: [worker, { ...worker, ended: null }] },
+    { log: log.replace('idle,', 'battery,') },
+    { log: log + '2026-09-04 10:02:01 [info] [keep-awake] code session hold taken (turn, battery=false)\n' },
+    { log: log + '2026-09-04 10:02:01 [info] LocalSessions.sendMessage: sessionId=local_test\n' }
+  ]) assert.equal(desktopIdle({ ...frame, ...extra }), false, JSON.stringify(extra))
+})
+
+test('only selected blocking workers trigger an idle restart, held closed through one move', async () => {
+  const calls = []
+  const state = { blocked: true, idle: true, signature: 'same' }
+  const io = {
+    inspect: async () => ({ ...state }),
+    wait: async () => {},
+    quit: async () => { calls.push('quit'); return true },
+    open: async () => { calls.push('open'); return true }
+  }
+  const work = async () => { calls.push('move'); return 'moved' }
+  const run = () => withIdleDesktop([], {}, () => {}, work, io)
+  assert.deepEqual(await run(), { result: 'moved', restarted: true, waiting: false })
+  assert.deepEqual(calls.splice(0), ['quit', 'move', 'open'])
+  state.blocked = false
+  await run()
+  assert.deepEqual(calls.splice(0), ['move'])
+  state.blocked = true
+  state.idle = false
+  assert.equal((await run()).waiting, true)
+  assert.deepEqual(calls.splice(0), ['move'])
+  state.idle = true
+  let reads = 0
+  io.inspect = async () => ({ ...state, signature: String(++reads) })
+  assert.equal((await run()).waiting, true)
+  assert.deepEqual(calls.splice(0), ['move'])
+  io.inspect = async () => state
+  await assert.rejects(withIdleDesktop([], {}, () => {}, async () => { throw new Error('move failed') }, io), /move failed/)
+  assert.deepEqual(calls.splice(0), ['quit', 'open'])
+  io.quit = async () => { calls.push('quit'); return false }
+  assert.equal((await run()).waiting, true)
+  assert.deepEqual(calls.splice(0), ['quit', 'move', 'open'])
+})
+
+test('Desktop restart checks real record and transcript metadata for every owned worker', async () => {
+  const h = await home()
+  const now = Date.now()
+  const ended = now - 60000
+  const date = new Date(now - 30000)
+  const local = new Date(date - date.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace('T', ' ')
+  const log = path.join(h.root, 'Library/Logs/Claude/main.log')
+  await mkdir(path.dirname(log), { recursive: true })
+  await writeFile(log, `${local} [info] [keep-awake] code session hold released (idle, held 60000ms)\n`)
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.write(SOURCE, [entry('assistant', 1, null, SOURCE, { timestamp: new Date(ended).toISOString(), message: { role: 'assistant', content: 'Done', stop_reason: 'end_turn' } })])
+  const file = path.join(h.project, `${SOURCE}.jsonl`)
+  await utimes(file, new Date(ended), new Date(ended))
+  const table = [
+    { pid: 10, parent: 1, started: now - 120000, executable: path.join(h.paths.claudeApp, 'Contents/MacOS/Claude'), claude: true, ids: [] },
+    { pid: 11, parent: 10, started: now - 90000, executable: '/fake/claude', claude: true, ids: [SOURCE] }
+  ]
+  const inspect = () => desktopState([SOURCE], h.paths, table)
+  assert.equal((await inspect()).idle, true)
+  assert.equal((await desktopState([id(700)], h.paths, table)).blocked, false)
+  table.push({ ...table[1], pid: 12, ids: [id(700)] })
+  assert.equal((await inspect()).idle, false, 'an unidentified worker in any account blocks restart')
+  await h.record('T', id(700), rehomeRecord())
+  await h.write(id(700), [entry('user', 1, null, id(700))])
+  assert.equal((await inspect()).idle, false, 'an unrelated active session blocks restart')
+  table.pop()
+  table[1].parent = 1
+  assert.equal((await inspect()).idle, false, 'a terminal worker cannot be released by restarting Desktop')
+  table[1].parent = 10
+  await appendFile(file, JSON.stringify(entry('user', 2, 1, SOURCE)) + '\n')
+  assert.equal((await inspect()).idle, false, 'a new local turn invalidates old idle evidence')
+})
 
 async function hold(file) {
   const guard = spawn('/usr/bin/lockf', ['-k', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })

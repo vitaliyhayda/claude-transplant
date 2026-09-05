@@ -64,6 +64,7 @@ struct Event: Decodable {
     let problems: [Problem]?
     let note: String?
     let restart: Bool?
+    let waitingForIdle: Bool?
     let reconciled: Reconciliation?
     let retry: Bool?
     let undone: String?
@@ -293,7 +294,8 @@ final class Model: ObservableObject {
             if moved == 0, retired > 0 { outcomes.append(quantity(retired, "source entry retired", "source entries retired")) }
             if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
             if !problems.isEmpty { outcomes.append("verification failed") }
-            let summary = outcomes.isEmpty ? "Nothing to move" : outcomes.joined(separator: ", ")
+            if event.waitingForIdle == true { outcomes.append("Wait for Claude to be idle, then Move again") }
+            let summary = outcomes.isEmpty ? (event.note ?? "Nothing to move") : outcomes.joined(separator: ", ")
             restartAvailable = event.restart ?? false
             note = summary
             notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
@@ -322,29 +324,9 @@ final class Model: ObservableObject {
     }
 
     func restartDesktop() {
-        note = "restarting Claude Desktop"
-        restartAvailable = false
-        DispatchQueue.global().async { [weak self] in
-            let quit = Model.shell("/usr/bin/osascript", ["-e", "quit app \"Claude\""]) == 0
-            var gone = false
-            for _ in 0..<40 {
-                if Model.shell("/usr/bin/pgrep", ["-x", "Claude"]) != 0 { gone = true; break }
-                Thread.sleep(forTimeInterval: 0.25)
-            }
-            let opened = gone && Model.shell("/usr/bin/open", ["-a", "Claude"]) == 0
-            DispatchQueue.main.async { self?.note = quit && opened ? "" : "could not restart Claude Desktop, quit and reopen it yourself" }
-        }
-    }
-
-    nonisolated private static func shell(_ executable: String, _ arguments: [String]) -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return 1 }
-        process.waitUntilExit()
-        return process.terminationStatus
+        guard !running else { return }
+        begin()
+        run(["restart", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
 
     nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String? {

@@ -17,7 +17,7 @@ npx claude-transplant menubar
 npx claude-transplant
 ```
 
-To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v3.0.1` or a commit hash to pin.
+To run from this repository instead of npm: `npx github:vitaliyhayda/claude-transplant`, with `#v3.1.0` or a commit hash to pin.
 
 The menubar shows two columns of email over plan, with FROM on the left and TO on the right. TO starts on the most recently used account other than the signed-in one, while every other account starts selected as a source. Uncheck only the accounts to leave behind. Curves converge on TO, chevrons show direction, destination changes swap lane identity, and source changes fade only that lane. Long inventories scroll together. The active account is tagged, pending sources are tagged, and Finish pending becomes available when one is active. Keep local abandons pending cloud work without reversing successful local movement. It starts at login, shows progress in the icon, and posts a notification when done. The app bundles its own CLI, so run the menubar command again after upgrading. Use `menubar --snapshot panel.png` to render the live panel without installing it, or use `menubar --remove` to uninstall. The animation above is rendered from the same Swift panel.
 
@@ -88,6 +88,8 @@ One receipt owns the local move, completed cloud checks, failures, retries, and 
 
 A move is eligible when the history is a single comparable version, the record filename and identity are valid, no scheduled task, notification route, or running worker owns it, the parent record is already in the target or moves first in the same batch, and the target has no id collision. Everything else is refused with a named reason.
 
+Remote Control can keep an idle Desktop worker alive, so process presence is not the same as an active response. If a selected record is blocked only by a worker, the CLI and menubar check every Desktop-owned Claude worker, including other accounts. An automatic graceful restart requires completed transcript turns plus Desktop's global idle acknowledgement from the current app lifetime, unchanged across two checks. Unknown workers, unreadable activity, a newer prompt, or active work mean no restart. Eligible records still move, and the result asks you to wait for Claude to be idle before moving the rest. Desktop stays closed while records are re-inventoried and moved, then reopens even if the move fails. No process is force-killed and no Remote Control default is changed. The existing manual restart link uses the same idle check.
+
 Before writing, the transcript is hashed against its analyzed bytes and both records are reread. Sources and destinations are checked again before retirement, and a change after parking begins restores the plan. Undo verifies the target record and every restore path before recording its plan, then moves only Desktop records. A receipt journals every phase, interrupted retirement or undo resumes from it, and a corrupt newest receipt stops undo before it can reach the previous batch.
 
 Planning reuses a disposable cache at `~/Library/Application Support/claude-transplant/cache.json`, keyed by path, device, inode, size, and nanosecond mtime and ctime. Dry runs read it, real moves refresh it, and every decision that writes is made from live files. Delete the cache at any time.
@@ -125,6 +127,7 @@ Lineage follows existing `forkedFrom` pointers to their roots, so copies made by
 - Sign Claude Desktop into a named pending source to finish its Remote Control check or cloud Undo. Local movement never waits for that login.
 - Remote Control uses private Claude endpoints and fails closed if their response shape, organization, history, status, or authentication changes.
 - File layouts and Remote Control endpoints are undocumented. Verified with Claude Desktop 1.46388.1, bundled Claude Code 2.1.260, and transcript 2.1.258.
+- Automatic restart also depends on Desktop's private activity log. Missing, rotated, changed, or inconclusive activity evidence means wait, never assume idle. Desktop's idle acknowledgement can arrive about 30 seconds after a response ends.
 - Moving history out of a Team organization is your organization's decision.
 - Unofficial. Not affiliated with Anthropic.
 
