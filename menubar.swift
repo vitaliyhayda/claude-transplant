@@ -15,6 +15,10 @@ struct Account: Decodable, Identifiable {
     let pendingFailures: [Failure]?
     var stats: String? = nil
     var identityState: String? = nil
+    var pendingAction: String? = nil
+    var pendingWaiting: [HeldRecord]? = nil
+    var receiptMoved: Int? = nil
+    var receiptDestination: String? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
@@ -73,6 +77,8 @@ struct Event: Decodable {
     let resume: Bool?
     let affected: [RestartWorker]?
     let held: [HeldRecord]?
+    let waiting: [HeldRecord]?
+    let pendingLabels: [String]?
     let stage: String?
     let text: String?
     let live: Bool?
@@ -119,6 +125,8 @@ final class Model: ObservableObject {
     @Published var excluded: Set<String> = []
     @Published var lanes: [String: String] = [:]
     @Published var lines: [(String, String)] = []
+    @Published var detailsExpanded = false
+    @Published var progressLabel = "Preparing sessions"
     @Published var note = ""
     @Published var badge = ""
     @Published var symbol = "arrow.left.arrow.right"
@@ -140,6 +148,7 @@ final class Model: ObservableObject {
     private var poller: AnyCancellable?
     private var activeIdentity = ""
     private var targetChosen = false
+    private var selectionComplete = false
     private var panelOpen = false
     private var sweepNote: String?
 
@@ -174,20 +183,30 @@ final class Model: ObservableObject {
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
     var canKeepLocal: Bool { !running && !sweeping && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
-    var pendingReady: Bool { !running && !sweeping && (activePendingAccount != nil || pendingAccounts.contains { $0.pending == "local" }) && (config != nil || demo) }
+    var pendingReady: Bool { !running && !sweeping && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.active == true ? "finish" : "sign-in")) } && (config != nil || demo) }
+    var pendingButtonTitle: String { pendingAccounts.contains { $0.pendingAction == "restart" } ? "Stop and restart" : pendingAccounts.contains { $0.pending == "undo" } ? "Finish Undo" : "Finish move" }
     var ready: Bool { !running && !sweeping && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
-        if pendingAccounts.contains(where: { $0.pending == "local" }) { return "Finish pending can restart Claude Desktop. Keep local cancels the remaining work." }
-        let labels = pendingAccounts.map(\.label).joined(separator: " or ")
-        let failures = activePendingAccount?.pendingFailures ?? []
-        if let first = failures.first {
-            let title = identity(first.title, first.id)
-            if !pendingReady { return "Sign Claude Desktop into \(labels) to retry pending" }
-            return failures.count == 1 ? "Retry \(title)" : "Retry \(failures.count) cloud sessions"
-        }
-        return pendingReady ? "Pending work is ready for this account" : "Sign Claude Desktop into \(labels) to finish pending"
+        let moved = pendingAccounts.compactMap(\.receiptMoved).max() ?? 0
+        let waiting = Set(pendingAccounts.flatMap { $0.pendingWaiting ?? [] }.map(\.id)).count
+        let issues = pendingAccounts.reduce(0) { $0 + ($1.pendingFailures?.count ?? 0) }
+        let signIn = pendingAccounts.filter { $0.pendingAction == "sign-in" }.map(\.label)
+        var parts = moved > 0 ? [quantity(moved, "session moved", "sessions moved")] : []
+        if waiting > 0 { parts.append("\(waiting) still open") }
+        if issues > 0 { parts.append("\(issues) need attention") }
+        if !signIn.isEmpty { parts.append("sign into \(signIn.joined(separator: " or ")) to finish") }
+        if waiting == 0 && issues == 0 && signIn.isEmpty { parts.append("remaining sessions are ready to move") }
+        return parts.isEmpty ? "Remaining sessions are ready to move" : parts.joined(separator: ", ")
     }
+    var detailLines: [(String, String)] {
+        if !lines.isEmpty { return lines }
+        return pendingAccounts.flatMap { account in
+            (account.pendingWaiting ?? []).map { ("open", $0.title) } +
+            (account.pendingFailures ?? []).map { ("issue", identity($0.title, $0.id) + " | " + $0.error) }
+        }
+    }
+    var displaySummary: String { running ? progressLabel : note.isEmpty ? pendingPrompt : note }
     var progress: Double? {
         guard let completed = progressCompleted, let total = progressTotal, total > 0 else { return nil }
         return Double(completed) / Double(total)
@@ -197,12 +216,14 @@ final class Model: ObservableObject {
 
     func toggle(_ id: String) {
         guard let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
+        if selectionComplete { excluded = Set(accounts.map(\.id)) }
         clearResult()
         if from.contains(id) { excluded.insert(id) } else { excluded.remove(id) }
         settle()
     }
 
     func selectTarget(_ id: String) {
+        if selectionComplete { excluded = [] }
         clearResult()
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
             lanes[vacated] = id
@@ -218,7 +239,11 @@ final class Model: ObservableObject {
             to = nil
             targetChosen = false
         }
-        if !targetChosen {
+        if selectionComplete && pendingAccounts.isEmpty {
+            to = nil
+        } else if let destination = pendingAccounts.compactMap(\.receiptDestination).first {
+            to = destination
+        } else if !targetChosen {
             let recent = accounts.sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
             to = accounts.first(where: { $0.active == true }).flatMap { current in recent.first { $0.id != current.id }?.id }
         }
@@ -228,17 +253,18 @@ final class Model: ObservableObject {
         for id in ids where next[id] == nil { if let source = free.next() { next[id] = source } }
         lanes = next
         excluded = excluded.filter { ids.contains($0) }
-        from = Set(accounts.filter(canSource).map(\.id)).subtracting(excluded)
+        from = selectionComplete && pendingAccounts.isEmpty ? [] : Set(accounts.filter(canSource).map(\.id)).subtracting(excluded)
     }
 
     func panelVisibility(_ visible: Bool) {
         panelOpen = visible
         if visible { refresh() }
-        else if !running { clearResult() }
     }
 
     private func clearResult() {
+        selectionComplete = false
         lines = []
+        detailsExpanded = false
         note = ""
         restartAvailable = false
     }
@@ -287,18 +313,20 @@ final class Model: ObservableObject {
 
     func begin() {
         lines = []
+        detailsExpanded = false
         note = ""
         running = true
         restartAvailable = false
         symbol = "arrow.triangle.2.circlepath"
-        badge = "starting"
+        progressLabel = "Preparing sessions"
+        badge = "Preparing"
         progressCompleted = nil
         progressTotal = nil
         pendingResult = false
         pendingPlan = nil
     }
 
-    private func handle(_ line: String) {
+    func handle(_ line: String) {
         guard let data = line.data(using: .utf8), let event = try? JSONDecoder().decode(Event.self, from: data) else { return }
         if event.plan == true {
             pendingPlan = event
@@ -306,7 +334,8 @@ final class Model: ObservableObject {
             if event.live == true {
                 progressCompleted = event.completed
                 progressTotal = event.total
-                badge = event.completed != nil && event.total != nil ? "\(stage) \(text)" : stage
+                progressLabel = ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : stage == "desktop" ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
+                badge = event.completed != nil && event.total != nil ? "\(progressLabel) \(text)" : progressLabel
             } else {
                 progressCompleted = nil
                 progressTotal = nil
@@ -319,51 +348,31 @@ final class Model: ObservableObject {
             note = event.retry == true ? "Run Undo last again if still wanted" : ""
             restartAvailable = false
         } else if event.done == true {
-            if event.moved == nil, event.note != nil || event.reason != nil {
-                note = event.note ?? event.reason ?? ""
-                pendingResult = event.ok == false
-                restartAvailable = operationArgs.first == "restart" && event.ok == false
-                return
-            }
-            let moved = event.moved ?? 0
-            let rescued = event.rescued ?? 0
-            let cloudArchived = event.cloudArchived ?? 0
-            let cloudChecked = event.cloudChecked ?? 0
-            let cloudRestored = event.cloudRestored ?? 0
-            let newerCloud = event.newerCloud ?? 0
+            let failed = event.failed ?? [], problems = event.problems ?? []
+            let waiting = event.waiting ?? event.held ?? []
             let pendingCloud = event.pendingCloud ?? 0
-            let pendingUndo = event.pendingUndo ?? []
-            let keptLocal = event.keptLocal ?? 0
-            let heldCancelled = event.heldCancelled ?? 0
-            let held = event.held ?? []
-            pendingResult = event.complete == false || pendingCloud > 0 || !pendingUndo.isEmpty
-            let failed = event.failed ?? []
-            if !failed.isEmpty {
-                lines.append(("failed", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n")))
-            }
-            let problems = event.problems ?? []
+            pendingResult = event.complete == false || pendingCloud > 0 || !(event.pendingUndo ?? []).isEmpty || !waiting.isEmpty
+            if !failed.isEmpty { lines.append(("issue", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
             for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
-            let retired = event.retired ?? 0
-            var outcomes: [String] = []
-            if moved - rescued > 0 { outcomes.append(quantity(moved - rescued, "session moved", "sessions moved")) }
-            if rescued > 0 { outcomes.append(quantity(rescued, "remote branch rescued", "remote branches rescued")) }
-            if cloudArchived > 0 { outcomes.append(quantity(cloudArchived, "cloud mirror archived", "cloud mirrors archived")) }
-            if cloudChecked > 0 { outcomes.append(quantity(cloudChecked, "cloud source checked", "cloud sources checked")) }
-            if cloudRestored > 0 { outcomes.append(quantity(cloudRestored, "cloud mirror restored", "cloud mirrors restored")) }
-            if newerCloud > 0 { outcomes.append(quantity(newerCloud, "newer cloud session left for next move", "newer cloud sessions left for next move")) }
-            if pendingCloud > 0 { outcomes.append(quantity(pendingCloud, "cloud check pending", "cloud checks pending")) }
-            if !held.isEmpty { outcomes.append(quantity(held.count, "session held", "sessions held")) }
-            if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
-            if keptLocal > 0 { outcomes.append("Local move kept, " + quantity(keptLocal, "cloud check cancelled", "cloud checks cancelled")) }
-            if heldCancelled > 0 { outcomes.append(quantity(heldCancelled, "held session left in source", "held sessions left in source")) }
-            if moved == 0, retired > 0 { outcomes.append(quantity(retired, "source entry retired", "source entries retired")) }
-            if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
-            if !problems.isEmpty { outcomes.append("verification failed") }
-            let summary = outcomes.isEmpty ? "Nothing to move" : outcomes.joined(separator: ", ")
+            if !waiting.isEmpty { lines.append(("open", waiting.map(\.title).joined(separator: "\n"))) }
+            if let reason = event.reason ?? (event.ok == false ? event.note : nil) { lines.append(("reason", reason)) }
+            let moved = event.moved ?? 0
+            var parts: [String] = []
+            if moved > 0 { parts.append(quantity(moved, "session moved", "sessions moved")) }
+            if !waiting.isEmpty { parts.append("\(waiting.count) still open") }
+            let issues = failed.count + problems.count
+            if issues > 0 { parts.append("\(issues) need attention") }
+            else if event.ok == false { parts.append("remaining work needs attention") }
+            if pendingCloud > 0 && waiting.isEmpty && issues == 0 { parts.append("remaining sessions will finish when their account is available") }
+            if !(event.pendingUndo ?? []).isEmpty { parts.append("sign into \(event.pendingUndo!.joined(separator: " or ")) to finish Undo") }
+            if (event.keptLocal ?? 0) > 0 || (event.heldCancelled ?? 0) > 0 { parts = ["Completed moves kept, remaining work cancelled"] }
+            if parts.isEmpty {
+                parts = [event.restarted == true ? "Claude Desktop restarted" : event.complete == true ? "Move complete" : "Nothing to move"]
+            }
+            note = parts.joined(separator: ", ")
             restartAvailable = event.restart ?? false
-            note = summary
-            if event.ok == false, let reason = event.reason { note += ". " + reason }
-            notify(summary, problems.isEmpty ? (event.note ?? "") : "Check the receipt before trusting the copies")
+            if !pendingResult && event.ok != false { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
+            notify(note, "")
         } else if event.undone != nil {
             restartAvailable = event.restart ?? false
             note = restartAvailable ? "" : event.note ?? ""
@@ -375,7 +384,7 @@ final class Model: ObservableObject {
             restartAvailable = false
             lines = refused.map { ("kept", $0) }
         } else if event.nothing == true {
-            note = "Nothing to undo"
+            note = operationArgs.first == "undo" ? "Nothing to undo" : "No remaining work"
             restartAvailable = false
         }
     }
@@ -413,10 +422,10 @@ final class Model: ObservableObject {
             alert.alertStyle = .warning
             alert.messageText = plan.kind == "refresh" ? "Restart Claude Desktop?" : "Restart Claude Desktop to finish moving?"
             var seen: Set<String> = []
-            let names = (plan.affected ?? []).filter { seen.insert($0.recordId ?? "pid/\($0.pid)").inserted }.map { $0.title ?? "Unidentified Claude session" }
-            alert.informativeText = "All Claude Desktop windows will close, including Chat, Cowork, and background commands. These Code sessions have running workers:\n\n" + (names.isEmpty ? "No Code workers were found." : names.joined(separator: "\n")) + "\n\nRestart begins immediately. Any native Claude quit confirmation remains yours to answer."
+            let names = (plan.affected ?? []).filter { seen.insert($0.recordId ?? "pid/\($0.pid)").inserted }.map { $0.title ?? "Another open Claude session" }
+            alert.informativeText = "All Claude Desktop windows will close, including Chat, Cowork, and background commands. These sessions are open:\n\n" + (names.isEmpty ? "No Code sessions are open." : names.joined(separator: "\n")) + "\n\nRestart begins immediately. Any native Claude quit confirmation remains yours to answer."
             alert.addButton(withTitle: "Stop and restart")
-            if plan.kind == "move" { alert.addButton(withTitle: "Move only the rest") }
+            if plan.kind == "move" { alert.addButton(withTitle: "Move the rest") }
             alert.addButton(withTitle: "Cancel")
             alert.showsSuppressionButton = true
             alert.suppressionButton?.title = "Don't show again"
@@ -458,10 +467,12 @@ final class Model: ObservableObject {
             if result != nil { sweepNote = nil }
             let previousNote = note
             if result == nil, status != 0 {
-                note = error.isEmpty ? "Background check stopped before reporting a result. Reopen the panel to retry." : error
+                lines.append(("background", error))
+                note = "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"
             } else if let error = result?.error, !error.isEmpty {
-                note = error
+                lines.append(("background", error))
+                note = "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"
             } else if let changed = result?.changed, !changed.isEmpty {
                 note = "\(changed.count) moved session(s) have changed metadata. Evidence is saved with the receipt."
@@ -506,14 +517,15 @@ final class Model: ObservableObject {
         badge = ""
         progressCompleted = nil
         progressTotal = nil
-        if !pendingResult && status == 0 { excluded = []; to = nil }
+        if !pendingResult && status == 0 { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
         symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
-        if status != 0, note.isEmpty { note = error.isEmpty ? "Failed, run npx claude-transplant in a terminal" : error }
+        if status != 0, note.isEmpty { lines.append(("reason", error)); note = "The move needs attention" }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.symbol = "arrow.left.arrow.right" }
         refresh()
     }
 
     private func notify(_ title: String, _ body: String) {
+        if demo || snapshot { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body.sentence
@@ -602,7 +614,7 @@ struct Row: View {
                     HStack(spacing: 6) {
                         Text(account.plan).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                         if account.active == true { Tag(text: "active", color: .green) }
-                        if account.pending != nil { Tag(text: account.pendingFailures?.isEmpty == false ? "retry" : "pending", color: .orange) }
+                        if account.pending != nil { Tag(text: account.pendingFailures?.isEmpty == false ? "attention" : account.pendingAction == "sign-in" ? "sign in" : "waiting", color: .orange) }
                     }
                 }
                 Spacer(minLength: 0)
@@ -763,20 +775,27 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            accountBoard
-            if !model.lines.isEmpty || !model.note.isEmpty || !model.pendingPrompt.isEmpty { Divider() }
-            ForEach(Array(model.lines.enumerated()), id: \.offset) { item in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(item.element.0).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                    Text(item.element.1).fixedSize(horizontal: false, vertical: true)
-                }
-                .font(.system(.caption, design: .monospaced))
-            }
+            accountBoard.disabled(model.running || model.sweeping || !model.pendingAccounts.isEmpty)
+            if !model.displaySummary.isEmpty { Divider() }
             if model.running {
                 if let progress = model.progress { Bar(value: progress) } else { ActivityBar() }
             }
-            if !model.note.isEmpty || !model.pendingPrompt.isEmpty {
-                Text((model.note.isEmpty ? model.pendingPrompt : model.note).sentence).font(.callout.weight(.medium))
+            if !model.displaySummary.isEmpty {
+                Text(model.displaySummary.sentence).font(.callout.weight(.medium))
+            }
+            if !model.detailLines.isEmpty {
+                DisclosureGroup("Details", isExpanded: $model.detailsExpanded) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(model.detailLines.enumerated()), id: \.offset) { item in
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(item.element.0).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+                                    Text(item.element.1).fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }.font(.system(.caption, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(height: 200)
+                }.font(.caption)
             }
             if model.restartAvailable {
                 Button(action: { model.restartDesktop() }) { Text("Restart Claude Desktop to see them").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
@@ -785,8 +804,8 @@ struct Panel: View {
                 if model.pendingAccounts.isEmpty {
                     Pill(title: "Move", prominent: true, enabled: model.ready) { model.move() }
                 } else {
-                    Pill(title: "Finish pending", prominent: true, enabled: model.pendingReady) { model.finishPending() }
-                    if model.canKeepLocal { Pill(title: "Keep local", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
+                    if model.pendingReady { Pill(title: model.pendingButtonTitle, prominent: true, enabled: true) { model.finishPending() } }
+                    if model.canKeepLocal { Pill(title: "Keep completed", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
                 }
                 Pill(title: "Undo last", prominent: false, enabled: !model.running && !model.sweeping) { model.undo() }
                 Spacer()
@@ -914,6 +933,7 @@ enum Demo {
         model.begin()
         model.lines = [("inventory", "318 records | 3 already there | 307 to move")]
         snap(300)
+        model.progressLabel = "Moving sessions"
         for completed in [75, 170, 250, 308] {
             model.progressCompleted = completed
             model.progressTotal = 308
@@ -926,7 +946,7 @@ enum Demo {
         model.lines.append(("move", "308 ✓ | 307 zero-copy | 1 rescued"))
         model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
         model.symbol = "checkmark"
-        model.note = "308 sessions moved"
+        model.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":308,\"failed\":[],\"waiting\":[]}")
         snap(2400)
         try? JSONSerialization.data(withJSONObject: durations).write(to: root.appendingPathComponent("durations.json"))
         exit(0)

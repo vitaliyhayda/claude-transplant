@@ -9,7 +9,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, executeMove, finishHeld, finishPending, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -3033,8 +3033,10 @@ test('a connected Remote Control session is never archived or locally activated'
   const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
   const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
   const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
-  assert.equal(result.ok, false)
-  assert.match(result.receipt.failed[0].error, /not proven disconnected and idle/)
+  assert.equal(result.ok, true)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.failed.length, 0)
+  assert.equal(result.receipt.cloudChecks[0].status, 'waiting')
   assert.equal(archived, false)
   assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
 })
@@ -3496,4 +3498,194 @@ test('rehome undo refuses when shared artifacts vanished', async () => {
   assert.match(refused.changed[0], /transcript missing, sidecars missing changed/)
   assert.equal(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)).catch(() => null), null)
   assert.ok(await readFile(path.join(teamDir, `local_${SOURCE}.json`)))
+})
+
+test('restart reuses preparation across cloud and local phases and reparses only changed history', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  await Promise.all(Array.from({ length: 180 }, async (_, offset) => {
+    const session = id(2000 + offset)
+    await h.write(session, [entry('user', 10000 + offset, null, session)])
+    await h.record('T', session)
+  }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(), scanned
+  const cloud = cloudFixture(h)
+  const io = { inspect: () => rows, command: async (file) => {
+    if (file.endsWith('osascript')) {
+      await appendFile(path.join(h.project, `${SOURCE}.jsonl`), JSON.stringify(entry('assistant', 2, 1, SOURCE)) + '\n')
+      rows = []
+    } else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { cloud, io })
+  assert.ok(planned.plan)
+  const result = await executeMove([from], to, h.paths, { cloudRequested: true, io, approve: planned.plan.token, summary: inv => { scanned = inv.cacheStats } })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(scanned.historyHits, 180)
+  assert.equal(scanned.historyMisses, 1)
+  assert.equal(result.receipt.sessions[0].events, 2)
+})
+
+test('inventory interrupts preparation at record boundaries when its deadline is spent', async () => {
+  const h = await home()
+  for (const session of [SOURCE, id(2)]) {
+    await h.write(session, [entry('user', Number(session.slice(-1)), null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let completed = 0
+  await assert.rejects(inventory([from], to, h.paths, (stage, text, progress) => {
+    if (stage === 'scan') completed = progress.completed
+  }, { processes: [], check: () => { if (completed > 0) throw new Error('fixture deadline spent') } }), /fixture deadline spent/)
+  assert.equal(completed, 1)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
+test('restart warnings group a helper and its child as one session and resolve copied records', async () => {
+  const h = await home(), other = id(400)
+  await h.record('P', SOURCE, { title: 'First session' })
+  await h.record('T', other, { title: 'Second session' })
+  await h.record('Z', other, { title: 'Second session' })
+  const rows = [
+    desktopFixture()[0],
+    { pid: 501, ppid: 500, started: 'helper one', executable: '/Applications/Claude.app/Contents/Helpers/disclaimer', worker: true, desktopPid: 500, ids: [] },
+    { pid: 502, ppid: 501, started: 'child one', executable: '/tmp/claude', worker: true, desktopPid: 500, ids: [SOURCE] },
+    { pid: 503, ppid: 500, started: 'helper two', executable: '/Applications/Claude.app/Contents/Helpers/disclaimer', worker: true, desktopPid: 500, ids: [] },
+    { pid: 504, ppid: 503, started: 'child two', executable: '/tmp/claude', worker: true, desktopPid: 500, ids: [other] }
+  ]
+  const plan = await restartPlan(null, h.paths, rows)
+  assert.equal(plan.affected.length, 2)
+  assert.deepEqual(plan.affected.map(row => row.title), ['First session', 'Second session'])
+  assert.deepEqual(plan.affected.map(row => row.pids), [[501, 502], [503, 504]])
+  assert.equal(plan.members.length, 5)
+  const unknown = await restartPlan(null, h.paths, rows.map(row => ({ ...row, ids: [] })))
+  assert.equal(unknown.affected.length, 2)
+})
+
+test('connected Remote Control is waiting, not failed, and completes in the same receipt after disconnect', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, { bridgeSessionIds: ['session_live'] })
+  let connected = true, status = 'active', historyReads = 0
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_live', title: 'Session 001', status })],
+    session: async () => remoteState(status, { connection_status: connected ? 'connected' : 'disconnected' }),
+    eventRows: async () => { historyReads++; return remoteRows(entries) },
+    archive: async () => { status = 'archived' }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud, processes: [] })
+  assert.equal(inv.cloud.blocked.length, 0)
+  assert.equal(inv.cloud.waiting.length, 1)
+  assert.equal(inv.cloud.waiting[0].localId, SOURCE)
+  assert.equal(inv.pendingCloud, 1)
+  assert.equal(historyReads, 0)
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.receipt.failed.length, 0)
+  assert.equal(moved.receipt.cloudChecks[0].status, 'waiting')
+  assert.equal(moved.pendingCloud, 1)
+  connected = false
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.file, moved.file)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.receipt.failed.length, 0)
+  assert.equal(status, 'archived')
+})
+
+
+test('a legacy partial move resumes its named records and mirrors with one receipt and one Undo', async () => {
+  const h = await home(), cold = id(2)
+  const hotEntries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, hotEntries)
+  await h.write(cold, [entry('user', 2, null, cold)])
+  await h.record('P', SOURCE, { title: 'Legacy open session', bridgeSessionIds: ['session_legacy'] })
+  await h.record('P', cold)
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: desktopFixture(), cloudRequested: true }), to, h.paths)
+  assert.equal(moved.receipt.sessions.length, 1)
+  const legacy = structuredClone(moved.receipt)
+  delete legacy.held
+  legacy.cloudChecks[0].status = 'cancelled'
+  legacy.cloudChecks[0].cancelledAt = new Date().toISOString()
+  legacy.cloudChecks[0].failures = [{ id: 'cse_legacy', title: 'Legacy open session', error: 'Remote Control session is not proven disconnected and idle' }]
+  await writeFile(moved.file, JSON.stringify(legacy))
+  await assert.rejects(resumeLast(h.paths, { receiptFile: moved.file + '.old', includeCancelled: true, processes: [] }), /previous move changed/)
+  const resumed = await resumeLast(h.paths, { receiptFile: moved.file, includeCancelled: true, processes: desktopFixture() })
+  assert.equal(resumed.receipt.held.length, 1)
+  assert.equal(resumed.receipt.cloudChecks[0].status, 'pending')
+  assert.deepEqual(resumed.receipt.cloudChecks[0].sessionIds, ['session_legacy'])
+  assert.equal(resumed.receipt.failed.length, 0)
+  const finishedLocal = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finishedLocal.file, moved.file)
+  assert.equal(finishedLocal.receipt.sessions.length, 2)
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_legacy', title: 'Legacy open session', status }), remoteSession({ id: 'cse_unselected', title: 'Unselected old remote session' })],
+    session: async id => { assert.equal(id, 'cse_legacy'); return remoteState(status) },
+    eventRows: async id => { assert.equal(id, 'cse_legacy'); return remoteRows(hotEntries) },
+    archive: async () => { status = 'archived' }, unarchive: async () => { status = 'active' }
+  })
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.file, moved.file)
+  assert.equal(finished.complete, true)
+  assert.equal(status, 'archived')
+  assert.equal((await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name)).length, 1)
+  const undone = await undo(h.paths, { cloud })
+  assert.ok(undone.dest)
+  assert.equal(status, 'active')
+  assert.deepEqual((await readdir(h.dir('P'))).sort(), [`local_${SOURCE}.json`, `local_${cold}.json`].sort())
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+
+test('Finish pending offers a receipt-bound restart for a connected mirror and completes after reopen', async () => {
+  const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, { bridgeSessionIds: ['session_open'] })
+  let connected = true, status = 'active', rows = desktopFixture(), quits = 0
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_open', title: 'Session 001', status })],
+    session: async () => remoteState(status, { connection_status: connected ? 'connected' : 'disconnected' }),
+    eventRows: async () => remoteRows(entries), archive: async () => { status = 'archived' }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
+  const io = { inspect: () => rows, command: async file => {
+    if (file.endsWith('osascript')) { quits++; rows = []; connected = false }
+    else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await finishWorkflow(h.paths, { cloud, io })
+  assert.equal(planned.plan.kind, 'finish')
+  assert.equal(planned.plan.receiptFile, moved.file)
+  assert.equal(quits, 0)
+  const completed = await finishWorkflow(h.paths, { cloud, io, approve: planned.plan.token })
+  assert.equal(completed.complete, true)
+  assert.equal(completed.file, moved.file)
+  assert.equal(completed.receipt.remote.length, 1)
+  assert.equal(completed.receipt.failed.length, 0)
+  assert.equal(quits, 1)
+  const stale = await finishWorkflow(h.paths, { cloud, io, approve: planned.plan.token })
+  assert.equal(stale.ok, false)
+  assert.equal(quits, 1)
+})
+
+
+test('process registry identifies a new worker without argv ids and rejects stale pid reuse', () => {
+  const started = 'Fri Sep  4 18:00:00 2026'
+  const utc = new Date(started).toUTCString().replace(/^(\w+), (\d+) (\w+) (\d+) (.*) GMT$/, '$1 $3 $2 $5 $4')
+  const processes = `500 1 ${started} /Applications/Claude.app/Contents/MacOS/Claude\n501 500 ${started} /Applications/Claude.app/Contents/Helpers/disclaimer\n502 501 ${started} /tmp/claude`
+  const commands = `500 1 ${started} Claude\n501 500 ${started} disclaimer\n502 501 ${started} claude --input-format stream-json`
+  const registration = { pid: 502, sessionId: SOURCE, cwd: '/tmp/fixture', name: 'A new session', procStart: utc, pidDomain: 'darwin' }
+  const rows = parseProcesses(processes, commands, '/Applications/Claude.app', [registration])
+  assert.deepEqual(rows.find(row => row.pid === 502).ids, [SOURCE])
+  assert.equal(rows.find(row => row.pid === 502).desktopPid, 500)
+  const stale = parseProcesses(processes, commands, '/Applications/Claude.app', [{ ...registration, procStart: 'Thu Sep 3 00:00:00 2026' }])
+  assert.deepEqual(stale.find(row => row.pid === 502).ids, [])
+  const foreign = parseProcesses(processes, commands, '/Applications/Claude.app', [{ ...registration, pidDomain: 'linux' }])
+  assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
 })
