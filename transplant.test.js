@@ -89,6 +89,9 @@ test('process identity separates Desktop descendants, external workers, and reus
   assert.deepEqual(rows.find((row) => row.pid === 11).ids, [SOURCE])
   assert.equal(rows.find((row) => row.pid === 15).desktopPid, null)
   assert.throws(() => parseProcesses('unparseable', ''), /process identity/)
+  const alternate = parseProcesses(table.replaceAll('/Applications/Claude.app', '/Users/fixture/Applications/Claude.app'), commands)
+  assert.equal(alternate.find((row) => row.pid === 11).worker, true)
+  assert.equal(alternate.find((row) => row.pid === 12).desktopPid, 10)
 })
 
 test('inventory recognizes a live Desktop record id before its CLI uuid enters argv', async () => {
@@ -128,6 +131,47 @@ test('restart plans include collateral and refuse to claim external worker owner
   assert.equal(await restartPlan(inv, h.paths, external), null)
 })
 
+test('a worker on a non-representative Desktop alias holds the whole compatible group', async () => {
+  const h = await home(), alias = id(810)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, { lastFocusedAt: 1000 })
+  await h.record('T', SOURCE, { sessionId: `local_${alias}` })
+  await rename(path.join(h.dir('T'), `local_${SOURCE}.json`), path.join(h.dir('T'), `local_${alias}.json`))
+  const all = await accounts(h.paths), from = all.filter((row) => [h.acct.P, h.acct.T].includes(row.account)), to = all.find((row) => row.account === h.acct.Z)
+  const rows = desktopFixture(alias)
+  const inv = await inventory(from, to, h.paths, () => {}, { processes: rows })
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.blocked[0].worker, false)
+  assert.equal(inv.blocked[0].members.some((row) => row.worker), true)
+  const plan = await restartPlan(inv, h.paths, rows)
+  assert.equal(plan.held[0].sources.length, 2)
+})
+
+test('a worker plus a permanent filename collision never offers a restart', async () => {
+  const h = await home(), other = id(400)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  await h.write(other, [entry('user', 400, null, other)])
+  await h.record('T', other, { sessionId: `local_${SOURCE}` })
+  await rename(path.join(h.dir('T'), `local_${other}.json`), path.join(h.dir('T'), `local_${SOURCE}.json`))
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: desktopFixture() })
+  assert.match(inv.blocked[0].error, /filename collision/)
+  assert.equal(await restartPlan(inv, h.paths, desktopFixture()), null)
+})
+
+test('a destination arriving after planning is never quarantined by a failed placement', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const target = path.join(h.dir('T'), `local_${SOURCE}.json`), foreign = '{"title":"independent arrival"}\n'
+  const result = await executeMove([from], to, h.paths, { processes: [], summary: () => writeFileSync(target, foreign) })
+  assert.equal(result.ok, false)
+  assert.equal(await readFile(target, 'utf8'), foreign)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
 test('restart waits for children, moves only after exit, and reopens on move failure', async () => {
   const h = await home()
   let rows = desktopFixture(), time = 0
@@ -164,7 +208,26 @@ test('a native quit veto leaves held work untouched and does not reopen the runn
   assert.equal(moved, false)
   assert.equal(opened, false)
   assert.equal(result.restart.outcome, 'quit-not-confirmed')
-  assert.ok(time <= 1000)
+  assert.equal(time, 0)
+})
+
+test('post-quit deadline exhaustion still sends a bounded reopen request', async () => {
+  const h = await home()
+  let rows = desktopFixture(), time = 0
+  const plan = await restartPlan(null, h.paths, rows)
+  const calls = []
+  const result = await withDesktopRestart(plan, h.paths, async () => { time = 1100 }, () => {}, {
+    inspect: () => rows, now: () => time, budget: 1000, reserve: 200,
+    command: async (file, args, timeout) => {
+      calls.push({ file, timeout })
+      rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+      return { status: 0 }
+    }
+  })
+  assert.equal(calls.at(-1).file, '/usr/bin/open')
+  assert.ok(calls.at(-1).timeout > 0)
+  assert.equal(result.ok, false)
+  assert.match(result.error, /exceeded its deadline/)
 })
 
 test('new workers invalidate the reviewed restart scope before any quit', async () => {
@@ -223,13 +286,32 @@ test('an approved plan moves only after shutdown and keeps cloud calls outside i
   assert.deepEqual(calls, [])
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
   assert.equal(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
-  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, cloudRequested: true })
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, cloudRequested: true, report: (stage) => {
+    if (stage === 'scan') assert.ok(calls.includes('/usr/bin/osascript'))
+  } })
   assert.equal(result.restarted, true)
   assert.equal(result.receipt.sessions.length, 1)
   assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
   assert.equal(result.receipt.cloudChecks[0].status, 'pending')
   assert.equal(result.receipt.startedAt, planned.plan.requestedAt)
   assert.equal(result.receipt.restart.outcome, 'reopened')
+})
+
+test('failed source authentication stays pending after an approved restart', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  let rows = desktopFixture()
+  const io = { inspect: () => rows, command: async (file) => {
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io, cloudRequested: true, cloudError: 'authentication unavailable' })
+  const result = await executeMove([from], to, h.paths, { io, cloudRequested: true, approve: planned.plan.token })
+  assert.equal(result.receipt.cloudChecks[0].account, from.account)
+  assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+  assert.equal(result.complete, false)
 })
 
 test('held continuation shares one receipt and Undo restores both phases', async () => {
@@ -278,6 +360,71 @@ test('a failed held continuation preserves the earlier completed phase', async (
   assert.ok(await readFile(path.join(h.dir('T'), `local_${cold}.json`)))
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
   assert.equal(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
+  const retry = await finishHeld(h.paths, { processes: [] })
+  assert.equal(retry.ok, true)
+  assert.deepEqual(retry.receipt.failed, [])
+})
+
+test('a stale held continuation cannot start a new move after Undo', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  await undo(h.paths)
+  const stale = await executeMove([from], to, h.paths, { processes: [], resume: true, resumeFile: first.file })
+  assert.equal(stale.ok, false)
+  assert.match(stale.reason, /pending move changed/)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('held parents retain workerless children in the same continuation', async () => {
+  const h = await home(), child = id(701)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  await h.write(child, [entry('user', 701, null, child)])
+  await h.record('P', child, { forkedFromSessionId: `local_${SOURCE}` })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  assert.deepEqual(first.receipt.held.map((row) => row.id), [SOURCE, child])
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.ok, true)
+  assert.deepEqual(finished.receipt.sessions.map((row) => row.id), [SOURCE, child])
+  assert.deepEqual(await readdir(h.dir('P')), [])
+})
+
+test('completed cold records may grow before the held phase finishes', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  const row = first.receipt.sessions[0]
+  const record = JSON.parse(await readFile(row.record))
+  await writeFile(row.record, JSON.stringify({ ...record, lastFocusedAt: 1000, completedTurns: 2, bridgeSessionIds: ['session_new'] }))
+  await appendFile(row.targetTranscript, JSON.stringify(entry('assistant', 301, 300, cold)) + '\n')
+  const result = await finishHeld(h.paths, { processes: [] })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 2)
+})
+
+test('Keep local can abandon held work without undoing completed cold moves', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  const kept = await keepLocal(h.paths)
+  assert.equal(kept.file, first.file)
+  assert.equal(kept.heldCancelled, 1)
+  assert.deepEqual(kept.receipt.held, [])
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${cold}.json`)))
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
 })
 
 test('placed verification ignores activity and bridge registration but records title drift without repairing it', async () => {
@@ -1708,6 +1855,26 @@ test('automatic cloud follow-up waits for its named source login and completes t
   assert.equal(finished.result.receipt.remote.length, 1)
   assert.equal(await readFile(path.join(h.paths.state, 'restart-plan.json')).catch(() => null), null)
   assert.deepEqual((await verifyPlaced(h.paths)).changed, [])
+})
+
+test('automatic cloud retries bind their receipt and claim backoff under the mutation lock', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.T), to = all.find((row) => row.account === h.acct.Z)
+  const first = await moveWithPending(h, [from], to)
+  let calls = 0
+  const cloud = cloudFixture(h, { account: h.acct.T, org: h.org.T, list: async () => { calls++; throw new Error('fixture offline') } })
+  const stale = await finishPending(h.paths, { cloud, receiptFile: first.file + '.old', automatic: from })
+  assert.equal(stale.nothing, true)
+  assert.equal(calls, 0)
+  await sweep(h.paths, { active: from, cloud })
+  assert.equal(calls, 1)
+  await sweep(h.paths, { active: from, cloud })
+  assert.equal(calls, 1)
+  const receipt = JSON.parse(await readFile(first.file))
+  assert.equal(receipt.cloudChecks[0].status, 'failed')
+  assert.equal(receipt.automaticCloudAttempt.key, `${from.account}/${from.org}`)
 })
 
 test('Finish pending preserves a record-only bridge identity after local rehome', async () => {

@@ -60,16 +60,11 @@ struct MetadataChange: Decodable {
     let fields: [String]
 }
 
-struct SweepResult: Decodable {
-    let swept: Bool?
-    let ok: Bool?
-    let error: String?
-    let changed: [MetadataChange]?
-    let cloudChecked: Int?
-    let restart: Bool?
-}
 
 struct Event: Decodable {
+    let swept: Bool?
+    let error: String?
+    let changed: [MetadataChange]?
     let plan: Bool?
     let token: String?
     let kind: String?
@@ -91,6 +86,7 @@ struct Event: Decodable {
     let cloudRestored: Int?
     let newerCloud: Int?
     let keptLocal: Int?
+    let heldCancelled: Int?
     let pendingCloud: Int?
     let pendingUndo: [String]?
     let retired: Int?
@@ -125,7 +121,7 @@ final class Model: ObservableObject {
     @Published var badge = ""
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
-    @Published private var sweeping = false
+    @Published private(set) var sweeping = false
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var progressCompleted: Int?
@@ -172,12 +168,12 @@ final class Model: ObservableObject {
 
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
-    var canKeepLocal: Bool { !running && pendingAccounts.contains { $0.pending == "cloud" } }
+    var canKeepLocal: Bool { !running && !sweeping && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
     var pendingReady: Bool { !running && !sweeping && (activePendingAccount != nil || pendingAccounts.contains { $0.pending == "local" }) && (config != nil || demo) }
     var ready: Bool { !running && !sweeping && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
-        if pendingAccounts.contains(where: { $0.pending == "local" }) { return "Some sessions are still held. Finish pending can restart Claude Desktop." }
+        if pendingAccounts.contains(where: { $0.pending == "local" }) { return "Finish pending can restart Claude Desktop. Keep local cancels the remaining work." }
         let labels = pendingAccounts.map(\.label).joined(separator: " or ")
         let failures = activePendingAccount?.pendingFailures ?? []
         if let first = failures.first {
@@ -268,7 +264,7 @@ final class Model: ObservableObject {
     }
 
     func undo() {
-        guard !running else { return }
+        guard !running, !sweeping else { return }
         begin()
         run(["undo", "--json"], line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
@@ -334,6 +330,7 @@ final class Model: ObservableObject {
             let pendingCloud = event.pendingCloud ?? 0
             let pendingUndo = event.pendingUndo ?? []
             let keptLocal = event.keptLocal ?? 0
+            let heldCancelled = event.heldCancelled ?? 0
             let held = event.held ?? []
             pendingResult = event.complete == false || pendingCloud > 0 || !pendingUndo.isEmpty
             let failed = event.failed ?? []
@@ -354,6 +351,7 @@ final class Model: ObservableObject {
             if !held.isEmpty { outcomes.append(quantity(held.count, "session held", "sessions held")) }
             if !pendingUndo.isEmpty { outcomes.append("Undo pending for \(pendingUndo.joined(separator: " or "))") }
             if keptLocal > 0 { outcomes.append("Local move kept, " + quantity(keptLocal, "cloud check cancelled", "cloud checks cancelled")) }
+            if heldCancelled > 0 { outcomes.append(quantity(heldCancelled, "held session left in source", "held sessions left in source")) }
             if moved == 0, retired > 0 { outcomes.append(quantity(retired, "source entry retired", "source entries retired")) }
             if !failed.isEmpty { outcomes.append("\(failed.count) failed") }
             if !problems.isEmpty { outcomes.append("verification failed") }
@@ -442,17 +440,24 @@ final class Model: ObservableObject {
     private func sweep() {
         guard !running, !sweeping, !snapshot else { return }
         sweeping = true
-        var result: SweepResult?
+        var result: Event?
         run(["sweep", "--json"], line: { line in
-            if let data = line.data(using: .utf8), let decoded = try? JSONDecoder().decode(SweepResult.self, from: data), decoded.swept == true { result = decoded }
-        }) { [weak self] _, _ in
+            if let data = line.data(using: .utf8), let decoded = try? JSONDecoder().decode(Event.self, from: data), decoded.swept == true { result = decoded }
+        }) { [weak self] status, error in
             guard let self else { return }
             sweeping = false
-            if let changed = result?.changed, !changed.isEmpty {
+            if result == nil, status != 0 {
+                if error.contains("another run holds the lock") { return }
+                note = error.isEmpty ? "Background check stopped before reporting a result. Reopen the panel to retry." : error
+                symbol = "exclamationmark.triangle"
+            } else if let error = result?.error, !error.isEmpty {
+                note = error
+                symbol = "exclamationmark.triangle"
+            } else if let changed = result?.changed, !changed.isEmpty {
                 note = "\(changed.count) moved session(s) have changed metadata. Evidence is saved with the receipt."
                 symbol = "exclamationmark.triangle"
             }
-            if result?.restart == true {
+            if result?.ok != false, result?.restart == true {
                 restartAvailable = true
                 note = "Pending sessions moved. Restart Claude Desktop to refresh this account."
             }
@@ -534,6 +539,9 @@ final class Model: ObservableObject {
             try? FileManager.default.removeItem(at: errorURL)
             done(1, error.localizedDescription)
             return
+        }
+        if ["accounts", "sweep"].contains(args.first ?? "") {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 60) { if process.isRunning { process.terminate() } }
         }
         DispatchQueue.global().async {
             let handle = pipe.fileHandleForReading
@@ -768,7 +776,7 @@ struct Panel: View {
                     Pill(title: "Finish pending", prominent: true, enabled: model.pendingReady) { model.finishPending() }
                     if model.canKeepLocal { Pill(title: "Keep local", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
                 }
-                Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
+                Pill(title: "Undo last", prominent: false, enabled: !model.running && !model.sweeping) { model.undo() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
