@@ -73,6 +73,20 @@ To    ↑↓ move · enter confirm
 | `--json` | one event per line |
 | `--version` | print the version |
 
+## What each command touches
+
+| Command | Writes |
+|---|---|
+| `accounts`, `--dry-run`, `--version` | nothing on disk, `--dry-run --cloud` also reads Remote Control metadata over the network |
+| `restart` without a token | the plan file under the tool's own folder |
+| move, `finish`, `sweep`, `undo` | Desktop session records under `claude-code-sessions`, the receipt, quarantine, and drift evidence |
+| `keep-local` | the receipt only |
+| `--restart-approved <token>` | quits and reopens Claude Desktop, then the same as a move |
+| `--cloud` | archives the source's Remote Control mirrors on `claude.ai` and may write one rescued local transcript, using Desktop's session read from Keychain in memory, network to `claude.ai` only |
+| `menubar`, `menubar --remove` | the app under `~/Library/Application Support/claude-transplant` and a LaunchAgent under `~/Library/LaunchAgents` |
+
+Command and flag names are stable. Renames get a deprecation release first.
+
 ## Reading the output
 
 - without history: transcript no longer exists on disk
