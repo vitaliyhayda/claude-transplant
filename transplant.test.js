@@ -296,6 +296,26 @@ test('a journal failure after quit cannot prevent the reopen request', async () 
   assert.match(result.restart.error, /journal could not be saved/)
 })
 
+test('a failed progress callback cannot prevent the mandatory reopen', async () => {
+  const h = await home()
+  let rows = desktopFixture(), reportedAfterOpen = false
+  const plan = await restartPlan(null, h.paths, rows), calls = []
+  const result = await withDesktopRestart(plan, h.paths, async () => ({ ok: true }), stage => {
+    if (stage === 'reopen') {
+      reportedAfterOpen = calls.includes('/usr/bin/open')
+      throw new Error('progress output unavailable')
+    }
+  }, { inspect: () => rows, command: async file => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } })
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(reportedAfterOpen, true)
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.equal(result.ok, true)
+})
+
 test('new workers invalidate the reviewed restart scope before any quit', async () => {
   const h = await home()
   const rows = desktopFixture()
@@ -504,8 +524,8 @@ test('a successful held phase cannot hide an earlier placement verification fail
   }
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   const target = path.join(h.dir('T'), `local_${cold}.json`)
-  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage) => {
-    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
   } })
   assert.equal(first.receipt.verification.ok, false)
   assert.deepEqual(first.receipt.failed, [])
@@ -523,8 +543,8 @@ test('Keep local reports earlier verification failure while cancelling held work
   }
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   const target = path.join(h.dir('T'), `local_${cold}.json`)
-  await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage) => {
-    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true, report: (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
   } })
   const kept = await keepLocal(h.paths)
   assert.equal(kept.heldCancelled, 1)
@@ -1186,8 +1206,8 @@ test('an unreadable scheduled task registry fails closed', async () => {
   await writeFile(taskFile, JSON.stringify({ scheduledTasks: [] }))
   by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
   const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
-  await assert.rejects(move(inv, by[h.acct.Z], h.paths, (stage) => {
-    if (stage === 'sidecars') writeFileSync(taskFile, '{broken')
+  await assert.rejects(move(inv, by[h.acct.Z], h.paths, (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(taskFile, '{broken')
   }), /unreadable scheduled task registry/)
   assert.equal((await readdir(h.dir('P'))).filter((file) => file.startsWith('local_')).length, 1)
 })
@@ -1229,8 +1249,8 @@ test('retirement records the exact bytes after harmless source focus drift', asy
   await h.record('P', id(928))
   const sourceRecord = path.join(h.dir('P'), `local_${id(928)}.json`)
   const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
-  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths, (stage) => {
-    if (stage !== 'sidecars') return
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths, (stage, _text, progress) => {
+    if (stage !== 'verify' || progress?.completed !== 0) return
     const focused = JSON.parse(readFileSync(sourceRecord, 'utf8'))
     writeFileSync(sourceRecord, JSON.stringify({ ...focused, lastFocusedAt: focused.lastFocusedAt + 1 }))
   })
@@ -2095,8 +2115,8 @@ test('a successful cloud phase preserves an earlier local verification failure',
   await h.record('T', id(997))
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.T), to = all.find((row) => row.account === h.acct.Z)
   const target = path.join(h.dir('Z'), `local_${SOURCE}.json`)
-  const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths, (stage) => {
-    if (stage === 'sidecars') writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
+  const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths, (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(target, JSON.stringify({ ...JSON.parse(readFileSync(target)), lastFocusedAt: 1000 }))
   })
   assert.equal(first.receipt.verification.ok, false)
   const result = await finishPending(h.paths, { cloud: cloudFixture(h, { account: from.account, org: from.org }) })
@@ -3288,8 +3308,8 @@ test('rehome verification catches transcript and sidecar drift after placement',
   const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
   const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
   const inv = await inventory([from], to, h.paths)
-  const result = await move(inv, to, h.paths, (stage) => {
-    if (stage !== 'sidecars') return
+  const result = await move(inv, to, h.paths, (stage, _text, progress) => {
+    if (stage !== 'verify' || progress?.completed !== 0) return
     appendFileSync(transcript, `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
     appendFileSync(sidecar, '{"after":true}\n')
   })
@@ -3553,6 +3573,114 @@ test('inventory interrupts preparation at record boundaries when its deadline is
   assert.equal((await readdir(h.dir('T'))).length, 0)
 })
 
+test('a thousand source records finish one restart with bounded polling and a linear journal', async () => {
+  const h = await home(), amount = 1000
+  for (let i = 0; i < amount; i++) {
+    const session = id(10000 + i)
+    await h.write(session, [entry('user', 20000 + i, null, session)])
+    await h.record('P', session, rehomeRecord({ sessionSettings: { fixture: 'x'.repeat(4096) } }))
+  }
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(id(10000)), inspections = 0, journalBytes = 0, checkpointBytes = 0
+  const io = { inspect: () => { inspections++; return rows }, command: async file => {
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, _text, progress) => {
+    if (stage !== 'move' || progress?.completed !== amount) return
+    const log = readdirSync(h.paths.state).find(name => name.endsWith('.journal'))
+    journalBytes = readFileSync(path.join(h.paths.state, log)).length
+    checkpointBytes = readFileSync(path.join(h.paths.state, log.slice(0, -8))).length
+  } })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, amount)
+  assert.equal(result.receipt.superseded.length, amount)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.equal((await readdir(h.dir('T'))).length, amount)
+  assert.ok(inspections < 150, `Unexpected process scans: ${inspections}`)
+  assert.ok(checkpointBytes < 5000, `Receipt was rewritten during placement: ${checkpointBytes}`)
+  assert.ok(journalBytes < 12_000 * amount, `Journal grew beyond its per-record bound: ${journalBytes}`)
+  assert.equal((await readdir(h.paths.state)).some(name => name.endsWith('.journal')), false)
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal((await readdir(h.dir('P'))).length, amount)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
+test('interrupted placement replays complete journal entries and ignores only a torn final append', async () => {
+  for (const keep of [3, 4]) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    const original = await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const reported = []
+    await assert.rejects(move(await inventory([from], to, h.paths), to, h.paths, (stage, text, progress) => {
+      reported.push({ stage, text, progress })
+      if (stage === 'move' && progress?.completed === 1) throw new Error('fixture interrupted publication')
+    }), /fixture interrupted publication/)
+    const log = (await readdir(h.paths.state)).find(name => name.endsWith('.journal'))
+    const file = path.join(h.paths.state, log)
+    const patches = (await readFile(file, 'utf8')).trimEnd().split('\n')
+    assert.equal(patches.length, 4)
+    assert.ok(JSON.parse(patches[2]).pending.created)
+    await writeFile(file, patches.slice(0, keep).join('\n') + '\n{"sequence":')
+    assert.equal(reported.some(row => row.stage === 'move' && row.text.includes('✓')), false)
+    assert.equal(JSON.parse(await readFile(file.slice(0, -8))).sessions.length, 0)
+    const recovered = await sweep(h.paths)
+    assert.ok(recovered.recovered)
+    assert.equal((await readdir(h.dir('T'))).length, 0)
+    assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)), original)
+    assert.equal((await readdir(h.paths.state)).some(name => name.endsWith('.journal')), false)
+    assert.equal((await sweep(h.paths)).recovered, undefined)
+  }
+})
+
+test('a restart timeout before finalization never reports placed records as completed moves', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(), time = 0
+  const io = { now: () => time, budget: 1000, reserve: 200, inspect: () => rows, command: async file => {
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io }), reported = []
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, text, progress) => {
+    reported.push({ stage, text, progress })
+    if (stage === 'move' && progress?.completed === 1) time = 801
+  } })
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /mutation deadline/)
+  assert.equal(result.restarted, true)
+  assert.equal(reported.some(row => row.stage === 'move' && row.text.includes('✓')), false)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  await sweep(h.paths, { io })
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
+test('a forced boundary detects reopening before retirement even inside the polling interval', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(), opens = 0
+  const io = { now: () => 0, inspect: () => rows, command: async file => {
+    if (!file.endsWith('osascript')) opens++
+    rows = []
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 1) rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+  } })
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /reopened before/)
+  assert.equal(opens, 0)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
 test('restart warnings group a helper and its child as one session and resolve copied records', async () => {
   const h = await home(), other = id(400)
   await h.record('P', SOURCE, { title: 'First session' })
@@ -3683,6 +3811,53 @@ test('Finish pending offers a receipt-bound restart for a connected mirror and c
   assert.equal(quits, 1)
 })
 
+test('mixed cloud Finish keeps its first pass preparatory until the restart decision', async () => {
+  const h = await home(), other = id(300)
+  const histories = { cse_ready: [entry('user', 1, null, SOURCE)], cse_open: [entry('user', 300, null, other)] }
+  const connected = { cse_ready: true, cse_open: true }, status = { cse_ready: 'active', cse_open: 'active' }
+  for (const [session, remote] of [[SOURCE, 'ready'], [other, 'open']]) {
+    await h.write(session, histories[`cse_${remote}`])
+    await h.record('P', session, rehomeRecord({ bridgeSessionIds: [`session_${remote}`] }))
+  }
+  const cloud = cloudFixture(h, {
+    list: async () => Object.keys(histories).map(id => remoteSession({ id, title: id, status: status[id] })),
+    session: async id => remoteState(status[id], { connection_status: connected[id] ? 'connected' : 'disconnected' }),
+    eventRows: async id => remoteRows(histories[id]), archive: async id => { status[id] = 'archived' }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
+  connected.cse_ready = false
+  let rows = desktopFixture(other)
+  const io = { inspect: () => rows, command: async file => {
+    if (file.endsWith('osascript')) { rows = []; connected.cse_open = false }
+    else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const before = [], after = []
+  const plan = await finishWorkflow(h.paths, { cloud, io, report: (stage, text, extra) => before.push({ stage, text, ...extra }) })
+  assert.equal(plan.plan.kind, 'finish')
+  assert.equal(status.cse_ready, 'archived')
+  assert.equal(status.cse_open, 'active')
+  assert.ok(before.some(event => event.stage === 'cloud' && event.completed === 1))
+  assert.ok(before.filter(event => event.live).every(event => event.preparatory === true))
+  const completed = await finishWorkflow(h.paths, { cloud, io, approve: plan.plan.token, report: (stage, text, extra) => after.push({ stage, text, ...extra }) })
+  assert.equal(completed.file, moved.file)
+  assert.equal(completed.complete, true)
+  assert.equal(completed.receipt.remote.length, 2)
+  assert.ok(after.some(event => event.stage === 'reopen'))
+  assert.ok(after.filter(event => event.live).every(event => !event.preparatory))
+})
+
+test('a local move explicitly reports that no cloud phase remains', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T), cloud = []
+  const result = await move(await inventory([from], to, h.paths), to, h.paths, (stage, _text, extra) => { if (stage === 'cloud') cloud.push(extra) })
+  assert.equal(result.ok, true)
+  assert.deepEqual(cloud, [{ live: true, completed: 0, total: 0 }])
+})
+
 
 test('process registry identifies a new worker without argv ids and rejects stale pid reuse', () => {
   const started = 'Fri Sep  4 18:00:00 2026'
@@ -3699,7 +3874,7 @@ test('process registry identifies a new worker without argv ids and rejects stal
   assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
 })
 
-test('Swift queues the clicked command once and distinguishes metadata notices from unreadable records', async () => {
+test('Swift preserves command, progress, metadata, and completion states', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
   let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct TransplantApp: App {')[0]
   const start = source.indexOf('    private func run(_ args: [String]')
@@ -3715,11 +3890,127 @@ test('Swift queues the clicked command once and distinguishes metadata notices f
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 extension Model {
     func checkSweep() { sweep() }
+    func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
+    func checkStarted(_ secondsAgo: TimeInterval) { operationStarted = ProcessInfo.processInfo.systemUptime - secondsAgo }
 }
 @main
 struct StateChecks {
     @MainActor
     static func main() {
+        let menuSize = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)!.size
+        var textHeight: Int?
+        for badge in ["", "0%", "9%", "10%", "47%", "99%", "100%"] {
+            let image = MenuLabel(symbol: "arrow.left.arrow.right", badge: badge).image
+            precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
+            if !badge.isEmpty {
+                let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
+                let rows = (0..<bitmap.pixelsHigh).filter { y in (0..<bitmap.pixelsWide).contains { x in bitmap.colorAt(x: x, y: y)!.alphaComponent > 0.4 } }.count
+                precondition(textHeight == nil || rows == textHeight)
+                textHeight = rows
+            }
+        }
+        var progress = MoveProgress(now: 0)
+        var previous = 0
+        for (stage, completed, total, at) in [("scan", 0, 100, 0.0), ("scan", 50, 100, 2.0), ("scan", 100, 100, 4.0), ("cloud scan", 1, 2, 5.0), ("desktop", 0, 1, 6.0), ("scan", 1, 100, 8.0), ("scan", 100, 100, 8.2), ("move", 1, 100, 8.3), ("move", 100, 100, 8.5), ("verify", 100, 100, 8.6), ("retire", 100, 100, 8.7), ("finalize", 0, 1, 8.8), ("reopen", 0, 1, 9.0), ("cloud", 1, 2, 10.0), ("cloud", 2, 2, 11.0)] {
+            progress.update(stage, completed: completed, total: total, now: at)
+            precondition(progress.percent >= previous && progress.percent <= 99)
+            previous = progress.percent
+        }
+        progress.refresh(10000)
+        precondition(progress.percent == 99)
+        for stage in ["", "undo", "keep-local", "unknown"] {
+            var idle = MoveProgress(now: 0)
+            idle.update(stage, completed: nil, total: nil, now: 1)
+            idle.record(120)
+            precondition(!idle.hasProgress && idle.observed.isEmpty)
+            precondition(idle.costs == MoveProgress.defaults)
+        }
+        var empty = MoveProgress(now: 0)
+        empty.update("scan", completed: 0, total: 0, now: 0)
+        empty.update("retire", completed: nil, total: nil, now: 1)
+        empty.update("finalize", completed: nil, total: nil, now: 2)
+        empty.record(3)
+        precondition(empty.observed.isEmpty)
+        var reopen = MoveProgress(now: 0)
+        reopen.update("reopen", completed: nil, total: nil, now: 10)
+        reopen.record(12)
+        precondition(reopen.observed["prepare"] == nil && reopen.observed["reopen"] == 2)
+        var local = MoveProgress(now: 0)
+        local.update("scan", completed: 100, total: 100, now: 1)
+        local.record(1)
+        precondition(local.observed["prepare"] == 0.01)
+        local.update("move", completed: 100, total: 100, now: 2)
+        local.update("rescue", completed: 0, total: 0, now: 2)
+        precondition(!local.skipped.contains("move"))
+        local.update("finalize", completed: nil, total: nil, now: 3)
+        local.update("cloud", completed: 0, total: 0, now: 4)
+        precondition(local.skipped.contains("cloud") && local.percent > 90)
+        var mixed = MoveProgress(now: 0)
+        mixed.update("rescue", completed: 1, total: 1, preparatory: true, now: 1)
+        mixed.update("cloud", completed: 1, total: 1, preparatory: true, now: 2)
+        let checked = mixed.percent
+        precondition(checked < 99 && mixed.phase == "cloudScan")
+        mixed.update("desktop", completed: nil, total: nil, now: 3)
+        precondition(mixed.phase == "close" && mixed.percent >= checked)
+        mixed.update("reopen", completed: nil, total: nil, now: 4)
+        precondition(mixed.phase == "reopen")
+        var paused = MoveProgress(now: 0)
+        paused.update("scan", completed: 0, total: 1, now: 0)
+        paused.paused = 2
+        paused.resume(102)
+        paused.record(103)
+        precondition(paused.observed["prepare"] == 3)
+        let progressModel = Model(demo: Demo.accounts)
+        progressModel.begin()
+        precondition(progressModel.badge == "0%")
+        progressModel.handle("{\"stage\":\"cloud\",\"text\":\"1/1\",\"live\":true,\"completed\":1,\"total\":1,\"preparatory\":true}")
+        precondition(progressModel.moveProgress.phase == "cloudScan" && progressModel.moveProgress.percent < 99)
+        progressModel.begin()
+        progressModel.handle("{\"stage\":\"scan\",\"text\":\"50/100\",\"live\":true,\"completed\":50,\"total\":100}")
+        let percentage = progressModel.badge
+        precondition(percentage.hasSuffix("%") && !percentage.contains("/"))
+        progressModel.handle("{\"stage\":\"inventory\",\"text\":\"100 sessions\"}")
+        precondition(progressModel.badge == percentage)
+        progressModel.begin(resetProgress: false)
+        precondition(progressModel.badge == percentage)
+        progressModel.handle("{\"done\":true,\"ok\":false,\"moved\":0,\"reason\":\"fixture rollback\"}")
+        progressModel.checkFinish(1)
+        precondition(progressModel.badge.isEmpty && !progressModel.running)
+        progressModel.begin()
+        progressModel.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":100}")
+        progressModel.checkFinish(0)
+        precondition(progressModel.badge == "100%" && !progressModel.running)
+        let completed = Model(demo: Demo.accounts)
+        completed.selectTarget(Demo.accounts[2].id)
+        completed.begin()
+        completed.checkStarted(8.1)
+        completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
+        precondition(completed.visibleCompletion == nil)
+        completed.checkFinish(0)
+        precondition(completed.visibleCompletion?.summary == "167 sessions moved to Personal")
+        precondition(completed.visibleCompletion?.detail == "History verified · 8.1 seconds")
+        completed.note = "A moved session has a newer title"
+        precondition(completed.visibleCompletion == nil)
+        completed.selectTarget(Demo.accounts[3].id)
+        precondition(completed.completion == nil)
+        for event in [
+            "{\"done\":true,\"ok\":true,\"complete\":false,\"moved\":167}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167,\"pendingCloud\":1}",
+            "{\"done\":true,\"ok\":false,\"complete\":true,\"moved\":167}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":0}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167,\"keptLocal\":1}",
+            "{\"undone\":true,\"sessions\":167}"
+        ] {
+            completed.begin()
+            completed.handle(event)
+            completed.checkFinish(0)
+            precondition(completed.visibleCompletion == nil)
+        }
+        completed.begin()
+        completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
+        completed.checkFinish(1)
+        precondition(completed.completion == nil)
+        requests = []
         let model = Model(demo: Demo.accounts)
         model.selectTarget(Demo.accounts[2].id)
         let selected = model.to

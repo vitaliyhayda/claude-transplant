@@ -268,10 +268,14 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const state = { at: stamp(), requestedAt: new Date().toISOString(), app: paths.claudeApp, desktop: plan.desktop, held: plan.held,
     deadline: new Date(Date.now() + budget).toISOString(), outcome: 'closing' }
   const save = () => saveJson(file, state)
-  const check = () => {
+  let nextInspection = -Infinity
+  const check = (force = false) => {
     if (now() >= mutationDeadline) throw new Error('Restart mutation deadline reached')
+    if (!force && now() < nextInspection) return
     const possible = io.inspect || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
     if (possible && appProcess(paths, inspect())) throw new Error('Claude Desktop reopened before the held move finished. Retry the move.')
+    nextInspection = now() + 100
+    if (now() >= mutationDeadline) throw new Error('Restart mutation deadline reached')
   }
   await mkdir(paths.state, { recursive: true, mode: 0o700 })
   await save()
@@ -291,7 +295,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.exitedAt = new Date().toISOString()
       state.outcome = 'moving'
       await save()
-      check()
+      check(true)
       result = await work({ at: state.at, restart: state, check })
     }
   } catch (error) {
@@ -305,7 +309,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'reopening'
       const remaining = deadline - now()
       if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
-      const opened = await run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining))
+      const opening = run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining))
+      try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
+      const opened = await opening
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, deadline, now, wait)
       state.outcome = opened.status === 0 && present ? 'reopened' : 'reopen-failed'
       if (state.outcome === 'reopened') state.reopenedAt = new Date().toISOString()
@@ -1098,7 +1104,6 @@ const sameEvents = (a, b) => {
 const historyIncluded = (a, b) => a.comparable && b.comparable && a.roots.isSubsetOf(b.roots) && a.state === b.state && sameEvents(a, b)
 const carries = (a, b) => Boolean(a.sidecar && b.sidecar && a.sidecar.set.isSubsetOf(b.sidecar.set))
 const included = (a, b) => historyIncluded(a, b) && carries(a, b)
-const overlaps = (a, b) => !a.roots.isDisjointFrom(b.roots)
 const progress = (report, stage, completed, total) => report(stage, `${completed}/${total}`, { live: true, completed, total })
 const desktopRecordOf = (row) => row.session?.record ?? row.record ?? {}
 const desktopFileOf = (row) => typeof row === 'string' ? row : row.session?.file ?? row.file
@@ -1383,7 +1388,13 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     } else pending.push(s)
   }
   const { move, blocked } = localPlan(pending, to)
-  const apart = reps.filter((a) => reps.some((b) => a !== b && overlaps(a, b))).length
+  const rootOwner = new Map(), divergent = new Set()
+  for (const row of reps) for (const root of row.roots) {
+    const prior = rootOwner.get(root)
+    if (prior) { divergent.add(prior); divergent.add(row) }
+    else rootOwner.set(root, row)
+  }
+  const apart = divergent.size
   const cloudCutoff = options.cloudCutoff ?? (cloudRequested ? requestedAt : null)
   const cloudPlan = await cloudInventory(options.cloud, from, targets, options.cloudTargetOnly ? [] : move, cache, report, cloudCutoff, found, options.cloudSessionIds)
   const retiring = new Set([...move, ...there].flatMap((row) => (row.members ?? [row]).map((member) => member.file)))
@@ -1638,7 +1649,7 @@ async function latestReceipt(paths) {
   const name = (await receipts(paths)).at(-1)
   if (!name) return null
   const file = path.join(paths.state, name)
-  const receipt = await readJson(file).catch(() => null)
+  const receipt = await readReceipt(file).catch(() => null)
   return receipt ? { name, file, receipt } : { name, file, corrupt: true }
 }
 
@@ -1671,6 +1682,47 @@ const saveText = async (file, text) => {
 }
 
 const saveJson = (file, value, spacing = 2) => saveText(file, jsonText(value, spacing))
+
+async function readReceipt(file) {
+  const receipt = await readJson(file)
+  const text = await readFile(`${file}.journal`, 'utf8').catch((error) => {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  })
+  for (const line of text.split('\n').slice(0, -1)) {
+    const patch = JSON.parse(line)
+    if (!Number.isSafeInteger(patch.sequence) || patch.sequence < 1) throw new Error('Invalid move journal sequence')
+    if (patch.sequence <= (receipt.journalSequence ?? 0)) continue
+    if (patch.sequence !== (receipt.journalSequence ?? 0) + 1) throw new Error('Incomplete move journal')
+    for (const key of ['sessions', 'failed', 'retained']) {
+      if (!Array.isArray(patch[key])) throw new Error('Invalid move journal entries')
+      if (patch[key].length) (receipt[key] ??= []).push(...patch[key])
+    }
+    receipt.pending = patch.pending
+    receipt.journalSequence = patch.sequence
+  }
+  return receipt
+}
+
+async function placementJournal(file, receipt) {
+  await saveJson(file, receipt)
+  const name = `${file}.journal`
+  await rm(name, { force: true })
+  const handle = await open(name, 'ax', 0o600)
+  const sizes = Object.fromEntries(['sessions', 'failed', 'retained'].map(key => [key, receipt[key]?.length ?? 0]))
+  return {
+    save: async () => {
+      const patch = { sequence: (receipt.journalSequence ?? 0) + 1, pending: receipt.pending ?? null }
+      for (const key of Object.keys(sizes)) patch[key] = (receipt[key] ?? []).slice(sizes[key])
+      try { await handle.writeFile(jsonText(patch, 0)) }
+      catch (error) { error.code = 'JOURNAL_WRITE'; throw error }
+      receipt.journalSequence = patch.sequence
+      for (const key of Object.keys(sizes)) sizes[key] = receipt[key]?.length ?? 0
+    },
+    close: () => handle.close(),
+    compact: async () => { await saveJson(file, receipt); await rm(name, { force: true }) }
+  }
+}
 
 async function recoveryPending(paths) {
   const latest = await latestReceipt(paths)
@@ -1955,6 +2007,7 @@ async function reconcileFiles(paths, options = {}) {
     })
   }
   await saveJson(p.file, receipt)
+  await rm(`${p.file}.journal`, { force: true })
   return recovered.length === 1 ? recovered[0] : {
     title: recovered.map((item) => item.title).join(' + '),
     error: recovered.map((item) => item.error).join(', ')
@@ -1993,9 +2046,14 @@ const carrying = (inv, landed, gone = new Set()) => [
   ...landed,
   ...inv.targets.filter((t) => t.transcript && !gone.has(t)).map((t) => ({ by: t.id, history: t }))
 ]
-const owners = (sources, carried) => sources.map((s) => ({ s, owner: carried.find((c) => included(s, c.history)) })).filter((row) => row.owner)
+const owners = (sources, carried) => {
+  const candidates = new Map(sources.filter(row => row.roots.size).map(row => [row.roots.values().next().value, []]))
+  for (const carrier of carried) for (const root of carrier.history.roots) candidates.get(root)?.push(carrier)
+  return sources.map(s => ({ s, owner: candidates.get(s.roots.values().next().value)?.find(carrier => included(s, carrier.history)) })).filter(row => row.owner)
+}
 
 async function retire(inv, receipt, paths, at, problems, save, report = () => {}, check = () => {}) {
+  check(true)
   report('retire', 'checking', { live: true })
   const bad = new Set(problems.map((p) => p.id))
   const dest = path.join(paths.state, 'quarantine', at)
@@ -2096,6 +2154,7 @@ async function retire(inv, receipt, paths, at, problems, save, report = () => {}
   receipt.retiring = plan
   await save()
   try {
+    check(true)
     const parkWorkers = workers()
     await park(plan, async (item) => {
       check()
@@ -2107,7 +2166,7 @@ async function retire(inv, receipt, paths, at, problems, save, report = () => {}
       const row = item.source ? sourceRows.get(item.moved[0][0]) : targetRows.get(item.moved.at(-1)[0])
       if (!row || !(await untouched(row, parkWorkers, row.strategy !== 'rehome'))) throw new Error(`${item.source ? 'source' : 'destination'} changed during retirement: ${item.id}`)
     })
-    check()
+    check(true)
     const postWorkers = workers()
     for (const id of new Set(plan.map((item) => item.by))) {
       const carrier = carriers.get(id)
@@ -2458,7 +2517,10 @@ function finishCloudAttempt(receipt, cloud, later = [], waiting = []) {
 
 async function archiveCloud(inv, receipt, save, report = () => {}) {
   const matches = (inv.cloud?.matches ?? []).filter((match) => !match.target.failed)
-  if (!matches.length) return
+  if (!matches.length) {
+    if (!inv.deferredCloudSources?.length && (!inv.cloudRequested || inv.cloud?.checked)) progress(report, 'cloud', 0, 0)
+    return
+  }
   const cloud = inv.cloud.client
   const failedVerification = new Set(receipt.verification?.problems?.map((problem) => problem.id) ?? [])
   let archived = 0
@@ -2605,7 +2667,7 @@ async function restoreRemote(receipt, file, paths, supplied) {
 }
 
 async function transfer(inv, to, paths, report, context = {}) {
-  context.check?.()
+  context.check?.(true)
   if (context.restart && inv.cloud?.checked) throw new Error('Cloud work cannot run inside the restart window')
   const deferred = await deferredWorkflow(paths)
   if (deferred && context.existing?.file !== deferred.file) return { deferred, ok: false, complete: false, pendingCloud: deferred.mode === 'cloud' ? deferred.sources.length : 0 }
@@ -2658,50 +2720,43 @@ async function transfer(inv, to, paths, report, context = {}) {
   }
   const landedRecordIds = new Set(to.sessions.map((session) => session.record.sessionId).filter(Boolean))
   progress(report, 'move', 0, inv.move.length)
-  for (const [i, s] of inv.move.entries()) {
-    context.check?.()
-    const targetId = s.id
-    const made = [path.join(to.dir, path.basename(s.file))]
-    receipt.pending = { strategy: 'rehome', id: s.id, title: s.title, targetId, made, recordSha: null, creationRequired: true }
-    await save()
-    try {
-      if (s.record.forkedFromSessionId && !landedRecordIds.has(s.record.forkedFromSessionId)) throw new Error('parent Desktop record did not move')
-      const row = await rehomeOne(s, to, async (journal) => { Object.assign(receipt.pending, journal); await save() }, rehomeGuard)
-      receipt.sessions.push(row)
-      if (row.targetRecordId) landedRecordIds.add(row.targetRecordId)
-      events += row.events
-    } catch (error) {
-      const raw = await readFile(made[0]).catch(() => null)
-      const created = rehomeGuard.created.get(made[0])
-      const found = await stat(made[0]).catch(() => null)
-      const ours = created && found?.dev === created.dev && found?.ino === created.ino
-      const unchanged = ours && raw && receipt.pending.recordSha && sha(raw) === receipt.pending.recordSha
-      if (unchanged) await quarantine(made, path.join(paths.state, 'quarantine', at, 'failed'))
-      const retained = Boolean(ours && raw && !unchanged)
-      if (retained) receipt.retained = [...(receipt.retained ?? []), { id: s.id, title: s.title, targetId, artifacts: made }]
-      receipt.failed.push({ id: s.id, title: s.title, error: error.message, ...(retained ? { retained, targetId, artifacts: made } : {}) })
+  const journal = inv.move.length ? await placementJournal(file, receipt) : null
+  try {
+    for (const [i, s] of inv.move.entries()) {
+      context.check?.()
+      const targetId = s.id
+      const made = [path.join(to.dir, path.basename(s.file))]
+      receipt.pending = { strategy: 'rehome', id: s.id, title: s.title, targetId, made, recordSha: null, creationRequired: true }
+      await journal.save()
+      try {
+        if (s.record.forkedFromSessionId && !landedRecordIds.has(s.record.forkedFromSessionId)) throw new Error('parent Desktop record did not move')
+        const row = await rehomeOne(s, to, async (patch) => { Object.assign(receipt.pending, patch); await journal.save() }, rehomeGuard)
+        receipt.sessions.push(row)
+        if (row.targetRecordId) landedRecordIds.add(row.targetRecordId)
+        events += row.events
+      } catch (error) {
+        if (error.code === 'JOURNAL_WRITE') throw error
+        const raw = await readFile(made[0]).catch(() => null)
+        const created = rehomeGuard.created.get(made[0])
+        const found = await stat(made[0]).catch(() => null)
+        const ours = created && found?.dev === created.dev && found?.ino === created.ino
+        const unchanged = ours && raw && receipt.pending.recordSha && sha(raw) === receipt.pending.recordSha
+        if (unchanged) await quarantine(made, path.join(paths.state, 'quarantine', at, 'failed'))
+        const retained = Boolean(ours && raw && !unchanged)
+        if (retained) receipt.retained = [...(receipt.retained ?? []), { id: s.id, title: s.title, targetId, artifacts: made }]
+        receipt.failed.push({ id: s.id, title: s.title, error: error.message, ...(retained ? { retained, targetId, artifacts: made } : {}) })
+      }
+      receipt.pending = null
+      await journal.save()
+      progress(report, 'move', i + 1, inv.move.length)
     }
-    receipt.pending = null
-    await save()
-    progress(report, 'move', i + 1, inv.move.length)
-  }
+  } finally { await journal?.close() }
+  await journal?.compact()
+  context.check?.(true)
   const rescues = inv.cloud?.matches.filter((match) => match.target.kind === 'rescue') ?? []
   const rescued = await rescueCloud(inv, receipt, to, paths, save, report)
   events += rescued.events
   const done = receipt.sessions.length
-  if (inv.move.length || rescues.length) {
-    const rehomed = receipt.sessions.filter((row) => row.strategy === 'rehome').length
-    const rescuedCount = receipt.sessions.filter((row) => row.strategy === 'remote').length
-    await save()
-    report('move', [
-      `${count(done)} ✓`,
-      `${count(events)} events`,
-      rehomed ? `${count(rehomed)} zero-copy` : null,
-      rescuedCount ? `${count(rescuedCount)} rescued` : null,
-      receipt.failed.length ? `${receipt.failed.length} failed` : null
-    ].filter(Boolean).join(' | '))
-    report('sidecars', `${count(receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0))} files | unchanged ✓`)
-  }
   const { ok, lines, problems } = await verify(receipt.sessions.slice(previousCount), report, context.check)
   const rescueIds = new Set(rescued.rows.map((row) => row.targetId))
   const recordedProblems = problems.map((problem) => rescueIds.has(problem.id) ? taggedCloudFailure(inv.cloud, problem) : problem)
@@ -2715,11 +2770,24 @@ async function transfer(inv, to, paths, report, context = {}) {
     if (!context.existing) receipt.cloudChecks = receipt.cloudChecks.filter((check) => inv.cloud?.checked && sameAccount(check, inv.cloud) || inv.deferredCloudSources?.some((source) => sameAccount(check, source)) || actual.some((source) => sameAccount(check, source)))
     for (const source of actual) if (!receipt.cloudChecks.some((check) => sameAccount(check, source))) receipt.cloudChecks.push({ ...source, status: 'pending' })
   }
+  context.check?.(true)
   receipt.finalizing = false
   delete receipt.appendCheckpoint
   delete receipt.automaticCloudAttempt
   receipt.failed = receipt.failed.filter((row) => !(heldIds.has(row.id) && [WORKER_OWNS, PARENT_MISSING].includes(row.error)))
   await save()
+  if (inv.move.length || rescues.length) {
+    const rehomed = receipt.sessions.filter((row) => row.strategy === 'rehome').length
+    const rescuedCount = receipt.sessions.filter((row) => row.strategy === 'remote').length
+    report('move', [
+      `${count(done)} ${receipt.verification.ok ? '✓' : 'need verification'}`,
+      `${count(events)} events`,
+      rehomed ? `${count(rehomed)} zero-copy` : null,
+      rescuedCount ? `${count(rescuedCount)} rescued` : null,
+      receipt.failed.length ? `${receipt.failed.length} failed` : null
+    ].filter(Boolean).join(' | '))
+    if (receipt.verification.ok) report('sidecars', `${count(receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0))} files | unchanged ✓`)
+  }
   await archiveCloud(inv, receipt, save, report)
   if (inv.cloud?.checked) finishCloudAttempt(receipt, inv.cloud, inv.cloud.later, inv.cloud.waiting)
   if (inv.cloud?.later.length) report('later', inv.cloud.later.map((row) => row.title).join('\n'))
@@ -3079,7 +3147,8 @@ export async function finishWorkflow(paths, options = {}) {
     if (!restarted.ok || restarted.plan) return restarted
     return completeActiveCloud({ ...restarted, file: deferred.file, receipt: deferred.receipt }, paths, options)
   }
-  const result = await finishPending(paths, options)
+  const report = (stage, text, extra = {}) => options.report?.(stage, text, extra.live ? { ...extra, preparatory: true } : extra)
+  const result = await finishPending(paths, { ...options, report })
   const table = options.io?.inspect?.() ?? options.processes ?? processTable(paths.claudeApp)
   const checked = result.receipt?.cloudChecks.find(check => sameAccount(check, result.checkedAccount))
   if (!options.background && checked?.waiting?.length && canRestartWaiting({ cloudChecks: [checked] }, table)) {
@@ -3271,6 +3340,7 @@ function reporter(json) {
       stage,
       text,
       ...(extra.live ? { live: true } : {}),
+      ...(extra.preparatory ? { preparatory: true } : {}),
       ...(Number.isInteger(extra.completed) ? { completed: extra.completed } : {}),
       ...(Number.isInteger(extra.total) ? { total: extra.total } : {})
     }
