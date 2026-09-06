@@ -3874,7 +3874,7 @@ test('process registry identifies a new worker without argv ids and rejects stal
   assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
 })
 
-test('Swift queues the clicked command once and distinguishes metadata notices from unreadable records', async () => {
+test('Swift preserves command, progress, metadata, and completion states', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
   let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct TransplantApp: App {')[0]
   const start = source.indexOf('    private func run(_ args: [String]')
@@ -3891,6 +3891,7 @@ test('Swift queues the clicked command once and distinguishes metadata notices f
 extension Model {
     func checkSweep() { sweep() }
     func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
+    func checkStarted(_ secondsAgo: TimeInterval) { operationStarted = ProcessInfo.processInfo.systemUptime - secondsAgo }
 }
 @main
 struct StateChecks {
@@ -3979,6 +3980,36 @@ struct StateChecks {
         progressModel.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":100}")
         progressModel.checkFinish(0)
         precondition(progressModel.badge == "100%" && !progressModel.running)
+        let completed = Model(demo: Demo.accounts)
+        completed.selectTarget(Demo.accounts[2].id)
+        completed.begin()
+        completed.checkStarted(8.1)
+        completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
+        precondition(completed.visibleCompletion == nil)
+        completed.checkFinish(0)
+        precondition(completed.visibleCompletion?.summary == "167 sessions moved to Personal")
+        precondition(completed.visibleCompletion?.detail == "History verified · 8.1 seconds")
+        completed.note = "A moved session has a newer title"
+        precondition(completed.visibleCompletion == nil)
+        completed.selectTarget(Demo.accounts[3].id)
+        precondition(completed.completion == nil)
+        for event in [
+            "{\"done\":true,\"ok\":true,\"complete\":false,\"moved\":167}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167,\"pendingCloud\":1}",
+            "{\"done\":true,\"ok\":false,\"complete\":true,\"moved\":167}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":0}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167,\"keptLocal\":1}",
+            "{\"undone\":true,\"sessions\":167}"
+        ] {
+            completed.begin()
+            completed.handle(event)
+            completed.checkFinish(0)
+            precondition(completed.visibleCompletion == nil)
+        }
+        completed.begin()
+        completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
+        completed.checkFinish(1)
+        precondition(completed.completion == nil)
         requests = []
         let model = Model(demo: Demo.accounts)
         model.selectTarget(Demo.accounts[2].id)

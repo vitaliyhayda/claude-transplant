@@ -223,6 +223,7 @@ final class Model: ObservableObject {
     @Published var detailsExpanded = false
     @Published var progressLabel = "Preparing sessions"
     @Published var note = ""
+    @Published var completion: (summary: String, detail: String)?
     @Published var badge = ""
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
@@ -239,6 +240,8 @@ final class Model: ObservableObject {
     private var pendingResult = false
     private var pendingPlan: Event?
     private var operationArgs: [String] = []
+    private var operationStarted: TimeInterval?
+    private var operationDestination: String?
     private var approvalAttempted = false
     private var poller: AnyCancellable?
     private var progressTimer: AnyCancellable?
@@ -309,6 +312,9 @@ final class Model: ObservableObject {
         }
     }
     var displaySummary: String { running ? progressLabel : note.isEmpty ? pendingPrompt : note }
+    var visibleCompletion: (summary: String, detail: String)? {
+        !running && completion?.summary == note ? completion : nil
+    }
 
     func canSource(_ account: Account) -> Bool { account.id != to }
 
@@ -365,6 +371,7 @@ final class Model: ObservableObject {
         lines = []
         detailsExpanded = false
         note = ""
+        completion = nil
         restartAvailable = false
     }
 
@@ -410,11 +417,14 @@ final class Model: ObservableObject {
         lines = []
         detailsExpanded = false
         note = ""
+        completion = nil
         running = true
         restartAvailable = false
         symbol = "arrow.triangle.2.circlepath"
         progressLabel = "Preparing sessions"
         if resetProgress {
+            operationStarted = nil
+            operationDestination = accounts.first(where: { $0.id == to })?.plan
             let costs = UserDefaults.standard.dictionary(forKey: MoveProgress.storageKey) as? [String: Double] ?? [:]
             moveProgress = MoveProgress(costs: demo || snapshot ? [:] : costs)
         }
@@ -463,6 +473,10 @@ final class Model: ObservableObject {
                 parts = [event.restarted == true ? "Claude Desktop restarted" : event.complete == true ? "Move complete" : "Nothing to move"]
             }
             note = parts.joined(separator: ", ")
+            if event.ok == true, event.complete == true, moved > 0, issues == 0, !pendingResult, event.keptLocal == nil, event.heldCancelled == nil {
+                if let destination = operationDestination ?? accounts.first(where: { $0.id == to })?.plan { note += " to " + destination }
+                completion = (note, "History verified")
+            }
             restartAvailable = event.restart ?? false
             if !pendingResult && event.ok != false { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
             notify(note, "")
@@ -512,7 +526,7 @@ final class Model: ObservableObject {
     }
 
     private func runOperation(_ args: [String], remember: Bool = true) {
-        if remember { operationArgs = args; approvalAttempted = false }
+        if remember { operationArgs = args; approvalAttempted = false; operationStarted = ProcessInfo.processInfo.systemUptime }
         run(args, line: { [weak self] in self?.handle($0) }) { [weak self] status, error in self?.finish(status, error) }
     }
 
@@ -538,6 +552,7 @@ final class Model: ObservableObject {
             suppress = alert.suppressionButton?.state == .on
         }
         pendingPlan = nil
+        if let paused = moveProgress.paused, let started = operationStarted { operationStarted = started + ProcessInfo.processInfo.systemUptime - paused }
         moveProgress.resume()
         if response == .alertFirstButtonReturn {
             if suppress { skipRestartWarning = true; UserDefaults.standard.set(true, forKey: "skipRestartWarning") }
@@ -631,6 +646,10 @@ final class Model: ObservableObject {
             }
             confirmRestart(plan)
             return
+        }
+        if status != 0 { completion = nil }
+        if status == 0, let result = completion, let started = operationStarted {
+            completion = (result.summary, "History verified · " + String(format: "%.1f seconds", max(0.1, ProcessInfo.processInfo.systemUptime - started)))
         }
         running = false
         badge = status == 0 && !pendingResult ? "100%" : ""
@@ -873,6 +892,34 @@ struct Pill: View {
     }
 }
 
+struct CompletionNotice: View {
+    let summary: String
+    let detail: String
+    private let green = Color(red: 0.38, green: 0.84, blue: 0.61)
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Circle()
+                .fill(RadialGradient(colors: [green.opacity(0.08), green.opacity(0.03)], center: .topLeading, startRadius: 0, endRadius: 60))
+                .overlay(Circle().strokeBorder(green.opacity(0.4), lineWidth: 1))
+                .overlay(Image(systemName: "checkmark").font(.system(size: 20, weight: .medium)).foregroundStyle(Color(red: 0.48, green: 0.87, blue: 0.66)))
+                .frame(width: 48, height: 48)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(summary).font(.system(size: 15, weight: .medium)).foregroundStyle(Color(red: 0.87, green: 0.91, blue: 0.88))
+                    .lineLimit(1).frame(height: 20, alignment: .leading)
+                Text(detail).font(.system(size: 13)).foregroundStyle(Color(red: 0.59, green: 0.64, blue: 0.61))
+                    .lineLimit(1).frame(height: 17, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .offset(y: -1)
+        }
+        .frame(height: 48)
+        .help(summary + "\n" + detail)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct Panel: View {
     @EnvironmentObject private var model: Model
 
@@ -889,7 +936,10 @@ struct Panel: View {
             if model.running {
                 Bar(value: model.moveProgress.value)
             }
-            if !model.displaySummary.isEmpty {
+            if let completion = model.visibleCompletion {
+                CompletionNotice(summary: completion.summary, detail: completion.detail)
+                    .padding(.vertical, 2).transition(.opacity)
+            } else if !model.displaySummary.isEmpty {
                 Text(model.displaySummary.sentence).font(.callout.weight(.medium))
             }
             if !model.detailLines.isEmpty {
@@ -927,6 +977,7 @@ struct Panel: View {
         .padding(16)
         .frame(width: 2 * columnWidth + Panel.gap + 32)
         .background(Color(white: 0.11))
+        .animation(.easeOut(duration: 0.18), value: model.visibleCompletion?.summary)
         .onAppear { if !model.snapshot { model.panelVisibility(true) } }
         .onDisappear { if !model.snapshot { model.panelVisibility(false) } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
@@ -1024,9 +1075,11 @@ enum Demo {
         model.selectTarget(accounts[2].id)
         model.lines = [("inventory", "318 records | 3 already there | 307 to move"), ("move", "308 ✓ | 307 zero-copy | 1 rescued"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
         model.note = "308 sessions moved"
+        model.completion = (model.note, "History verified · 8.1 seconds")
         let size = ImageRenderer(content: Panel().environmentObject(model).environment(\.colorScheme, .dark)).nsImage?.size
         model.lines = []
         model.note = ""
+        model.completion = nil
         model.restartAvailable = false
         func snap(_ milliseconds: Int) {
             guard let png = Snapshot.data(model, size: size) else { exit(1) }
@@ -1057,6 +1110,7 @@ enum Demo {
         model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
         model.symbol = "checkmark"
         model.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":308,\"failed\":[],\"waiting\":[]}")
+        model.completion = (model.note, "History verified · 8.1 seconds")
         snap(2400)
         try? JSONSerialization.data(withJSONObject: durations).write(to: root.appendingPathComponent("durations.json"))
         exit(0)
