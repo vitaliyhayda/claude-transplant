@@ -82,6 +82,7 @@ struct Event: Decodable {
     let stage: String?
     let text: String?
     let live: Bool?
+    let preparatory: Bool?
     let completed: Int?
     let total: Int?
     let done: Bool?
@@ -118,6 +119,7 @@ extension String {
 }
 
 struct MoveProgress {
+    static let storageKey = "moveProgressCosts.v2"
     static let phases = ["prepare", "cloudScan", "close", "rescan", "move", "verify", "retire", "finalize", "reopen", "cloud"]
     static let defaults: [String: Double] = ["prepare": 0.004, "cloudScan": 1, "close": 2, "rescan": 0.001, "move": 0.0015, "verify": 0.0003, "retire": 0.0002, "finalize": 0.0015, "reopen": 1, "cloud": 1]
     static let scaled: Set<String> = ["prepare", "rescan", "move", "verify", "retire", "finalize"]
@@ -127,7 +129,8 @@ struct MoveProgress {
     var phase = "prepare"
     var started: TimeInterval = 0
     var paused: TimeInterval?
-    var sessions = 1
+    var sessions = 0
+    private(set) var hasProgress = false
     var completed: Int?
     var total: Int?
     var value = 0.0
@@ -144,36 +147,44 @@ struct MoveProgress {
 
     mutating func record(_ now: TimeInterval) {
         let elapsed = now - started
-        guard elapsed > 0.01 else { return }
+        guard hasProgress, elapsed > 0.01, !Self.scaled.contains(phase) || sessions > 0 else { return }
         let sample = elapsed / units(phase)
         observed[phase] = sample
         costs[phase] = sample
     }
 
-    mutating func update(_ stage: String, completed count: Int?, total size: Int?, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        if size == 0 { return }
-        if stage == "desktop" { restarting = true }
-        let next: String
+    mutating func update(_ stage: String, completed count: Int?, total size: Int?, preparatory: Bool = false, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        if stage == "desktop", !preparatory { restarting = true }
+        let mapped: String
         switch stage {
-        case "scan": next = restarting ? "rescan" : "prepare"
-        case "cloud scan": next = restarting || Self.phases.firstIndex(of: phase)! >= 4 ? "cloud" : "cloudScan"
-        case "desktop": next = "close"
-        case "reopen": next = "reopen"
-        case "move", "rescue": next = "move"
-        case "verify", "retire", "finalize": next = stage
-        case "cloud": next = "cloud"
+        case "scan": mapped = restarting ? "rescan" : "prepare"
+        case "cloud scan": mapped = restarting || Self.phases.firstIndex(of: phase)! >= 4 ? "cloud" : "cloudScan"
+        case "desktop": mapped = "close"
+        case "reopen": mapped = "reopen"
+        case "move", "rescue": mapped = "move"
+        case "verify", "retire", "finalize": mapped = stage
+        case "cloud": mapped = "cloud"
         default: return
         }
+        let next = preparatory ? "cloudScan" : mapped
         let index = Self.phases.firstIndex(of: next)!, previous = Self.phases.firstIndex(of: phase)!
         guard index >= previous else { return }
+        if next == "move", !restarting { skipped.formUnion(["close", "rescan", "reopen"]) }
+        if size == 0 {
+            if index > previous || !hasProgress { skipped.insert(next) }
+            refresh(now)
+            return
+        }
+        skipped.remove(next)
         if next != phase {
             record(now)
+            if !hasProgress { skipped.insert(phase) }
             for missing in Self.phases[(previous + 1)..<index] { skipped.insert(missing) }
             phase = next
             started = now
         }
-        if next == "prepare", let size { sessions = max(1, size) }
-        if next == "move", !restarting { skipped.formUnion(["close", "rescan", "reopen"]) }
+        hasProgress = true
+        if Self.scaled.contains(next), let size { sessions = max(sessions, size) }
         completed = count
         total = size
         refresh(now)
@@ -298,9 +309,6 @@ final class Model: ObservableObject {
         }
     }
     var displaySummary: String { running ? progressLabel : note.isEmpty ? pendingPrompt : note }
-    var progress: Double? {
-        running ? moveProgress.value : nil
-    }
 
     func canSource(_ account: Account) -> Bool { account.id != to }
 
@@ -407,7 +415,7 @@ final class Model: ObservableObject {
         symbol = "arrow.triangle.2.circlepath"
         progressLabel = "Preparing sessions"
         if resetProgress {
-            let costs = UserDefaults.standard.dictionary(forKey: "moveProgressCosts") as? [String: Double] ?? [:]
+            let costs = UserDefaults.standard.dictionary(forKey: MoveProgress.storageKey) as? [String: Double] ?? [:]
             moveProgress = MoveProgress(costs: demo || snapshot ? [:] : costs)
         }
         badge = "\(moveProgress.percent)%"
@@ -421,8 +429,8 @@ final class Model: ObservableObject {
             pendingPlan = event
         } else if let stage = event.stage, let text = event.text {
             if event.live == true {
-                moveProgress.update(stage, completed: event.completed, total: event.total)
-                progressLabel = ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : ["desktop", "reopen"].contains(stage) ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
+                moveProgress.update(stage, completed: event.completed, total: event.total, preparatory: event.preparatory == true)
+                progressLabel = event.preparatory == true ? "Checking remaining sessions" : ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : ["desktop", "reopen"].contains(stage) ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
                 badge = "\(moveProgress.percent)%"
             } else {
                 lines.removeAll { $0.0 == stage }
@@ -626,11 +634,11 @@ final class Model: ObservableObject {
         }
         running = false
         badge = status == 0 && !pendingResult ? "100%" : ""
-        if status == 0, !demo, !snapshot {
+        if status == 0, !demo, !snapshot, moveProgress.hasProgress {
             moveProgress.record(ProcessInfo.processInfo.systemUptime)
-            var learned = UserDefaults.standard.dictionary(forKey: "moveProgressCosts") as? [String: Double] ?? [:]
+            var learned = UserDefaults.standard.dictionary(forKey: MoveProgress.storageKey) as? [String: Double] ?? [:]
             for (key, sample) in moveProgress.observed { learned[key] = (learned[key] ?? sample) * 0.5 + sample * 0.5 }
-            UserDefaults.standard.set(learned, forKey: "moveProgressCosts")
+            UserDefaults.standard.set(learned, forKey: MoveProgress.storageKey)
         }
         if !pendingResult && status == 0 { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
         symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
@@ -844,24 +852,6 @@ struct Bar: View {
     }
 }
 
-struct ActivityBar: View {
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-            GeometryReader { geo in
-                let width = geo.size.width
-                let segment = max(24, width * 0.22)
-                let phase = timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.1) / 1.1
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary)
-                    Capsule().fill(Color.accentColor).frame(width: segment).offset(x: -segment + (width + segment) * phase)
-                }
-            }
-        }
-        .frame(height: 6)
-        .clipped()
-    }
-}
-
 struct Pill: View {
     let title: String
     let prominent: Bool
@@ -897,7 +887,7 @@ struct Panel: View {
             accountBoard.disabled(model.running || !model.pendingAccounts.isEmpty)
             if !model.displaySummary.isEmpty { Divider() }
             if model.running {
-                if let progress = model.progress { Bar(value: progress) } else { ActivityBar() }
+                Bar(value: model.moveProgress.value)
             }
             if !model.displaySummary.isEmpty {
                 Text(model.displaySummary.sentence).font(.callout.weight(.medium))
@@ -1086,12 +1076,16 @@ struct MenuLabel: View {
                 let width = glyph.size.width * scale, height = glyph.size.height * scale
                 glyph.draw(in: NSRect(x: (rect.width - width) / 2, y: (rect.height - height) / 2, width: width, height: height))
             } else {
-                var font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-                let width = (badge as NSString).size(withAttributes: [.font: font]).width
-                if width > rect.width { font = NSFont.monospacedDigitSystemFont(ofSize: 10 * rect.width / width, weight: .semibold) }
+                let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
                 let text = NSAttributedString(string: badge, attributes: [.font: font, .foregroundColor: NSColor.black])
                 let measured = text.size()
-                text.draw(at: NSPoint(x: (rect.width - measured.width) / 2, y: (rect.height - measured.height) / 2))
+                let scale = min(1, (rect.width - 1) / measured.width)
+                guard let context = NSGraphicsContext.current?.cgContext else { return false }
+                context.saveGState()
+                context.translateBy(x: (rect.width - measured.width * scale) / 2, y: (rect.height - measured.height) / 2)
+                context.scaleBy(x: scale, y: 1)
+                text.draw(at: .zero)
+                context.restoreGState()
             }
             return true
         }

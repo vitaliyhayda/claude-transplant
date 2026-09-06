@@ -307,10 +307,11 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!remaining || !appProcess(paths, remaining)) {
       state.outcomeBeforeReopen = state.outcome
       state.outcome = 'reopening'
-      report('reopen', 'Opening Claude Desktop', { live: true })
       const remaining = deadline - now()
       if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
-      const opened = await run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining))
+      const opening = run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining))
+      try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
+      const opened = await opening
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, deadline, now, wait)
       state.outcome = opened.status === 0 && present ? 'reopened' : 'reopen-failed'
       if (state.outcome === 'reopened') state.reopenedAt = new Date().toISOString()
@@ -2516,7 +2517,10 @@ function finishCloudAttempt(receipt, cloud, later = [], waiting = []) {
 
 async function archiveCloud(inv, receipt, save, report = () => {}) {
   const matches = (inv.cloud?.matches ?? []).filter((match) => !match.target.failed)
-  if (!matches.length) return
+  if (!matches.length) {
+    if (!inv.deferredCloudSources?.length && (!inv.cloudRequested || inv.cloud?.checked)) progress(report, 'cloud', 0, 0)
+    return
+  }
   const cloud = inv.cloud.client
   const failedVerification = new Set(receipt.verification?.problems?.map((problem) => problem.id) ?? [])
   let archived = 0
@@ -3143,7 +3147,8 @@ export async function finishWorkflow(paths, options = {}) {
     if (!restarted.ok || restarted.plan) return restarted
     return completeActiveCloud({ ...restarted, file: deferred.file, receipt: deferred.receipt }, paths, options)
   }
-  const result = await finishPending(paths, options)
+  const report = (stage, text, extra = {}) => options.report?.(stage, text, extra.live ? { ...extra, preparatory: true } : extra)
+  const result = await finishPending(paths, { ...options, report })
   const table = options.io?.inspect?.() ?? options.processes ?? processTable(paths.claudeApp)
   const checked = result.receipt?.cloudChecks.find(check => sameAccount(check, result.checkedAccount))
   if (!options.background && checked?.waiting?.length && canRestartWaiting({ cloudChecks: [checked] }, table)) {
@@ -3335,6 +3340,7 @@ function reporter(json) {
       stage,
       text,
       ...(extra.live ? { live: true } : {}),
+      ...(extra.preparatory ? { preparatory: true } : {}),
       ...(Number.isInteger(extra.completed) ? { completed: extra.completed } : {}),
       ...(Number.isInteger(extra.total) ? { total: extra.total } : {})
     }

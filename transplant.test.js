@@ -296,6 +296,26 @@ test('a journal failure after quit cannot prevent the reopen request', async () 
   assert.match(result.restart.error, /journal could not be saved/)
 })
 
+test('a failed progress callback cannot prevent the mandatory reopen', async () => {
+  const h = await home()
+  let rows = desktopFixture(), reportedAfterOpen = false
+  const plan = await restartPlan(null, h.paths, rows), calls = []
+  const result = await withDesktopRestart(plan, h.paths, async () => ({ ok: true }), stage => {
+    if (stage === 'reopen') {
+      reportedAfterOpen = calls.includes('/usr/bin/open')
+      throw new Error('progress output unavailable')
+    }
+  }, { inspect: () => rows, command: async file => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } })
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(reportedAfterOpen, true)
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.equal(result.ok, true)
+})
+
 test('new workers invalidate the reviewed restart scope before any quit', async () => {
   const h = await home()
   const rows = desktopFixture()
@@ -3791,6 +3811,53 @@ test('Finish pending offers a receipt-bound restart for a connected mirror and c
   assert.equal(quits, 1)
 })
 
+test('mixed cloud Finish keeps its first pass preparatory until the restart decision', async () => {
+  const h = await home(), other = id(300)
+  const histories = { cse_ready: [entry('user', 1, null, SOURCE)], cse_open: [entry('user', 300, null, other)] }
+  const connected = { cse_ready: true, cse_open: true }, status = { cse_ready: 'active', cse_open: 'active' }
+  for (const [session, remote] of [[SOURCE, 'ready'], [other, 'open']]) {
+    await h.write(session, histories[`cse_${remote}`])
+    await h.record('P', session, rehomeRecord({ bridgeSessionIds: [`session_${remote}`] }))
+  }
+  const cloud = cloudFixture(h, {
+    list: async () => Object.keys(histories).map(id => remoteSession({ id, title: id, status: status[id] })),
+    session: async id => remoteState(status[id], { connection_status: connected[id] ? 'connected' : 'disconnected' }),
+    eventRows: async id => remoteRows(histories[id]), archive: async id => { status[id] = 'archived' }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
+  connected.cse_ready = false
+  let rows = desktopFixture(other)
+  const io = { inspect: () => rows, command: async file => {
+    if (file.endsWith('osascript')) { rows = []; connected.cse_open = false }
+    else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const before = [], after = []
+  const plan = await finishWorkflow(h.paths, { cloud, io, report: (stage, text, extra) => before.push({ stage, text, ...extra }) })
+  assert.equal(plan.plan.kind, 'finish')
+  assert.equal(status.cse_ready, 'archived')
+  assert.equal(status.cse_open, 'active')
+  assert.ok(before.some(event => event.stage === 'cloud' && event.completed === 1))
+  assert.ok(before.filter(event => event.live).every(event => event.preparatory === true))
+  const completed = await finishWorkflow(h.paths, { cloud, io, approve: plan.plan.token, report: (stage, text, extra) => after.push({ stage, text, ...extra }) })
+  assert.equal(completed.file, moved.file)
+  assert.equal(completed.complete, true)
+  assert.equal(completed.receipt.remote.length, 2)
+  assert.ok(after.some(event => event.stage === 'reopen'))
+  assert.ok(after.filter(event => event.live).every(event => !event.preparatory))
+})
+
+test('a local move explicitly reports that no cloud phase remains', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T), cloud = []
+  const result = await move(await inventory([from], to, h.paths), to, h.paths, (stage, _text, extra) => { if (stage === 'cloud') cloud.push(extra) })
+  assert.equal(result.ok, true)
+  assert.deepEqual(cloud, [{ live: true, completed: 0, total: 0 }])
+})
+
 
 test('process registry identifies a new worker without argv ids and rejects stale pid reuse', () => {
   const started = 'Fri Sep  4 18:00:00 2026'
@@ -3830,9 +3897,16 @@ struct StateChecks {
     @MainActor
     static func main() {
         let menuSize = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)!.size
+        var textHeight: Int?
         for badge in ["", "0%", "9%", "10%", "47%", "99%", "100%"] {
             let image = MenuLabel(symbol: "arrow.left.arrow.right", badge: badge).image
             precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
+            if !badge.isEmpty {
+                let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
+                let rows = (0..<bitmap.pixelsHigh).filter { y in (0..<bitmap.pixelsWide).contains { x in bitmap.colorAt(x: x, y: y)!.alphaComponent > 0.4 } }.count
+                precondition(textHeight == nil || rows == textHeight)
+                textHeight = rows
+            }
         }
         var progress = MoveProgress(now: 0)
         var previous = 0
@@ -3843,7 +3917,44 @@ struct StateChecks {
         }
         progress.refresh(10000)
         precondition(progress.percent == 99)
+        for stage in ["", "undo", "keep-local", "unknown"] {
+            var idle = MoveProgress(now: 0)
+            idle.update(stage, completed: nil, total: nil, now: 1)
+            idle.record(120)
+            precondition(!idle.hasProgress && idle.observed.isEmpty)
+            precondition(idle.costs == MoveProgress.defaults)
+        }
+        var empty = MoveProgress(now: 0)
+        empty.update("scan", completed: 0, total: 0, now: 0)
+        empty.update("retire", completed: nil, total: nil, now: 1)
+        empty.update("finalize", completed: nil, total: nil, now: 2)
+        empty.record(3)
+        precondition(empty.observed.isEmpty)
+        var reopen = MoveProgress(now: 0)
+        reopen.update("reopen", completed: nil, total: nil, now: 10)
+        reopen.record(12)
+        precondition(reopen.observed["prepare"] == nil && reopen.observed["reopen"] == 2)
+        var local = MoveProgress(now: 0)
+        local.update("scan", completed: 100, total: 100, now: 1)
+        local.record(1)
+        precondition(local.observed["prepare"] == 0.01)
+        local.update("move", completed: 100, total: 100, now: 2)
+        local.update("rescue", completed: 0, total: 0, now: 2)
+        precondition(!local.skipped.contains("move"))
+        local.update("finalize", completed: nil, total: nil, now: 3)
+        local.update("cloud", completed: 0, total: 0, now: 4)
+        precondition(local.skipped.contains("cloud") && local.percent > 90)
+        var mixed = MoveProgress(now: 0)
+        mixed.update("rescue", completed: 1, total: 1, preparatory: true, now: 1)
+        mixed.update("cloud", completed: 1, total: 1, preparatory: true, now: 2)
+        let checked = mixed.percent
+        precondition(checked < 99 && mixed.phase == "cloudScan")
+        mixed.update("desktop", completed: nil, total: nil, now: 3)
+        precondition(mixed.phase == "close" && mixed.percent >= checked)
+        mixed.update("reopen", completed: nil, total: nil, now: 4)
+        precondition(mixed.phase == "reopen")
         var paused = MoveProgress(now: 0)
+        paused.update("scan", completed: 0, total: 1, now: 0)
         paused.paused = 2
         paused.resume(102)
         paused.record(103)
@@ -3851,6 +3962,9 @@ struct StateChecks {
         let progressModel = Model(demo: Demo.accounts)
         progressModel.begin()
         precondition(progressModel.badge == "0%")
+        progressModel.handle("{\"stage\":\"cloud\",\"text\":\"1/1\",\"live\":true,\"completed\":1,\"total\":1,\"preparatory\":true}")
+        precondition(progressModel.moveProgress.phase == "cloudScan" && progressModel.moveProgress.percent < 99)
+        progressModel.begin()
         progressModel.handle("{\"stage\":\"scan\",\"text\":\"50/100\",\"live\":true,\"completed\":50,\"total\":100}")
         let percentage = progressModel.badge
         precondition(percentage.hasSuffix("%") && !percentage.contains("/"))
