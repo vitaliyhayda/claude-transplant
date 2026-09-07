@@ -671,6 +671,49 @@ test('normalize collapses replays and reports conflicts', () => {
   assert.equal(conflict.entries.length, 3)
 })
 
+test('file-read replays keep the full payload and refuse incompatible copies', () => {
+  const parent = entry('assistant', 1, null, SOURCE)
+  const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'text', file: { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 } } })
+  const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, content: '' } } }
+  for (const rows of [[parent, full, replay], [parent, replay, full]]) {
+    const result = normalize(rows)
+    assert.equal(result.conflicts, 0)
+    assert.equal(result.replays, 1)
+    assert.deepEqual(result.entries, [parent, full])
+    assert.equal(semantic(rows, SOURCE), semantic([parent, full], SOURCE))
+  }
+  for (const content of ['different file body', null, { text: 'unexpected shape' }]) {
+    const changed = { ...replay, toolUseResult: { ...replay.toolUseResult, file: { ...replay.toolUseResult.file, content } } }
+    assert.equal(normalize([parent, full, changed]).conflicts, 1)
+  }
+  const otherFile = { ...replay, toolUseResult: { ...replay.toolUseResult, file: { ...replay.toolUseResult.file, filePath: '/tmp/other.txt' } } }
+  assert.equal(normalize([parent, full, otherFile]).conflicts, 1)
+})
+
+test('a transcript with a compact file-read replay rehomes intact and is not retired into a poorer fork', async () => {
+  const h = await home()
+  const parent = entry('assistant', 1, null, SOURCE)
+  const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'text', file: { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 } } })
+  const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, content: '' } } }
+  await h.write(SOURCE, [parent, full, replay])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Replayed file read' }))
+  await h.write(id(991), fork([parent, replay], SOURCE, id(991), 'Poorer fork'))
+  await h.record('T', id(991), rehomeRecord({ title: 'Poorer fork' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const before = await readFile(transcript), beforeStat = await stat(transcript)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.blocked.length, 0)
+  assert.equal(inv.there.length, 0)
+  assert.equal(inv.move.length, 1)
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.sessions[0].strategy, 'rehome')
+  assert.deepEqual(await readFile(transcript), before)
+  assert.equal((await stat(transcript)).ino, beforeStat.ino)
+  assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.P).sessions.length, 0)
+})
+
 test('semantic change detection keeps richer output and parse state', () => {
   const a = entry('user', 1, null, id(0))
   const plain = entry('user', 2, 1, id(0), { toolUseResult: { stdout: '', stderr: '' } })
@@ -957,6 +1000,25 @@ test('a conflicting same-root history is refused instead of hidden', async () =>
   assert.deepEqual(inv.blocked.map((s) => s.id), [id(937)])
   const result = await move(inv, by[h.acct.Z], h.paths)
   assert.match(result.receipt.failed[0].error, /conflicting duplicate uuids/)
+})
+
+test('Finish reports recorded local failures even after all queued work is complete', async () => {
+  const h = await home()
+  const bad = entry('user', 1, null, SOURCE)
+  await h.write(SOURCE, [bad, { ...bad, message: { role: 'user', content: 'conflicting body' } }])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Needs attention' }))
+  await h.write(id(994), [entry('user', 2, null, id(994))])
+  await h.record('P', id(994), rehomeRecord({ title: 'Good history' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  assert.equal(moved.receipt.sessions.length, 1)
+  assert.equal(moved.receipt.failed.length, 1)
+  const result = await cli(h.root, ['finish', '--json'])
+  assert.equal(result.code, 1)
+  const done = lines(result.stdout).find(row => row.done)
+  assert.equal(done.ok, false)
+  assert.match(done.failed[0].error, /conflicting duplicate uuids/)
+  assert.equal(lines(result.stdout).some(row => row.nothing), false)
 })
 
 test('new sidecars remain visible through a shared transcript', async () => {
@@ -4123,6 +4185,15 @@ struct StateChecks {
         requests[2].2(0, "")
         precondition(recovering.note == "No remaining work" && !recovering.pendingReady)
         precondition(recovering.lines.isEmpty && recovering.to == nil && recovering.from.isEmpty)
+        requests = []
+        let failed = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        failed.finishPending()
+        requests[0].1("{\"done\":true,\"ok\":false,\"complete\":true,\"failed\":[{\"id\":\"fixture\",\"title\":\"Unmoved session\",\"error\":\"conflicting history\"}]}")
+        requests[0].2(1, "")
+        requests[1].1(accountResponse(false))
+        requests[1].2(0, "")
+        precondition(failed.note == "1 need attention")
+        precondition(failed.lines.contains { $0.1.contains("conflicting history") })
         print("Swift queue and metadata states passed")
     }
 }

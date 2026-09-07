@@ -22,7 +22,7 @@ const RESTART_BUDGET = 30_000
 const REOPEN_RESERVE = 8_000
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 7
+const CACHE_VERSION = 8
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
@@ -867,28 +867,33 @@ const keepRecordSemantic = (record) => sha(stable(without(record, [...RECORD_RUN
 
 const semanticShape = (entry) => stable(without(entry, RUNTIME_KEYS))
 
-const replayShape = (entry) => {
-  const c = without(entry, RUNTIME_KEYS)
-  if (c.toolUseResult && typeof c.toolUseResult === 'object' && !Array.isArray(c.toolUseResult)) {
-    delete c.toolUseResult.stdout
-    delete c.toolUseResult.stderr
+const OUTPUT_KEYS = ['stdout', 'stderr', 'fileContent']
+const toolOutput = (entry) => ({ stdout: entry.toolUseResult?.stdout, stderr: entry.toolUseResult?.stderr, fileContent: entry.toolUseResult?.file?.content })
+
+const stripToolOutput = (entry) => {
+  const result = entry.toolUseResult
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    delete result.stdout
+    delete result.stderr
+    if (typeof result.file?.content === 'string') delete result.file.content
   }
-  return stable(c)
+  return entry
 }
 
-const richness = (e) => ['stdout', 'stderr'].reduce((n, k) => n + (typeof e.toolUseResult?.[k] === 'string' ? Buffer.byteLength(e.toolUseResult[k]) : 0), 0)
+const replayShape = (entry) => stable(stripToolOutput(without(entry, RUNTIME_KEYS)))
+const richness = (entry) => Object.values(toolOutput(entry)).reduce((n, value) => n + (typeof value === 'string' ? Buffer.byteLength(value) : 0), 0)
 
 function survivor(rows, ids) {
   if (new Set(rows.map((r) => replayShape(r.entry))).size !== 1) return null
   if (rows.some((r) => r.entry.parentUuid && !ids.has(r.entry.parentUuid))) return null
   const keep = {}
-  for (const k of ['stdout', 'stderr']) {
-    const values = new Set(rows.map((r) => r.entry.toolUseResult?.[k]).filter((v) => typeof v === 'string' && v.length))
+  for (const k of OUTPUT_KEYS) {
+    const values = new Set(rows.map((r) => toolOutput(r.entry)[k]).filter((v) => typeof v === 'string' && v.length))
     if (values.size > 1) return null
     keep[k] = [...values][0] ?? ''
   }
   const ranked = rows.toSorted((a, b) => richness(b.entry) - richness(a.entry) || a.line - b.line)
-  return ranked.find((r) => ['stdout', 'stderr'].every((k) => !keep[k] || r.entry.toolUseResult?.[k] === keep[k]))?.line ?? null
+  return ranked.find((r) => OUTPUT_KEYS.every((k) => !keep[k] || toolOutput(r.entry)[k] === keep[k]))?.line ?? null
 }
 
 export function normalize(entries) {
@@ -969,23 +974,20 @@ async function origins(id, ctx, cwd = '') {
 
 const lineageEvent = (entry) => {
   const c = without(entry, RUNTIME_KEYS)
-  const output = { stdout: null, stderr: null }
+  const output = Object.fromEntries(Object.entries(toolOutput(c)).map(([key, value]) => [key, typeof value === 'string' && value ? sha(value) : null]))
   const ignored = [
     'uuid', 'logicalParentUuid', 'sessionId', 'timestamp',
     'forkedFrom', 'teamName', 'agentName', 'sessionKind', 'sourceToolAssistantUUID', 'neutralizedByFork'
   ]
   for (const k of ignored) delete c[k]
+  stripToolOutput(c)
   if (c.toolUseResult && typeof c.toolUseResult === 'object' && !Array.isArray(c.toolUseResult)) {
-    for (const k of ['stdout', 'stderr']) {
-      if (typeof c.toolUseResult[k] === 'string' && c.toolUseResult[k]) output[k] = sha(c.toolUseResult[k])
-      delete c.toolUseResult[k]
-    }
     if (!Object.keys(c.toolUseResult).length) delete c.toolUseResult
   }
   return { base: sha(stable(c)), ...output }
 }
 
-const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && ['stdout', 'stderr'].every((k) => !a[k] || a[k] === b[k])
+const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && OUTPUT_KEYS.every((k) => !a[k] || a[k] === b[k])
 
 const messageHash = (type, value) => sha(stable({ type, message: without(value, MESSAGE_RUNTIME_KEYS) }))
 
@@ -2835,7 +2837,10 @@ export function finishPending(paths, options = {}) {
     const { file, receipt } = latest
     if (options.receiptFile && file !== options.receiptFile) return { nothing: true, ok: true }
     const outstanding = openCloudChecks(receipt)
-    if (!outstanding.length) return { nothing: true, receipt, file, ok: true, complete: true, pendingCloud: 0 }
+    if (!outstanding.length) {
+      const ok = receiptOkay(receipt)
+      return { nothing: ok, receipt, file, ok, complete: true, pendingCloud: 0, failed: receipt.failed ?? [], problems: receipt.verification?.problems ?? [] }
+    }
     if (options.automatic) {
       const key = `${options.automatic.account}/${options.automatic.org}`
       const previous = receipt.automaticCloudAttempt

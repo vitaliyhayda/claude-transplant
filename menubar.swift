@@ -657,7 +657,7 @@ final class Model: ObservableObject {
             confirmRestart(plan)
             return
         }
-        failedFinish = status != 0 && operationArgs.first == "finish"
+        failedFinish = status != 0 && operationArgs.first == "finish" && note.isEmpty
         if status != 0 { completion = nil }
         if status == 0, let result = completion, let started = operationStarted {
             completion = (result.summary, "History verified · " + String(format: "%.1f seconds", max(0.1, ProcessInfo.processInfo.systemUptime - started)))
