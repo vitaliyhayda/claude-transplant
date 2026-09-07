@@ -606,10 +606,12 @@ final class Model: ObservableObject {
             if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish, let sweepNote, note == sweepNote {
                 note = ""
                 symbol = "arrow.left.arrow.right"
+                self.sweepNote = nil
             }
-            if result != nil { sweepNote = nil; lines.removeAll { $0.0 == "metadata" } }
+            if result != nil { lines.removeAll { $0.0 == "metadata" } }
             let previousNote = note
             if let problem {
+                lines.removeAll { $0.0 == "background" }
                 lines.append(("background", problem))
                 note = "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"

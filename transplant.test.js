@@ -4217,6 +4217,14 @@ struct StateChecks {
             requests[index].2(0, "")
         }
         let cleanSweep = #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one"}"#
+        let repeated = Model(demo: Demo.accounts)
+        let repeatError = #"{"swept":true,"ok":false,"error":"Repeated error","receipt":"receipt-one"}"#
+        sweepReply(repeated, repeatError)
+        sweepReply(repeated, repeatError)
+        precondition(repeated.note == "The remaining work needs attention")
+        precondition(repeated.lines.filter { $0.0 == "background" }.count == 1)
+        sweepReply(repeated, cleanSweep)
+        precondition(repeated.note.isEmpty)
         sweepReply(recovering, #"{"swept":true,"ok":false,"error":"Could not check source","receipt":"receipt-one"}"#)
         precondition(recovering.note == "The remaining work needs attention")
         sweepReply(recovering, cleanSweep)
