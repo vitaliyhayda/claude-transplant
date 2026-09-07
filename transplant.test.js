@@ -9,7 +9,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -1569,6 +1569,68 @@ test('signed-in identity follows an offline switch without using network-depende
   await f.write(f.init() + f.event(1, `[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`) + f.init(2, h.acct.P, h.org.T) + f.event(3, 'Failed to check allowlist status: offline'))
   assert.equal((await signedIn(h.paths, f.processes)).org, h.org.T)
   assert.equal(network.mock.callCount(), 0)
+})
+
+test('Finish uses the active Desktop organization when its saved cookie still names the previous organization', async (t) => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Switched organization' }))
+  await h.record('P', id(997), rehomeRecord({ title: 'Pending source' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  assert.equal(moved.pendingCloud, 1)
+  await unlink(path.join(h.dir('P'), `local_${id(997)}.json`))
+  const requestedOrgs = []
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const endpoint = new URL(url).pathname
+    if (endpoint === '/api/account') return Response.json({ uuid: h.acct.P })
+    if (endpoint === '/api/organizations') return Response.json([{ uuid: h.org.P }, { uuid: h.org.T }])
+    assert.equal(endpoint, '/v1/code/sessions')
+    assert.equal(options.method ?? 'GET', 'GET')
+    requestedOrgs.push(options.headers['x-organization-uuid'])
+    return Response.json({ data: [] }, { headers: { 'anthropic-organization-id': options.headers['x-organization-uuid'] } })
+  })
+  const cloud = await cloudClient(h.paths, null, {
+    active: { account: h.acct.P, org: h.org.P, state: 'known' },
+    cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.T]]),
+    userAgent: 'fixture'
+  })
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.pendingCloud, 0)
+  assert.deepEqual(requestedOrgs, [h.org.P])
+})
+
+test('cloud identity rejects a stale authenticated account even when both logins share the organization', async (t) => {
+  const h = await home(), requested = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    requested.push(new URL(url).pathname)
+    if (requested.at(-1) === '/api/account') return Response.json({ uuid: h.acct.T })
+    return Response.json([{ uuid: h.org.P }])
+  })
+  await assert.rejects(cloudClient(h.paths, null, {
+    active: { account: h.acct.P, org: h.org.P, state: 'known' },
+    cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]),
+    userAgent: 'fixture'
+  }), /login is still updating/)
+  assert.deepEqual(requested, ['/api/account'])
+})
+
+test('cloud identity retains verified cookie fallback for unknown Desktop state and rejects an explicit logout', async (t) => {
+  const h = await home(), requested = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    requested.push(new URL(url).pathname)
+    return Response.json(requested.at(-1) === '/api/account' ? { uuid: h.acct.P } : [{ uuid: h.org.P }, { uuid: h.org.T }])
+  })
+  const io = { active: { state: 'unknown', account: null, org: null }, cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]), userAgent: 'fixture' }
+  assert.equal((await cloudClient(h.paths, null, io)).org, h.org.P)
+  assert.equal((await cloudClient(h.paths, { account: h.acct.P, org: h.org.T, label: 'Team' }, io)).org, h.org.T)
+  requested.length = 0
+  await assert.rejects(cloudClient(h.paths, null, { ...io, active: { state: 'logged-out' } }), /signed out/)
+  assert.deepEqual(requested, [])
+  await assert.rejects(cloudClient(h.paths, { account: h.acct.T, org: h.org.T, label: 'Other login' }, io), /sign Claude Desktop into Other login/)
+  assert.deepEqual(requested, ['/api/account'])
 })
 
 async function home() {
@@ -4041,6 +4103,26 @@ struct StateChecks {
             precondition(item.note.contains(unavailable ? "cannot be read" : ["isStarred": "starred state", "isArchived": "archive state", "title": "title"][field]!))
             precondition(item.detailLines.contains { $0.1.contains("Fixture") })
         }
+        func accountResponse(_ pending: Bool) -> String {
+            String(data: try! JSONSerialization.data(withJSONObject: Demo.accounts.enumerated().map { index, account -> [String: Any] in
+                var row: [String: Any] = ["account": account.account, "org": account.org, "label": account.label, "active": index == 0]
+                if pending && index == 0 { row["pending"] = "cloud"; row["pendingAction"] = "finish" }
+                return row
+            }), encoding: .utf8)!
+        }
+        requests = []
+        let recovering = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        recovering.finishPending()
+        precondition(requests[0].0 == ["finish", "--json"])
+        requests[0].2(1, "Sign Claude Desktop into Personal")
+        requests[1].1(accountResponse(true))
+        requests[1].2(0, "")
+        precondition(recovering.note == "The move needs attention" && recovering.pendingReady)
+        recovering.refresh()
+        requests[2].1(accountResponse(false))
+        requests[2].2(0, "")
+        precondition(recovering.note == "No remaining work" && !recovering.pendingReady)
+        precondition(recovering.lines.isEmpty && recovering.to == nil && recovering.from.isEmpty)
         print("Swift queue and metadata states passed")
     }
 }

@@ -242,6 +242,7 @@ final class Model: ObservableObject {
     private var operationArgs: [String] = []
     private var operationStarted: TimeInterval?
     private var operationDestination: String?
+    private var failedFinish = false
     private var approvalAttempted = false
     private var poller: AnyCancellable?
     private var progressTimer: AnyCancellable?
@@ -367,6 +368,7 @@ final class Model: ObservableObject {
     }
 
     private func clearResult() {
+        failedFinish = false
         selectionComplete = false
         lines = []
         detailsExpanded = false
@@ -379,10 +381,17 @@ final class Model: ObservableObject {
         guard !refreshing, !running, !sweeping else { return }
         refreshing = true
         var text = ""
-        run(["accounts", "--json"], line: { text += $0 }) { [weak self] _, _ in
+        run(["accounts", "--json"], line: { text += $0 }) { [weak self] status, _ in
             guard let self else { return }
             refreshing = false
-            guard let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
+            guard status == 0, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
+            if failedFinish, !pendingAccounts.isEmpty, !list.contains(where: { $0.pending != nil }), pendingAccounts.allSatisfy({ source in list.contains { $0.id == source.id } }) {
+                clearResult()
+                pendingResult = false
+                selectionComplete = true
+                note = "No remaining work"
+                symbol = "arrow.left.arrow.right"
+            }
             accounts = list
             settle()
             let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
@@ -414,6 +423,7 @@ final class Model: ObservableObject {
     }
 
     func begin(resetProgress: Bool = true) {
+        failedFinish = false
         lines = []
         detailsExpanded = false
         note = ""
@@ -647,6 +657,7 @@ final class Model: ObservableObject {
             confirmRestart(plan)
             return
         }
+        failedFinish = status != 0 && operationArgs.first == "finish"
         if status != 0 { completion = nil }
         if status == 0, let result = completion, let started = operationStarted {
             completion = (result.summary, "History verified · " + String(format: "%.1f seconds", max(0.1, ProcessInfo.processInfo.systemUptime - started)))

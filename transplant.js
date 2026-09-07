@@ -670,10 +670,13 @@ const remoteId = (id) => {
   try { return wireRemoteId(id) } catch { return null }
 }
 
-export async function cloudClient(paths, expected = null) {
-  const cookies = desktopCookies(paths)
+export async function cloudClient(paths, expected = null, io = {}) {
+  const current = io.active ?? await signedIn(paths)
+  if (current.state === 'logged-out') throw new Error('Claude Desktop is signed out')
+  const selected = expected ?? (current.state === 'known' ? current : null)
+  const cookies = io.cookies ?? desktopCookies(paths)
   const cookie = [...cookies].map(([name, value]) => `${name}=${value}`).join('; ')
-  const userAgent = await desktopUserAgent(paths)
+  const userAgent = io.userAgent ?? await desktopUserAgent(paths)
   const baseHeaders = {
     accept: 'application/json',
     cookie,
@@ -701,8 +704,9 @@ export async function cloudClient(paths, expected = null) {
   }
   const account = await raw('/api/account')
   if (!UUID.test(account?.uuid ?? '')) throw new Error('Claude Desktop account could not be verified')
+  if (selected?.account && account.uuid !== selected.account) throw new Error(expected ? `sign Claude Desktop into ${expected.label}` : 'Claude Desktop login is still updating. Try again in a moment.')
   const organizations = await raw('/api/organizations')
-  const preferredOrg = expected?.org ?? cookies.get('lastActiveOrg') ?? (await signedIn(paths)).org
+  const preferredOrg = selected?.org ?? cookies.get('lastActiveOrg')
   const organization = Array.isArray(organizations) ? organizations.find((item) => item.uuid === preferredOrg) : null
   if (!organization) throw new Error('Claude Desktop organization could not be verified')
   if (expected && (account.uuid !== expected.account || organization.uuid !== expected.org)) throw new Error(`sign Claude Desktop into ${expected.label}`)
