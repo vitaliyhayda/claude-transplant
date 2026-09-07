@@ -69,6 +69,7 @@ const waitingSessions = (receipt) => [...new Map([
 ].map(row => [row.localId ?? remoteId(row.id) ?? row.id, row])).values()]
 const legacyLocalFailures = (receipt) => receipt.localCancelledAt ? [] : (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
 const receiptOkay = (receipt) => receipt.verification?.ok !== false && !receipt.failed?.length
+const problemText = (problem) => `${problem.title ?? problem.id} | ${problem.check} verification failed`
 const cancelCloudChecks = (receipt) => {
   for (const check of openCloudChecks(receipt)) {
     check.status = 'cancelled'
@@ -709,7 +710,6 @@ export async function cloudClient(paths, expected = null, io = {}) {
   const preferredOrg = selected?.org ?? cookies.get('lastActiveOrg')
   const organization = Array.isArray(organizations) ? organizations.find((item) => item.uuid === preferredOrg) : null
   if (!organization) throw new Error('Claude Desktop organization could not be verified')
-  if (expected && (account.uuid !== expected.account || organization.uuid !== expected.org)) throw new Error(`sign Claude Desktop into ${expected.label}`)
   const org = organization.uuid
   const request = (endpoint, options) => raw(endpoint, options, org)
   const session = async (id) => {
@@ -2838,7 +2838,7 @@ export function finishPending(paths, options = {}) {
     if (options.receiptFile && file !== options.receiptFile) return { nothing: true, ok: true }
     const outstanding = openCloudChecks(receipt)
     if (!outstanding.length) {
-      const ok = receiptOkay(receipt)
+      const ok = receipt.verification?.ok !== false && !receipt.verification?.problems?.length
       return { nothing: ok, receipt, file, ok, complete: true, pendingCloud: 0, failed: receipt.failed ?? [], problems: receipt.verification?.problems ?? [] }
     }
     if (options.automatic) {
@@ -2981,7 +2981,7 @@ export function keepLocal(paths) {
       return { file, receipt, cancelled: 0, heldCancelled, labels: [], ok: receiptOkay(receipt), complete: true }
     }
     const unsafe = (receipt.verification?.problems ?? []).filter((problem) => checks.some((check) => cloudTagged(problem, check)))
-    const refused = unsafe.map((problem) => `${problem.title ?? problem.id} | ${problem.check} verification failed`)
+    const refused = unsafe.map(problemText)
     const liveWorkers = workers()
     for (const row of receipt.sessions) {
       const changes = await targetChanges(row, liveWorkers, row.strategy !== 'rehome', true)
@@ -3201,7 +3201,7 @@ async function inspectPlaced(paths) {
     receipt.metadataDrift = changed
     await saveJson(file, receipt)
   }
-  return { changed, receipt: file }
+  return { changed, receipt: file, ok: receiptOkay(receipt), failed: receipt.failed ?? [], problems: receipt.verification?.problems ?? [] }
 }
 
 export const verifyPlaced = (paths) => locked(paths, () => inspectPlaced(paths))
@@ -3216,7 +3216,7 @@ export async function sweep(paths, options = {}) {
     const error = result.reason ?? result.problems?.map((row) => `${row.title}: ${row.check}`).join(', ') ?? result.receipt?.failed.map((row) => `${row.title}: ${row.error}`).join(', ')
     return { verification, result, error: result.ok === false ? error || 'Pending local work needs attention' : null, refreshRequired: !result.receipt?.held.length && result.added > 0 && sameAccount(await signedIn(paths), result.receipt?.toAccount), ok: result.ok !== false }
   }
-  if (!deferred || deferred.mode !== 'cloud') return { verification, ok: !verification.error }
+  if (!deferred || deferred.mode !== 'cloud') return { verification, ok: !verification.error, complete: !deferred && verification.ok === true }
   const active = options.active ?? await signedIn(paths, options.processes)
   const source = deferred.sources.find((row) => sameAccount(row, active))
   if (!source) return { verification, pending: true, ok: true }
@@ -3542,9 +3542,13 @@ async function main(argv) {
   if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
   if (args.cmd === 'sweep') {
     const result = await sweep(paths)
-    if (args.json) return emit({ swept: true, ok: result.ok, error: result.error, changed: result.verification?.changed ?? [], recovered: result.recovered,
-      pendingLocal: result.result?.pendingLocal, restart: result.refreshRequired, cloudChecked: result.result?.cloudChecked ?? 0, cloudArchived: result.result?.cloudArchived ?? 0, complete: result.result?.complete })
-    return out.write(result.error ? `${result.error}\n` : `${quantity(result.verification?.changed.length ?? 0, 'metadata change')} detected\n`)
+    const failed = result.result?.receipt?.failed ?? result.verification?.failed ?? []
+    const problems = result.result?.receipt?.verification?.problems ?? result.verification?.problems ?? []
+    const error = result.error ?? result.verification?.error ?? (problems.length ? problems.map(problemText).join(', ') : null)
+    if (args.json) return emit({ swept: true, ok: result.ok && !error, error, changed: result.verification?.changed ?? [], recovered: result.recovered,
+      receipt: result.result?.file ?? result.verification?.receipt, failed, problems,
+      pendingLocal: result.result?.pendingLocal, restart: result.refreshRequired, cloudChecked: result.result?.cloudChecked ?? 0, cloudArchived: result.result?.cloudArchived ?? 0, complete: result.result?.complete ?? result.complete })
+    return out.write(error ? `${error}\n` : `${quantity(result.verification?.changed.length ?? 0, 'metadata change')} detected\n`)
   }
   if (args.cmd === 'restart') {
     const result = await executeMove(null, null, paths, { approve: args.restartApproved, approvalStartedAt: began, report: reporter(args.json) })
@@ -3572,9 +3576,9 @@ async function main(argv) {
     const deferred = await deferredWorkflow(paths)
     const result = await finishWorkflow(paths, { approve: args.restartApproved, approvalStartedAt: began, moveOnly: args.moveOnly, report })
     if (result.plan) return showPlan(result.plan)
-    if (result.ok === false || result.recoveryRequired || result.restoreProblems?.length || result.failed?.length || result.pendingUndo?.length) process.exitCode = 1
+    if (result.ok === false || result.recoveryRequired || result.restoreProblems?.length || (!result.nothing && result.failed?.length) || result.problems?.length || result.pendingUndo?.length) process.exitCode = 1
     if (args.json) {
-      if (result.nothing) return emit({ nothing: true })
+      if (result.nothing) return emit({ nothing: true, failed: result.failed ?? [], problems: result.problems ?? [] })
       if (result.reconciled) return emit({ done: true, ok: false, recoveryRequired: true, reconciled: result.reconciled })
       if (result.recoveryRequired) return emit({ done: true, ok: false, recoveryRequired: true, reason: 'Recovery remains pending' })
       if (result.dest) return emit({ undone: result.receipt.at, sessions: result.receipt.sessions.length, restored: retiredCount(result.receipt), cloudRestored: result.receipt.remote?.length ?? 0, restart: Boolean(result.receipt.sessions.length || result.receipt.superseded?.length || result.receipt.remote?.length) })
@@ -3601,12 +3605,14 @@ async function main(argv) {
         restart: result.restart ?? false
       })
     }
-    if (result.nothing) return out.write('nothing pending\n')
+    if (result.nothing) out.write('nothing pending\n')
     if (result.reconciled) return out.write(`recovered   ${result.reconciled.title} | ${result.reconciled.error}\n  finish      not run, review the recovery and try again\n`)
     if (result.recoveryRequired) return out.write('  pending     recovery remains incomplete\n')
     if (result.dest) return out.write(`Undo  ${result.receipt.at} completed\n`)
     if (result.pendingUndo?.length) return out.write(`  pending     sign Claude Desktop into ${result.pendingUndo.join(' or ')} and run finish again\n`)
-    if (result.failed?.length) out.write(`  failed      ${result.failed.map((failure) => `${failure.title || failure.id} | ${failure.error}`).join('\n              ')}\n`)
+    if (result.failed?.length) out.write(`  ${result.nothing ? 'not moved' : 'failed   '}   ${result.failed.map((failure) => `${failure.title || failure.id} | ${failure.error}`).join('\n              ')}\n`)
+    if (result.problems?.length) out.write(`  failed      ${result.problems.map(problemText).join('\n              ')}\n`)
+    if (result.nothing) return
     const pending = result.pendingLabels?.length ? ` | ${result.pendingLabels.join(', ')}` : ''
     return out.write(result.complete ? '  cloud       all source checks complete\n' : `  pending     ${result.pendingCloud} cloud checks${pending}\n`)
   }
@@ -3690,7 +3696,8 @@ async function main(argv) {
           pendingWaiting: waiting,
           receiptMoved: source ? deferred.receipt.sessions.length : null,
           receiptDestination: source ? `${deferred.receipt.toAccount.account}/${deferred.receipt.toAccount.org}` : null,
-          pendingFailures: source?.failures ?? []
+          pendingFailures: source?.failures ?? [],
+          receipt: source ? deferred.file : null
         }
       }))
     }

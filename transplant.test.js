@@ -1002,7 +1002,7 @@ test('a conflicting same-root history is refused instead of hidden', async () =>
   assert.match(result.receipt.failed[0].error, /conflicting duplicate uuids/)
 })
 
-test('Finish reports recorded local failures even after all queued work is complete', async () => {
+test('idle Finish reports refused sessions quietly while verification errors remain failures', async () => {
   const h = await home()
   const bad = entry('user', 1, null, SOURCE)
   await h.write(SOURCE, [bad, { ...bad, message: { role: 'user', content: 'conflicting body' } }])
@@ -1014,11 +1014,37 @@ test('Finish reports recorded local failures even after all queued work is compl
   assert.equal(moved.receipt.sessions.length, 1)
   assert.equal(moved.receipt.failed.length, 1)
   const result = await cli(h.root, ['finish', '--json'])
-  assert.equal(result.code, 1)
-  const done = lines(result.stdout).find(row => row.done)
-  assert.equal(done.ok, false)
-  assert.match(done.failed[0].error, /conflicting duplicate uuids/)
-  assert.equal(lines(result.stdout).some(row => row.nothing), false)
+  assert.equal(result.code, 0)
+  const idle = lines(result.stdout).find(row => row.nothing)
+  assert.match(idle.failed[0].error, /conflicting duplicate uuids/)
+  const text = await cli(h.root, ['finish'])
+  assert.equal(text.code, 0)
+  assert.match(text.stdout, /nothing pending\n.*not moved.*conflicting duplicate uuids/s)
+  const refused = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(refused.receipt, moved.file)
+  assert.equal(refused.complete, false)
+  assert.equal(refused.failed.length, 1)
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  receipt.failed = []
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const clean = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(clean.complete, true)
+  assert.equal(clean.receipt, moved.file)
+  receipt.verification = { ok: false, problems: [{ id: id(994), check: 'transcript' }] }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const unverified = await cli(h.root, ['finish', '--json'])
+  assert.equal(unverified.code, 1)
+  assert.deepEqual(lines(unverified.stdout).find(row => row.done).problems, receipt.verification.problems)
+  const details = await cli(h.root, ['finish'])
+  assert.equal(details.code, 1)
+  assert.ok(details.stdout.includes(`${id(994)} | transcript verification failed`))
+  const checked = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(checked.ok, false)
+  assert.match(checked.error, /transcript verification failed/)
+  await writeFile(moved.file, '{')
+  const corrupt = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(corrupt.ok, false)
+  assert.match(corrupt.error, /corrupt receipt/)
 })
 
 test('new sidecars remain visible through a shared transcript', async () => {
@@ -4168,7 +4194,7 @@ struct StateChecks {
         func accountResponse(_ pending: Bool) -> String {
             String(data: try! JSONSerialization.data(withJSONObject: Demo.accounts.enumerated().map { index, account -> [String: Any] in
                 var row: [String: Any] = ["account": account.account, "org": account.org, "label": account.label, "active": index == 0]
-                if pending && index == 0 { row["pending"] = "cloud"; row["pendingAction"] = "finish" }
+                if pending && index == 0 { row["pending"] = "cloud"; row["pendingAction"] = "finish"; row["receipt"] = "receipt-one" }
                 return row
             }), encoding: .utf8)!
         }
@@ -4183,8 +4209,62 @@ struct StateChecks {
         recovering.refresh()
         requests[2].1(accountResponse(false))
         requests[2].2(0, "")
+        precondition(recovering.note == "The move needs attention")
+        func sweepReply(_ model: Model, _ event: String) {
+            let index = requests.count
+            model.checkSweep()
+            requests[index].1(event)
+            requests[index].2(0, "")
+        }
+        let cleanSweep = #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one"}"#
+        sweepReply(recovering, #"{"swept":true,"ok":false,"error":"Could not check source","receipt":"receipt-one"}"#)
+        precondition(recovering.note == "The remaining work needs attention")
+        sweepReply(recovering, cleanSweep)
         precondition(recovering.note == "No remaining work" && !recovering.pendingReady)
         precondition(recovering.lines.isEmpty && recovering.to == nil && recovering.from.isEmpty)
+        func failedFinishModel() -> Model {
+            requests = []
+            let model = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+            model.finishPending()
+            requests[0].2(1, "Sign Claude Desktop into Personal")
+            requests[1].1(accountResponse(false))
+            requests[1].2(0, "")
+            return model
+        }
+        for event in [
+            #"{"swept":true,"ok":false,"receipt":"receipt-one"}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"another-receipt"}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[{"id":"fixture","error":"Unmoved history"}]}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","changed":[{"id":"fixture","fields":["record unavailable"]}]}"#
+        ] {
+            let guarded = failedFinishModel()
+            sweepReply(guarded, event)
+            precondition(guarded.note != "No remaining work")
+            sweepReply(guarded, cleanSweep)
+            precondition(guarded.note == "No remaining work")
+        }
+        let corrupt = failedFinishModel()
+        sweepReply(corrupt, #"{"swept":true,"ok":false,"error":"Corrupt receipt set aside"}"#)
+        sweepReply(corrupt, #"{"swept":true,"ok":true,"complete":true,"receipt":"older-receipt"}"#)
+        precondition(corrupt.note == "The remaining work needs attention")
+        let restart = failedFinishModel()
+        sweepReply(restart, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","restart":true}"#)
+        let hint = restart.note
+        sweepReply(restart, cleanSweep)
+        precondition(restart.restartAvailable && restart.note == hint)
+        for errors in ["[]", #"[{"id":"fixture","title":"Unmoved session","error":"conflicting history"}]"#] {
+            requests = []
+            let idle = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+            idle.finishPending()
+            requests[0].1("{\"nothing\":true,\"failed\":" + errors + "}")
+            requests[0].2(0, "")
+            requests[1].1(accountResponse(false))
+            requests[1].2(0, "")
+            precondition(idle.badge.isEmpty && idle.visibleCompletion == nil)
+            precondition(idle.note == (errors == "[]" ? "No remaining work" : "1 session was not moved"))
+            precondition(idle.symbol == (errors == "[]" ? "arrow.left.arrow.right" : "info.circle"))
+            precondition(errors == "[]" || idle.lines.contains { $0.1.contains("conflicting history") })
+        }
         requests = []
         let failed = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
         failed.finishPending()
