@@ -19,6 +19,7 @@ struct Account: Decodable, Identifiable {
     var pendingWaiting: [HeldRecord]? = nil
     var receiptMoved: Int? = nil
     var receiptDestination: String? = nil
+    var receipt: String? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
@@ -68,6 +69,7 @@ struct MetadataChange: Decodable {
 
 
 struct Event: Decodable {
+    let receipt: String?
     let swept: Bool?
     let error: String?
     let changed: [MetadataChange]?
@@ -112,6 +114,7 @@ struct Event: Decodable {
     let refused: [String]?
     let reason: String?
     let nothing: Bool?
+    var issues: Int { (failed?.count ?? 0) + (problems?.count ?? 0) }
 }
 
 extension String {
@@ -242,6 +245,7 @@ final class Model: ObservableObject {
     private var operationArgs: [String] = []
     private var operationStarted: TimeInterval?
     private var operationDestination: String?
+    private var failedFinish: String?
     private var approvalAttempted = false
     private var poller: AnyCancellable?
     private var progressTimer: AnyCancellable?
@@ -367,6 +371,7 @@ final class Model: ObservableObject {
     }
 
     private func clearResult() {
+        failedFinish = nil
         selectionComplete = false
         lines = []
         detailsExpanded = false
@@ -379,10 +384,10 @@ final class Model: ObservableObject {
         guard !refreshing, !running, !sweeping else { return }
         refreshing = true
         var text = ""
-        run(["accounts", "--json"], line: { text += $0 }) { [weak self] _, _ in
+        run(["accounts", "--json"], line: { text += $0 }) { [weak self] status, _ in
             guard let self else { return }
             refreshing = false
-            guard let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
+            guard status == 0, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             settle()
             let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
@@ -414,6 +419,7 @@ final class Model: ObservableObject {
     }
 
     func begin(resetProgress: Bool = true) {
+        failedFinish = nil
         lines = []
         detailsExpanded = false
         note = ""
@@ -451,19 +457,17 @@ final class Model: ObservableObject {
             note = event.retry == true ? "Run Undo last again if still wanted" : ""
             restartAvailable = false
         } else if event.done == true {
-            let failed = event.failed ?? [], problems = event.problems ?? []
             let waiting = event.waiting ?? event.held ?? []
             let pendingCloud = event.pendingCloud ?? 0
             pendingResult = event.complete == false || pendingCloud > 0 || !(event.pendingUndo ?? []).isEmpty || !waiting.isEmpty
-            if !failed.isEmpty { lines.append(("issue", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
-            for problem in problems { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " failed")) }
+            recordIssues(event)
             if !waiting.isEmpty { lines.append(("open", waiting.map(\.title).joined(separator: "\n"))) }
             if let reason = event.reason ?? (event.ok == false ? event.note : nil) { lines.append(("reason", reason)) }
             let moved = event.moved ?? 0
             var parts: [String] = []
             if moved > 0 { parts.append(quantity(moved, "session moved", "sessions moved")) }
             if !waiting.isEmpty { parts.append("\(waiting.count) still open") }
-            let issues = failed.count + problems.count
+            let issues = event.issues
             if issues > 0 { parts.append("\(issues) need attention") }
             else if event.ok == false { parts.append("remaining work needs attention") }
             if pendingCloud > 0 && waiting.isEmpty && issues == 0 { parts.append("remaining sessions will finish when their account is available") }
@@ -491,9 +495,18 @@ final class Model: ObservableObject {
             restartAvailable = false
             lines = refused.map { ("kept", $0) }
         } else if event.nothing == true {
-            note = operationArgs.first == "undo" ? "Nothing to undo" : "No remaining work"
+            recordIssues(event)
+            let refused = event.failed?.count ?? 0, unverified = event.problems?.count ?? 0
+            note = [refused > 0 ? quantity(refused, "session was not moved", "sessions were not moved") : nil,
+                    unverified > 0 ? quantity(unverified, "verification problem", "verification problems") : nil].compactMap { $0 }.joined(separator: ", ")
+            if note.isEmpty { note = operationArgs.first == "undo" ? "Nothing to undo" : "No remaining work" }
             restartAvailable = false
         }
+    }
+
+    private func recordIssues(_ event: Event) {
+        if let failed = event.failed, !failed.isEmpty { lines.append(("issue", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
+        for problem in event.problems ?? [] { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " verification failed")) }
     }
 
     private func identity(_ title: String?, _ id: String?) -> String {
@@ -588,18 +601,18 @@ final class Model: ObservableObject {
                 }
             }
             if result == nil, error.contains("another run holds the lock") { return }
-            if result != nil, let sweepNote, note == sweepNote {
+            let problem = result?.error.flatMap { $0.isEmpty ? nil : $0 } ?? (status != 0 || result?.ok != true ? (error.isEmpty ? "Background check did not complete" : error) : nil)
+            let clean = problem == nil && result?.issues == 0
+            if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish, let sweepNote, note == sweepNote {
                 note = ""
                 symbol = "arrow.left.arrow.right"
+                self.sweepNote = nil
             }
-            if result != nil { sweepNote = nil; lines.removeAll { $0.0 == "metadata" } }
+            if result != nil { lines.removeAll { $0.0 == "metadata" } }
             let previousNote = note
-            if result == nil, status != 0 {
-                lines.append(("background", error))
-                note = "The remaining work needs attention"
-                symbol = "exclamationmark.triangle"
-            } else if let error = result?.error, !error.isEmpty {
-                lines.append(("background", error))
+            if let problem {
+                lines.removeAll { $0.0 == "background" }
+                lines.append(("background", problem))
                 note = "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"
             } else if let changed = result?.changed, !changed.isEmpty {
@@ -612,9 +625,18 @@ final class Model: ObservableObject {
                 symbol = unavailable.isEmpty ? "info.circle" : "exclamationmark.triangle"
                 lines.append(("metadata", changed.map { self.identity($0.title, $0.id) + " | " + $0.fields.map { names[$0] ?? $0 }.joined(separator: ", ") }.joined(separator: "\n")))
             }
-            if result?.ok != false, result?.restart == true, result?.changed?.contains(where: { $0.fields.contains("record unavailable") }) != true {
+            if problem == nil, result?.restart == true, result?.changed?.contains(where: { $0.fields.contains("record unavailable") }) != true {
                 restartAvailable = true
                 note = "Pending sessions moved. Restart Claude Desktop to refresh this account."
+            }
+            if clean, let failedFinish, result?.receipt == failedFinish, result?.complete == true,
+               (result?.changed ?? []).isEmpty, pendingAccounts.isEmpty, !restartAvailable {
+                clearResult()
+                pendingResult = false
+                selectionComplete = true
+                note = "No remaining work"
+                symbol = "arrow.left.arrow.right"
+                settle()
             }
             if note != previousNote, !note.isEmpty { sweepNote = note }
         }
@@ -647,6 +669,7 @@ final class Model: ObservableObject {
             confirmRestart(plan)
             return
         }
+        failedFinish = status != 0 && operationArgs.first == "finish" && note.isEmpty ? pendingAccounts.first?.receipt : nil
         if status != 0 { completion = nil }
         if status == 0, let result = completion, let started = operationStarted {
             completion = (result.summary, "History verified · " + String(format: "%.1f seconds", max(0.1, ProcessInfo.processInfo.systemUptime - started)))
@@ -661,6 +684,10 @@ final class Model: ObservableObject {
         }
         if !pendingResult && status == 0 { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
         symbol = pendingResult ? "clock.arrow.circlepath" : status == 0 ? "checkmark" : "exclamationmark.triangle"
+        if status == 0, !pendingResult, !moveProgress.hasProgress, operationArgs.first == "finish" {
+            badge = ""
+            symbol = lines.isEmpty ? "arrow.left.arrow.right" : "info.circle"
+        }
         if status != 0, note.isEmpty { lines.append(("reason", error)); note = "The move needs attention" }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             guard let self, !self.running else { return }

@@ -9,7 +9,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SOURCE = '00000000-0000-4000-8000-000000000001'
@@ -671,6 +671,49 @@ test('normalize collapses replays and reports conflicts', () => {
   assert.equal(conflict.entries.length, 3)
 })
 
+test('file-read replays keep the full payload and refuse incompatible copies', () => {
+  const parent = entry('assistant', 1, null, SOURCE)
+  const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'text', file: { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 } } })
+  const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, content: '' } } }
+  for (const rows of [[parent, full, replay], [parent, replay, full]]) {
+    const result = normalize(rows)
+    assert.equal(result.conflicts, 0)
+    assert.equal(result.replays, 1)
+    assert.deepEqual(result.entries, [parent, full])
+    assert.equal(semantic(rows, SOURCE), semantic([parent, full], SOURCE))
+  }
+  for (const content of ['different file body', null, { text: 'unexpected shape' }]) {
+    const changed = { ...replay, toolUseResult: { ...replay.toolUseResult, file: { ...replay.toolUseResult.file, content } } }
+    assert.equal(normalize([parent, full, changed]).conflicts, 1)
+  }
+  const otherFile = { ...replay, toolUseResult: { ...replay.toolUseResult, file: { ...replay.toolUseResult.file, filePath: '/tmp/other.txt' } } }
+  assert.equal(normalize([parent, full, otherFile]).conflicts, 1)
+})
+
+test('a transcript with a compact file-read replay rehomes intact and is not retired into a poorer fork', async () => {
+  const h = await home()
+  const parent = entry('assistant', 1, null, SOURCE)
+  const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'text', file: { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 } } })
+  const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, content: '' } } }
+  await h.write(SOURCE, [parent, full, replay])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Replayed file read' }))
+  await h.write(id(991), fork([parent, replay], SOURCE, id(991), 'Poorer fork'))
+  await h.record('T', id(991), rehomeRecord({ title: 'Poorer fork' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const before = await readFile(transcript), beforeStat = await stat(transcript)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.blocked.length, 0)
+  assert.equal(inv.there.length, 0)
+  assert.equal(inv.move.length, 1)
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.sessions[0].strategy, 'rehome')
+  assert.deepEqual(await readFile(transcript), before)
+  assert.equal((await stat(transcript)).ino, beforeStat.ino)
+  assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.P).sessions.length, 0)
+})
+
 test('semantic change detection keeps richer output and parse state', () => {
   const a = entry('user', 1, null, id(0))
   const plain = entry('user', 2, 1, id(0), { toolUseResult: { stdout: '', stderr: '' } })
@@ -957,6 +1000,51 @@ test('a conflicting same-root history is refused instead of hidden', async () =>
   assert.deepEqual(inv.blocked.map((s) => s.id), [id(937)])
   const result = await move(inv, by[h.acct.Z], h.paths)
   assert.match(result.receipt.failed[0].error, /conflicting duplicate uuids/)
+})
+
+test('idle Finish reports refused sessions quietly while verification errors remain failures', async () => {
+  const h = await home()
+  const bad = entry('user', 1, null, SOURCE)
+  await h.write(SOURCE, [bad, { ...bad, message: { role: 'user', content: 'conflicting body' } }])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Needs attention' }))
+  await h.write(id(994), [entry('user', 2, null, id(994))])
+  await h.record('P', id(994), rehomeRecord({ title: 'Good history' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  assert.equal(moved.receipt.sessions.length, 1)
+  assert.equal(moved.receipt.failed.length, 1)
+  const result = await cli(h.root, ['finish', '--json'])
+  assert.equal(result.code, 0)
+  const idle = lines(result.stdout).find(row => row.nothing)
+  assert.match(idle.failed[0].error, /conflicting duplicate uuids/)
+  const text = await cli(h.root, ['finish'])
+  assert.equal(text.code, 0)
+  assert.match(text.stdout, /nothing pending\n.*not moved.*conflicting duplicate uuids/s)
+  const refused = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(refused.receipt, moved.file)
+  assert.equal(refused.complete, false)
+  assert.equal(refused.failed.length, 1)
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  receipt.failed = []
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const clean = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(clean.complete, true)
+  assert.equal(clean.receipt, moved.file)
+  receipt.verification = { ok: false, problems: [{ id: id(994), check: 'transcript' }] }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const unverified = await cli(h.root, ['finish', '--json'])
+  assert.equal(unverified.code, 1)
+  assert.deepEqual(lines(unverified.stdout).find(row => row.done).problems, receipt.verification.problems)
+  const details = await cli(h.root, ['finish'])
+  assert.equal(details.code, 1)
+  assert.ok(details.stdout.includes(`${id(994)} | transcript verification failed`))
+  const checked = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(checked.ok, false)
+  assert.match(checked.error, /transcript verification failed/)
+  await writeFile(moved.file, '{')
+  const corrupt = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(corrupt.ok, false)
+  assert.match(corrupt.error, /corrupt receipt/)
 })
 
 test('new sidecars remain visible through a shared transcript', async () => {
@@ -1569,6 +1657,68 @@ test('signed-in identity follows an offline switch without using network-depende
   await f.write(f.init() + f.event(1, `[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`) + f.init(2, h.acct.P, h.org.T) + f.event(3, 'Failed to check allowlist status: offline'))
   assert.equal((await signedIn(h.paths, f.processes)).org, h.org.T)
   assert.equal(network.mock.callCount(), 0)
+})
+
+test('Finish uses the active Desktop organization when its saved cookie still names the previous organization', async (t) => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Switched organization' }))
+  await h.record('P', id(997), rehomeRecord({ title: 'Pending source' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  assert.equal(moved.pendingCloud, 1)
+  await unlink(path.join(h.dir('P'), `local_${id(997)}.json`))
+  const requestedOrgs = []
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const endpoint = new URL(url).pathname
+    if (endpoint === '/api/account') return Response.json({ uuid: h.acct.P })
+    if (endpoint === '/api/organizations') return Response.json([{ uuid: h.org.P }, { uuid: h.org.T }])
+    assert.equal(endpoint, '/v1/code/sessions')
+    assert.equal(options.method ?? 'GET', 'GET')
+    requestedOrgs.push(options.headers['x-organization-uuid'])
+    return Response.json({ data: [] }, { headers: { 'anthropic-organization-id': options.headers['x-organization-uuid'] } })
+  })
+  const cloud = await cloudClient(h.paths, null, {
+    active: { account: h.acct.P, org: h.org.P, state: 'known' },
+    cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.T]]),
+    userAgent: 'fixture'
+  })
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.pendingCloud, 0)
+  assert.deepEqual(requestedOrgs, [h.org.P])
+})
+
+test('cloud identity rejects a stale authenticated account even when both logins share the organization', async (t) => {
+  const h = await home(), requested = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    requested.push(new URL(url).pathname)
+    if (requested.at(-1) === '/api/account') return Response.json({ uuid: h.acct.T })
+    return Response.json([{ uuid: h.org.P }])
+  })
+  await assert.rejects(cloudClient(h.paths, null, {
+    active: { account: h.acct.P, org: h.org.P, state: 'known' },
+    cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]),
+    userAgent: 'fixture'
+  }), /login is still updating/)
+  assert.deepEqual(requested, ['/api/account'])
+})
+
+test('cloud identity retains verified cookie fallback for unknown Desktop state and rejects an explicit logout', async (t) => {
+  const h = await home(), requested = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    requested.push(new URL(url).pathname)
+    return Response.json(requested.at(-1) === '/api/account' ? { uuid: h.acct.P } : [{ uuid: h.org.P }, { uuid: h.org.T }])
+  })
+  const io = { active: { state: 'unknown', account: null, org: null }, cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]), userAgent: 'fixture' }
+  assert.equal((await cloudClient(h.paths, null, io)).org, h.org.P)
+  assert.equal((await cloudClient(h.paths, { account: h.acct.P, org: h.org.T, label: 'Team' }, io)).org, h.org.T)
+  requested.length = 0
+  await assert.rejects(cloudClient(h.paths, null, { ...io, active: { state: 'logged-out' } }), /signed out/)
+  assert.deepEqual(requested, [])
+  await assert.rejects(cloudClient(h.paths, { account: h.acct.T, org: h.org.T, label: 'Other login' }, io), /sign Claude Desktop into Other login/)
+  assert.deepEqual(requested, ['/api/account'])
 })
 
 async function home() {
@@ -4041,6 +4191,97 @@ struct StateChecks {
             precondition(item.note.contains(unavailable ? "cannot be read" : ["isStarred": "starred state", "isArchived": "archive state", "title": "title"][field]!))
             precondition(item.detailLines.contains { $0.1.contains("Fixture") })
         }
+        func accountResponse(_ pending: Bool) -> String {
+            String(data: try! JSONSerialization.data(withJSONObject: Demo.accounts.enumerated().map { index, account -> [String: Any] in
+                var row: [String: Any] = ["account": account.account, "org": account.org, "label": account.label, "active": index == 0]
+                if pending && index == 0 { row["pending"] = "cloud"; row["pendingAction"] = "finish"; row["receipt"] = "receipt-one" }
+                return row
+            }), encoding: .utf8)!
+        }
+        requests = []
+        let recovering = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        recovering.finishPending()
+        precondition(requests[0].0 == ["finish", "--json"])
+        requests[0].2(1, "Sign Claude Desktop into Personal")
+        requests[1].1(accountResponse(true))
+        requests[1].2(0, "")
+        precondition(recovering.note == "The move needs attention" && recovering.pendingReady)
+        recovering.refresh()
+        requests[2].1(accountResponse(false))
+        requests[2].2(0, "")
+        precondition(recovering.note == "The move needs attention")
+        func sweepReply(_ model: Model, _ event: String) {
+            let index = requests.count
+            model.checkSweep()
+            requests[index].1(event)
+            requests[index].2(0, "")
+        }
+        let cleanSweep = #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one"}"#
+        let repeated = Model(demo: Demo.accounts)
+        let repeatError = #"{"swept":true,"ok":false,"error":"Repeated error","receipt":"receipt-one"}"#
+        sweepReply(repeated, repeatError)
+        sweepReply(repeated, repeatError)
+        precondition(repeated.note == "The remaining work needs attention")
+        precondition(repeated.lines.filter { $0.0 == "background" }.count == 1)
+        sweepReply(repeated, cleanSweep)
+        precondition(repeated.note.isEmpty)
+        sweepReply(recovering, #"{"swept":true,"ok":false,"error":"Could not check source","receipt":"receipt-one"}"#)
+        precondition(recovering.note == "The remaining work needs attention")
+        sweepReply(recovering, cleanSweep)
+        precondition(recovering.note == "No remaining work" && !recovering.pendingReady)
+        precondition(recovering.lines.isEmpty && recovering.to == nil && recovering.from.isEmpty)
+        func failedFinishModel() -> Model {
+            requests = []
+            let model = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+            model.finishPending()
+            requests[0].2(1, "Sign Claude Desktop into Personal")
+            requests[1].1(accountResponse(false))
+            requests[1].2(0, "")
+            return model
+        }
+        for event in [
+            #"{"swept":true,"ok":false,"receipt":"receipt-one"}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"another-receipt"}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[{"id":"fixture","error":"Unmoved history"}]}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","changed":[{"id":"fixture","fields":["record unavailable"]}]}"#
+        ] {
+            let guarded = failedFinishModel()
+            sweepReply(guarded, event)
+            precondition(guarded.note != "No remaining work")
+            sweepReply(guarded, cleanSweep)
+            precondition(guarded.note == "No remaining work")
+        }
+        let corrupt = failedFinishModel()
+        sweepReply(corrupt, #"{"swept":true,"ok":false,"error":"Corrupt receipt set aside"}"#)
+        sweepReply(corrupt, #"{"swept":true,"ok":true,"complete":true,"receipt":"older-receipt"}"#)
+        precondition(corrupt.note == "The remaining work needs attention")
+        let restart = failedFinishModel()
+        sweepReply(restart, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","restart":true}"#)
+        let hint = restart.note
+        sweepReply(restart, cleanSweep)
+        precondition(restart.restartAvailable && restart.note == hint)
+        for errors in ["[]", #"[{"id":"fixture","title":"Unmoved session","error":"conflicting history"}]"#] {
+            requests = []
+            let idle = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+            idle.finishPending()
+            requests[0].1("{\"nothing\":true,\"failed\":" + errors + "}")
+            requests[0].2(0, "")
+            requests[1].1(accountResponse(false))
+            requests[1].2(0, "")
+            precondition(idle.badge.isEmpty && idle.visibleCompletion == nil)
+            precondition(idle.note == (errors == "[]" ? "No remaining work" : "1 session was not moved"))
+            precondition(idle.symbol == (errors == "[]" ? "arrow.left.arrow.right" : "info.circle"))
+            precondition(errors == "[]" || idle.lines.contains { $0.1.contains("conflicting history") })
+        }
+        requests = []
+        let failed = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        failed.finishPending()
+        requests[0].1("{\"done\":true,\"ok\":false,\"complete\":true,\"failed\":[{\"id\":\"fixture\",\"title\":\"Unmoved session\",\"error\":\"conflicting history\"}]}")
+        requests[0].2(1, "")
+        requests[1].1(accountResponse(false))
+        requests[1].2(0, "")
+        precondition(failed.note == "1 need attention")
+        precondition(failed.lines.contains { $0.1.contains("conflicting history") })
         print("Swift queue and metadata states passed")
     }
 }

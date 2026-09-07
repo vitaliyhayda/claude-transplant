@@ -60,7 +60,7 @@ To    ↑↓ move · enter confirm
 | `claude-transplant` | pick From and To, move, print a receipt |
 | `--dry-run` | plan only, write nothing |
 | `undo` | quarantine the last move and restore source entries, refused if a target changed or a source cannot be restored |
-| `finish` | finish held local records, check the active pending cloud source, or continue a staged cloud undo |
+| `finish` | finish held local records or active-source cloud checks, continue a staged cloud undo, and list sessions the last move refused |
 | `sweep` | verify placed records and retry eligible pending work, never requests a restart |
 | `restart` | show the plan for the existing Desktop refresh action |
 | `keep-local` | cancel held work and pending cloud checks without reversing completed moves |
@@ -129,7 +129,7 @@ Safety:
 - Interrupted retirement or undo resumes from the receipt. A corrupt newest receipt stops undo.
 - Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. Undo, retirement, and source archival also ignore branch and PR bookkeeping.
 - Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
-- Lineage follows `forkedFrom` pointers to their roots. Duplicate message ids that differ only in runtime metadata count as sync replays, anything else is refused.
+- Lineage follows `forkedFrom` pointers to their roots. Duplicate message ids count as sync replays when only runtime metadata differs, or an otherwise identical copy leaves command output or file-read content empty. Conflicting contents are refused.
 - A disposable planning cache lives at `~/Library/Application Support/claude-transplant/cache.json`. Every write decision uses live files. Delete it any time.
 
 ## Rules
