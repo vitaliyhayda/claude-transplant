@@ -1,8 +1,8 @@
 <h1 align="center">claude-transplant</h1>
 
-<h3 align="center">Move Claude Code history between accounts. Menubar or CLI.</h3>
+<h3 align="center">Move Claude Code history between accounts in Claude Desktop. Menubar or CLI.</h3>
 
-<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="Claude Transplant panel with source accounts converging on one destination" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="claude-transplant menubar panel moving Claude Code sessions from a Team account and a personal account into one destination in Claude Desktop" width="760"></p>
 
 ## What it does
 
@@ -14,7 +14,15 @@ Switch accounts in Claude Desktop and the Code sidebar goes empty. The session h
 - `undo` reverses the whole move.
 - macOS only. Unofficial, not affiliated with Anthropic.
 
-Not an account switcher. claude-swap, claude-acc, and `CLAUDE_CONFIG_DIR` swap the CLI's login. This never touches logins. It moves the Desktop sidebar's records, which those tools do not see.
+Where it fits next to the other tools people find for this problem:
+
+| Tool | Layer | Effect on the Desktop Code sidebar |
+|---|---|---|
+| claude-swap, claude-acc, CCSwitcher, clauth | swap the CLI login | none, Desktop keeps its own login and its own sidebar |
+| `CLAUDE_CONFIG_DIR` | separate CLI config directory | none |
+| restore-desktop-sessions | copies record files into the active account | sessions appear under both accounts and the copies drift apart |
+| claude-code-session-restorer | rebuilds record files from transcripts on Windows | recovers a sidebar whose records were deleted |
+| claude-transplant | moves record files between accounts, verified, with undo | history follows you, one account lists each session |
 
 ## Install
 
@@ -101,10 +109,22 @@ Active identity comes from the newest complete initialization entry in Claude De
 ## FAQ
 
 - Why is the Code sidebar empty after switching accounts? Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account and untouched.
+- My sessions disappeared after signing out, an update, or a reset. Is this the fix? Only when the records still exist under another account or organization. If a reset or update deleted them there is nothing to move, the transcripts survive and `claude --resume` in the terminal still lists them, and the sidebar needs its records rebuilt.
+- Do I have to move history back when I return to the first account? Yes, it is a move, not a copy. Moving back is the same one click and takes seconds to a minute, longer only when a Desktop restart is needed.
 - Can I continue the same session under the other account? Yes. It keeps its id, and the next message goes through the account you are signed into with the whole conversation as context. Personal history moved into a Team or Enterprise organization becomes that organization's data.
-- Does the CLI have this problem? No. `claude --resume` reads the shared transcripts regardless of login. Only Claude Desktop's Code tab is affected, and only that is handled here.
+- Does a move use tokens or talk to a model? No. Continuing a moved session costs the same as resuming any session after a break, and the prompt cache is per organization, so the first message after a switch never hits it either way.
+- Which plans and accounts work? Any plan that runs Claude Code in Claude Desktop, Pro, Max, Team, or Enterprise. Two organizations on one email, a Team seat next to a personal plan, are two sidebars and both are supported.
+- Can a Team or Enterprise admin see moved history? Team owners get usage analytics only. Enterprise compliance tooling can retrieve Claude Code session transcripts, and the next message in a moved session sends its whole conversation to that organization.
+- What happens to sessions that are running when I switch? Desktop ends the workers of the account you leave. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
+- Is anything uploaded or read from Keychain? No, unless you pass `--cloud`, which uses Desktop's own claude.ai session to reconcile Remote Control mirrors and stores nothing.
+- What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account.
+- Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side or is still open.
+- Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
+- Can I do it by hand? Yes. Quit Desktop, move the session's record file into the other account's organization folder, reopen Desktop. Do it only while Desktop is closed, it rewrites records it has open from memory.
 - Windows or Linux? No, macOS only.
+
+Anthropic issues that describe the same problem: [74662](https://github.com/anthropics/claude-code/issues/74662) tracks the per-account scoping, [85294](https://github.com/anthropics/claude-code/issues/85294) the root cause, [26452](https://github.com/anthropics/claude-code/issues/26452) and [48511](https://github.com/anthropics/claude-code/issues/48511) the disappearing sessions, [18435](https://github.com/anthropics/claude-code/issues/18435) and [30031](https://github.com/anthropics/claude-code/issues/30031) the request for account profiles.
 
 ## How it works
 
@@ -167,6 +187,7 @@ Safety:
 | Infer a restart-safe moment from activity logs | Cold records need no restart, held records get an explicit graceful shutdown |
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
+| Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
 
 ## Limits
 

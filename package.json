@@ -35,7 +35,10 @@
     "account-switching",
     "session-history",
     "claude-max",
-    "sidebar"
+    "sidebar",
+    "claude-code-sessions",
+    "claude-team",
+    "claude-pro"
   ],
   "license": "MIT",
   "os": [
