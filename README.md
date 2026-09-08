@@ -147,7 +147,7 @@ Shorter answers:
 - What happens to sessions that are running when I switch? Desktop ends the workers of the account you leave. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
 - Is anything uploaded or read from Keychain? From the CLI, not unless you pass `--cloud`. The menubar's Move always passes it: Desktop's claude.ai session is read from Keychain in memory, sent only to claude.ai to reconcile Remote Control mirrors, and never stored.
 - What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account.
-- Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side or is still open.
+- Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side, is still open, or a new fork still needs the moved parent.
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
 - Can I do it by hand? Yes. Quit Desktop, move the session's record file into the other account's organization folder, reopen Desktop. Do it only while Desktop is closed, it rewrites records it has open from memory.
@@ -165,7 +165,7 @@ Eligibility:
 - history is a single comparable version
 - record filename and identity are valid
 - no scheduled task, notification route, or running worker owns it
-- parent record is already in the target or moves first in the same batch
+- parent record is already in the target or moves first in the same batch, and stays wherever surviving forks refer to it, including archived forks or forks without history
 - no id collision in the target
 
 Worker identity uses the Desktop record id, CLI session id, PID, process start time, and ancestry, plus `~/.claude/sessions/<pid>.json` for workers that omit the session id. External CLI workers are always refused because restarting Desktop does not stop them.
@@ -180,7 +180,7 @@ Restarts:
 Remote Control (`--cloud`):
 
 - Reads the active selected source through Claude Desktop's authenticated `claude.ai` session. Cookies are decrypted in memory via Keychain, sent only to `claude.ai`, never stored.
-- If one local target contains the remote history, that record becomes the destination. Otherwise a same-title target must share eight consecutive exact remote messages to anchor a separate companion whose supported payloads are copied exactly into a new local transcript.
+- After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. Otherwise a same-title target must share eight consecutive exact remote messages to anchor a separate companion whose supported payloads are copied exactly into a new local transcript.
 - The source mirror is archived only after the remote worker is disconnected and unchanged and the local target verifies.
 - Inaccessible sources become pending only when unreadable or unarchived local records remain. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
 
@@ -199,9 +199,9 @@ Safety:
 - without history: transcript no longer exists on disk
 - unreadable: Desktop record is not valid JSON
 - source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
-- compatible source versions: same history in several transcript files, blocked unless the target already holds every version
-- grew apart: overlapping versions with different messages, all move
-- already there: target already holds every message and sidecar file
+- compatible source versions: same history in several transcript files without an explicit Desktop fork, blocked unless the target already holds every version
+- overlapping versions: shared lineage kept separate, including Desktop forks with separate transcripts
+- already there: a compatible Desktop record in the target holds every message and sidecar file
 - held: a Desktop worker owns a required record, restart approval is offered
 - blocked: needs merging, has a collision or unresolved parent, or is owned by a scheduled task, notification route, or external CLI worker
 - retired: source entries moved to quarantine after verification
