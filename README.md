@@ -211,7 +211,7 @@ Safety:
 - cloud checks pending: inaccessible sources that still have unreadable or unarchived local records
 - newer cloud sessions: rows created after Move, left for the next move
 
-Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, and Desktop's agent-mode records. Personal-plan organizations show as Personal. Accounts with no known email show a uuid prefix, session count, last activity, and most common project folder.
+Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` config directories, and Desktop's agent-mode records. Personal-plan organizations show as Personal. Accounts with no known email show a uuid prefix, session count, last activity, and most common project folder.
 
 Active identity comes from the newest complete initialization entry in Claude Desktop's `main.log` for the current Desktop process. A logout, unfinished switch, initialization failure, or config conflict clears it and the panel shows unknown. No Keychain access or network request is used for the badge. Desktop must be running.
 
