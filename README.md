@@ -197,7 +197,7 @@ Safety:
 ## Reading the output
 
 - without history: transcript no longer exists on disk
-- unreadable: Desktop record is not valid JSON. It is reported as a failure, and while it sits in a folder involved in a move, retirement and undo refuse until it is fixed or removed
+- unreadable: Desktop record is not valid JSON. It is reported as a failure, and while it sits in a folder that retirement or undo would remove records from, that step refuses until it is fixed or removed
 - source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
 - compatible source versions: same history in several transcript files without an explicit Desktop fork, blocked unless the target already holds every version
 - overlapping versions: shared lineage kept separate, including Desktop forks with separate transcripts
