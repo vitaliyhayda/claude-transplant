@@ -1,6 +1,6 @@
 {
   "name": "claude-transplant",
-  "version": "4.0.4",
+  "version": "4.0.5",
   "description": "Claude Desktop shows an empty Code sidebar after you switch accounts. This moves the session history to the account you are using. macOS, menubar or CLI.",
   "type": "module",
   "bin": {
