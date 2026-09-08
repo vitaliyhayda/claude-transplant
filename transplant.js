@@ -1109,9 +1109,10 @@ const sameEvents = (a, b) => {
 }
 const historyIncluded = (a, b) => a.comparable && b.comparable && a.roots.isSubsetOf(b.roots) && a.state === b.state && sameEvents(a, b)
 const carries = (a, b) => Boolean(a.sidecar && b.sidecar && a.sidecar.set.isSubsetOf(b.sidecar.set))
-const included = (a, b) => historyIncluded(a, b) && carries(a, b)
-const progress = (report, stage, completed, total) => report(stage, `${completed}/${total}`, { live: true, completed, total })
 const desktopRecordOf = (row) => row.session?.record ?? row.record ?? {}
+const canShareRecord = (a, b) => a.transcript === b.transcript || !(desktopRecordOf(a).forkedFromSessionId || desktopRecordOf(b).forkedFromSessionId)
+const included = (a, b) => canShareRecord(a, b) && historyIncluded(a, b) && carries(a, b)
+const progress = (report, stage, completed, total) => report(stage, `${completed}/${total}`, { live: true, completed, total })
 const desktopFileOf = (row) => typeof row === 'string' ? row : row.session?.file ?? row.file
 const bridgeIdsOf = (row) => [row, ...(row.members ?? [])].flatMap((member) => {
   const record = desktopRecordOf(member)
@@ -1347,7 +1348,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   for (const source of ranked) {
     const at = reps.findIndex((candidate) => {
       if (!historyIncluded(source, candidate) && !historyIncluded(candidate, source)) return false
-      return candidate.members.every((member) => sidecarsAgree(member.sidecar, source.sidecar))
+      return candidate.members.every((member) => canShareRecord(member, source) && sidecarsAgree(member.sidecar, source.sidecar))
     })
     if (at >= 0) {
       const prior = reps[at]

@@ -3347,6 +3347,73 @@ test('same-account rehome preserves a parent link when both records move', async
   assert.deepEqual((await readdir(h.project)).sort(), [`${SOURCE}.jsonl`, `${child}.jsonl`].sort())
 })
 
+test('compatible Desktop parent and archived fork move separately and undo without changing history', async () => {
+  for (const richer of ['parent', 'fork']) {
+    const h = await home(), child = id(777)
+    const targetDir = path.join(h.paths.records, h.acct.P, h.org.T)
+    await mkdir(targetDir, { recursive: true })
+    const base = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+    const branch = fork(base, SOURCE, child, 'Archived fork')
+    await h.write(SOURCE, richer === 'parent' ? [...base, entry('user', 3, 2, SOURCE)] : base)
+    await h.write(child, richer === 'fork' ? [...branch, entry('user', 4, null, child)] : branch)
+    await h.record('P', SOURCE, rehomeRecord({ title: 'Parent', isArchived: false, isStarred: true }))
+    await h.record('P', child, rehomeRecord({ title: 'Archived fork', isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+    const files = []
+    for (const sid of [SOURCE, child]) {
+      await mkdir(path.join(h.project, sid), { recursive: true })
+      const sidecar = path.join(h.project, sid, `${sid}.txt`)
+      await writeFile(sidecar, `supporting data for ${sid}`)
+      for (const file of [path.join(h.project, `${sid}.jsonl`), sidecar]) files.push({ file, bytes: await readFile(file), inode: (await stat(file)).ino })
+    }
+    const originalRecords = await Promise.all([SOURCE, child].map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`))))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P && row.org === h.org.P), to = all.find(row => row.account === h.acct.P && row.org === h.org.T)
+    const inv = await inventory([from], to, h.paths)
+    assert.deepEqual(inv.blocked.map(row => row.error), [])
+    assert.deepEqual(inv.move.map(row => row.id), [SOURCE, child])
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 2)
+    assert.equal(moved.receipt.sessions.every(row => row.strategy === 'rehome'), true)
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    const parent = JSON.parse(await readFile(path.join(targetDir, `local_${SOURCE}.json`)))
+    const archived = JSON.parse(await readFile(path.join(targetDir, `local_${child}.json`)))
+    assert.equal(parent.title, 'Parent')
+    assert.equal(parent.isStarred, true)
+    assert.equal(parent.isArchived, false)
+    assert.equal(archived.title, 'Archived fork')
+    assert.equal(archived.isArchived, true)
+    assert.equal(archived.forkedFromSessionId, parent.sessionId)
+    for (const file of files) {
+      assert.deepEqual(await readFile(file.file), file.bytes)
+      assert.equal((await stat(file.file)).ino, file.inode)
+    }
+    const restored = await undo(h.paths)
+    assert.ok(restored.dest)
+    assert.deepEqual(await readdir(targetDir), [])
+    for (const [index, sid] of [SOURCE, child].entries()) assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${sid}.json`)), originalRecords[index])
+  }
+})
+
+test('a Desktop fork is preserved when its parent already covers its history in the destination', async () => {
+  const h = await home(), child = id(777)
+  const base = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, base)
+  await h.write(child, fork(base, SOURCE, child, 'Archived fork'))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Parent' }))
+  await h.record('P', child, rehomeRecord({ title: 'Archived fork', isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.there.length, 0)
+  assert.deepEqual(inv.move.map(row => row.id), [child])
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.superseded.some(row => !row.source), false)
+  assert.deepEqual((await readdir(h.dir('T'))).sort(), [`local_${SOURCE}.json`, `local_${child}.json`].sort())
+  const archived = JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`)))
+  assert.equal(archived.isArchived, true)
+  assert.equal(archived.forkedFromSessionId, `local_${SOURCE}`)
+})
+
 test('progress begins before analysis and every counted phase reaches its total', async () => {
   const h = await home()
   const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
