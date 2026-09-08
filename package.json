@@ -1,7 +1,7 @@
 {
   "name": "claude-transplant",
-  "version": "4.0.3",
-  "description": "Move Claude Code history between accounts. Either via menubar or CLI. macOS only.",
+  "version": "4.0.4",
+  "description": "Claude Desktop shows an empty Code sidebar after you switch accounts. This moves the session history to the account you are using. macOS, menubar or CLI.",
   "type": "module",
   "bin": {
     "claude-transplant": "transplant.js"
@@ -20,7 +20,7 @@
     "type": "git",
     "url": "git+https://github.com/vitaliyhayda/claude-transplant.git"
   },
-  "homepage": "https://github.com/vitaliyhayda/claude-transplant#readme",
+  "homepage": "https://vitaliyhayda.github.io/claude-transplant/",
   "bugs": "https://github.com/vitaliyhayda/claude-transplant/issues",
   "keywords": [
     "claude",
@@ -30,10 +30,19 @@
     "history",
     "accounts",
     "migrate",
-    "transfer"
+    "transfer",
+    "multi-account",
+    "account-switching",
+    "session-history",
+    "claude-max",
+    "sidebar",
+    "claude-code-sessions",
+    "claude-team",
+    "claude-pro"
   ],
   "license": "MIT",
   "os": [
     "darwin"
-  ]
+  ],
+  "author": "Vitaliy Hayda (https://github.com/vitaliyhayda)"
 }
