@@ -85,6 +85,7 @@ Every command may write the tool's own files under `~/Library/Application Suppor
 | `--restart-approved <token>` | quits and reopens Claude Desktop, then the same as a move |
 | a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control mirrors archived or restored there, rescued local transcripts when a remote branch diverged |
 | `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
+| Move in the menubar | the same as a move with `--cloud`, the panel always passes it |
 | `menubar --snapshot <png>` | that image file |
 
 Command and flag names are stable. Renames get a deprecation release first.
