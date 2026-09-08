@@ -116,13 +116,34 @@ Command and flag names are stable. Renames get a deprecation release first.
 
 ## FAQ
 
-- Why is the Code sidebar empty after switching accounts? Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account and untouched.
-- My sessions disappeared after signing out, an update, or a reset. Is this the fix? Only when the records still exist under another account or organization. If a reset or update deleted them there is nothing to move, the transcripts survive and `claude --resume` in the terminal still lists them, and the sidebar needs its records rebuilt.
-- Do I have to move history back when I return to the first account? Yes, it is a move, not a copy. Moving back is the same one click and takes seconds to a minute, longer only when a Desktop restart is needed.
-- Can I continue the same session under the other account? Yes. It keeps its id, and the next message goes through the account you are signed into with the whole conversation as context. Personal history moved into a Team or Enterprise organization becomes that organization's data.
+### Why is the Code sidebar empty after switching accounts?
+
+Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account and untouched.
+
+### My sessions disappeared after signing out, an update, or a reset. Is this the fix?
+
+Only when the records still exist under another account or organization. If a reset or update deleted them there is nothing to move, the transcripts survive and `claude --resume` in the terminal still lists them, and the sidebar needs its records rebuilt.
+
+### Do I have to move history back when I return to the first account?
+
+Yes, it is a move, not a copy. Moving back is the same one click and takes seconds to a minute, longer only when a Desktop restart is needed.
+
+### Can I continue the same session under the other account?
+
+Yes. It keeps its id, and the next message goes through the account you are signed into with the whole conversation as context. Personal history moved into a Team or Enterprise organization becomes that organization's data.
+
+### Can a Team or Enterprise admin see moved history?
+
+Team owners get usage analytics only. Enterprise compliance tooling can retrieve Claude Code session transcripts, and the next message in a moved session sends its whole conversation to that organization.
+
+### Does it work on Windows or Linux?
+
+Not yet. Desktop uses the same per-account folder layout there, under its app data directory, so the CLI needs only the platform paths and process checks, and the menubar stays macOS. PRs welcome, and claude-code-session-restorer covers Windows rebuilds meanwhile.
+
+Shorter answers:
+
 - Does a move use tokens or talk to a model? No. Continuing a moved session costs the same as resuming any session after a break, and the prompt cache is per organization, so the first message after a switch never hits it either way.
 - Which plans and accounts work? Any plan that runs Claude Code in Claude Desktop, Pro, Max, Team, or Enterprise. Two organizations on one email, a Team seat next to a personal plan, are two sidebars and both are supported.
-- Can a Team or Enterprise admin see moved history? Team owners get usage analytics only. Enterprise compliance tooling can retrieve Claude Code session transcripts, and the next message in a moved session sends its whole conversation to that organization.
 - What happens to sessions that are running when I switch? Desktop ends the workers of the account you leave. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
 - Is anything uploaded or read from Keychain? From the CLI, not unless you pass `--cloud`. The menubar's Move always passes it: Desktop's claude.ai session is read from Keychain in memory, sent only to claude.ai to reconcile Remote Control mirrors, and never stored.
 - What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account.
@@ -130,7 +151,6 @@ Command and flag names are stable. Renames get a deprecation release first.
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
 - Can I do it by hand? Yes. Quit Desktop, move the session's record file into the other account's organization folder, reopen Desktop. Do it only while Desktop is closed, it rewrites records it has open from memory.
-- Windows or Linux? Not yet. Desktop uses the same per-account folder layout there, under its app data directory, so the CLI needs only the platform paths and process checks, and the menubar stays macOS. PRs welcome, and claude-code-session-restorer covers Windows rebuilds meanwhile.
 
 Anthropic issues that describe the same problem: [74662](https://github.com/anthropics/claude-code/issues/74662) tracks the per-account scoping, [85294](https://github.com/anthropics/claude-code/issues/85294) the root cause, [26452](https://github.com/anthropics/claude-code/issues/26452) and [48511](https://github.com/anthropics/claude-code/issues/48511) the disappearing sessions, [18435](https://github.com/anthropics/claude-code/issues/18435) and [30031](https://github.com/anthropics/claude-code/issues/30031) the request for account profiles.
 
