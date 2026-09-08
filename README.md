@@ -2,7 +2,17 @@
 
 <h3 align="center">Move Claude Code history between accounts in Claude Desktop. Menubar or CLI.</h3>
 
+<p align="center"><a href="https://www.npmjs.com/package/claude-transplant"><img src="https://img.shields.io/npm/v/claude-transplant" alt="npm version"></a> <a href="https://github.com/vitaliyhayda/claude-transplant/actions/workflows/ci.yml"><img src="https://github.com/vitaliyhayda/claude-transplant/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <a href="https://github.com/vitaliyhayda/claude-transplant/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/claude-transplant" alt="MIT license"></a></p>
+
 <p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="claude-transplant menubar panel moving Claude Code sessions from a Team account and a personal account into one destination in Claude Desktop" width="760"></p>
+
+## Quick start
+
+```
+npx claude-transplant menubar
+```
+
+Open the panel from the menu bar, check the accounts to take from, pick the one to land in, click Move. Sign Claude Desktop into that account and the sessions are listed there.
 
 ## What it does
 
@@ -31,6 +41,7 @@ Node 22 or newer. The menubar also needs the Xcode command line tools: `xcode-se
 ```
 npx claude-transplant menubar   # install the menubar app
 npx claude-transplant           # CLI
+npm i -g claude-transplant      # global install, then claude-transplant
 ```
 
 From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (append a tag or commit hash to pin).
@@ -85,27 +96,6 @@ To    ↑↓ move · enter confirm
 | `--json` | one event per line |
 | `--version` | print the version |
 
-## Reading the output
-
-- without history: transcript no longer exists on disk
-- unreadable: Desktop record is not valid JSON
-- source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
-- compatible source versions: same history in several transcript files, blocked unless the target already holds every version
-- grew apart: overlapping versions with different messages, all move
-- already there: target already holds every message and sidecar file
-- held: a Desktop worker owns a required record, restart approval is offered
-- blocked: needs merging, has a collision or unresolved parent, or is owned by a scheduled task, notification route, or external CLI worker
-- retired: source entries moved to quarantine after verification
-- cloud mirrors: active or paused Remote Control rows under the signed-in source
-- cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads
-- cloud blocked: no unambiguous local anchor, unsupported payload, connected worker, changed history, or account mismatch
-- cloud checks pending: inaccessible sources that still have unreadable or unarchived local records
-- newer cloud sessions: rows created after Move, left for the next move
-
-Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, and Desktop's agent-mode records. Personal-plan organizations show as Personal. Accounts with no known email show a uuid prefix, session count, last activity, and most common project folder.
-
-Active identity comes from the newest complete initialization entry in Claude Desktop's `main.log` for the current Desktop process. A logout, unfinished switch, initialization failure, or config conflict clears it and the panel shows unknown. No Keychain access or network request is used for the badge. Desktop must be running.
-
 ## FAQ
 
 - Why is the Code sidebar empty after switching accounts? Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account and untouched.
@@ -125,6 +115,8 @@ Active identity comes from the newest complete initialization entry in Claude De
 - Windows or Linux? Not yet. Desktop uses the same per-account folder layout there, under its app data directory, so the CLI needs only the platform paths and process checks, and the menubar stays macOS. PRs welcome, and claude-code-session-restorer covers Windows rebuilds meanwhile.
 
 Anthropic issues that describe the same problem: [74662](https://github.com/anthropics/claude-code/issues/74662) tracks the per-account scoping, [85294](https://github.com/anthropics/claude-code/issues/85294) the root cause, [26452](https://github.com/anthropics/claude-code/issues/26452) and [48511](https://github.com/anthropics/claude-code/issues/48511) the disappearing sessions, [18435](https://github.com/anthropics/claude-code/issues/18435) and [30031](https://github.com/anthropics/claude-code/issues/30031) the request for account profiles.
+
+Discussed on [Hacker News](https://news.ycombinator.com/item?id=49583423).
 
 ## How it works
 
@@ -164,7 +156,29 @@ Safety:
 - Lineage follows `forkedFrom` pointers to their roots. Duplicate message ids count as sync replays when only runtime metadata differs, or an otherwise identical copy leaves command output or file-read content empty. Conflicting contents are refused.
 - A disposable planning cache lives at `~/Library/Application Support/claude-transplant/cache.json`. Every write decision uses live files. Delete it any time.
 
-## Rules
+## Reading the output
+
+- without history: transcript no longer exists on disk
+- unreadable: Desktop record is not valid JSON
+- source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
+- compatible source versions: same history in several transcript files, blocked unless the target already holds every version
+- grew apart: overlapping versions with different messages, all move
+- already there: target already holds every message and sidecar file
+- held: a Desktop worker owns a required record, restart approval is offered
+- blocked: needs merging, has a collision or unresolved parent, or is owned by a scheduled task, notification route, or external CLI worker
+- retired: source entries moved to quarantine after verification
+- cloud mirrors: active or paused Remote Control rows under the signed-in source
+- cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads
+- cloud blocked: no unambiguous local anchor, unsupported payload, connected worker, changed history, or account mismatch
+- cloud checks pending: inaccessible sources that still have unreadable or unarchived local records
+- newer cloud sessions: rows created after Move, left for the next move
+
+Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, and Desktop's agent-mode records. Personal-plan organizations show as Personal. Accounts with no known email show a uuid prefix, session count, last activity, and most common project folder.
+
+Active identity comes from the newest complete initialization entry in Claude Desktop's `main.log` for the current Desktop process. A logout, unfinished switch, initialization failure, or config conflict clears it and the panel shows unknown. No Keychain access or network request is used for the badge. Desktop must be running.
+
+<details>
+<summary>Rules</summary>
 
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
 - No transcript or sidecar is renamed, edited, or deleted. The quarantined record is the rollback.
@@ -174,7 +188,10 @@ Safety:
 - Automatic retries cover the receipt's named work only. They never start a restart, store credentials, or create destination bridges.
 - One JavaScript file, no dependencies, Node 22. The menubar is one Swift file.
 
-## Not done, and why
+</details>
+
+<details>
+<summary>Not done, and why</summary>
 
 | Tried | Result |
 |---|---|
@@ -188,6 +205,8 @@ Safety:
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
+
+</details>
 
 ## Limits
 
