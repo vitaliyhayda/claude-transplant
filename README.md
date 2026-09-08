@@ -12,7 +12,7 @@ Switch accounts in Claude Desktop and the Code sidebar goes empty. The session h
 - Sessions owned by a running Desktop worker are held until you approve a restart, or skipped with Move only the rest.
 - `--cloud` reconciles Remote Control for the signed-in source. No model runs, no artifact is recreated.
 - `undo` reverses the whole move.
-- macOS only. Unofficial, not affiliated with Anthropic.
+- macOS today, PRs for Windows and Linux welcome. Unofficial, not affiliated with Anthropic.
 
 Where it fits next to the other tools people find for this problem:
 
@@ -122,7 +122,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
 - Can I do it by hand? Yes. Quit Desktop, move the session's record file into the other account's organization folder, reopen Desktop. Do it only while Desktop is closed, it rewrites records it has open from memory.
-- Windows or Linux? No, macOS only.
+- Windows or Linux? Not yet. Desktop uses the same per-account folder layout there, under its app data directory, so the CLI needs only the platform paths and process checks, and the menubar stays macOS. PRs welcome, and claude-code-session-restorer covers Windows rebuilds meanwhile.
 
 Anthropic issues that describe the same problem: [74662](https://github.com/anthropics/claude-code/issues/74662) tracks the per-account scoping, [85294](https://github.com/anthropics/claude-code/issues/85294) the root cause, [26452](https://github.com/anthropics/claude-code/issues/26452) and [48511](https://github.com/anthropics/claude-code/issues/48511) the disappearing sessions, [18435](https://github.com/anthropics/claude-code/issues/18435) and [30031](https://github.com/anthropics/claude-code/issues/30031) the request for account profiles.
 
