@@ -1807,9 +1807,10 @@ async function prepareUndo(receipt, paths) {
 async function finishUndo(receipt, file, paths) {
   const root = path.join(paths.state, 'quarantine')
   const dest = path.join(root, receipt.at)
+  const superseded = receipt.superseded ?? [], undoing = receipt.undoing ?? []
   const problems = [
-    ...await restoreProblems(receipt.superseded ?? [], root),
-    ...await restoreProblems(receipt.undoing ?? [], root),
+    ...await restoreProblems(superseded, root),
+    ...await restoreProblems(undoing, root),
     ...await activationProblems(receipt)
   ]
   if (await exists(path.join(dest, 'receipt.json'))) problems.push('undo receipt path occupied')
@@ -1820,10 +1821,29 @@ async function finishUndo(receipt, file, paths) {
   }
   problems.push(...await undoParentProblems(receipt))
   if (problems.length) return { receipt, restoreProblems: problems }
-  await restore(receipt.superseded ?? [], root)
-  await park(receipt.undoing ?? [])
-  await restoreActivations(receipt)
-  await mkdir(dest, { recursive: true })
+  let failure
+  try {
+    await restore(superseded, root)
+    await park(undoing)
+    await restoreActivations(receipt)
+    await mkdir(dest, { recursive: true })
+  } catch (error) { failure = error }
+  problems.push(...await undoParentProblems(receipt))
+  if (!problems.length && failure) throw failure
+  if (problems.length) {
+    if (failure) problems.push(failure.message)
+    const blocked = []
+    for (const item of undoing) {
+      const unsafe = await restoreProblems([item], root)
+      blocked.push(...unsafe)
+      if (!unsafe.length) {
+        try { await restore([item], root) }
+        catch (error) { blocked.push(`Undo rollback blocked: ${error.message}`) }
+      }
+    }
+    blocked.push(...await restoreProblems(undoing, root), ...await restoreProblems(superseded, root))
+    return { receipt, restoreProblems: [...new Set([...problems, ...blocked])] }
+  }
   await rename(file, path.join(dest, 'receipt.json'))
   return { receipt, dest }
 }

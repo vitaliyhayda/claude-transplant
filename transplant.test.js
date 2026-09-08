@@ -3,7 +3,8 @@ import { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { appendFile, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import fs, { appendFile, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -3774,6 +3775,119 @@ test('Undo rechecks destination forks after cloud restoration before removing an
   assert.ok((await undo(h.paths, { cloud })).dest)
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
   assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('Undo restores destination parents when forks arrive during local mutations and remains recoverable', async () => {
+  for (const stage of ['restore source', 'park destination']) for (const unreadable of [false, true]) {
+    const h = await home(), child = id(777), later = id(778), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(child, fork(base, SOURCE, child, 'Moved fork'))
+    await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)]))
+    const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+    assert.equal(moved.ok, true)
+    const destination = await Promise.all(moved.receipt.sessions.map(async row => [row.record, await readFile(row.record)]))
+    const sourceParent = path.join(h.dir('P'), `local_${SOURCE}.json`), targetParent = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const originalRename = fs.rename
+    let injected = false, refused
+    try {
+      fs.rename = async (source, target) => {
+        await originalRename(source, target)
+        if (injected || !(stage === 'restore source' ? target === sourceParent : source === targetParent)) return
+        injected = true
+        if (unreadable) await writeFile(path.join(h.dir('T'), `local_${later}.json`), '{broken')
+        else await h.record('T', later, rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+      }
+      syncBuiltinESMExports()
+      refused = await undo(h.paths)
+    } finally {
+      fs.rename = originalRename
+      syncBuiltinESMExports()
+    }
+    assert.equal(injected, true)
+    assert.equal(refused.dest, undefined)
+    assert.match(refused.restoreProblems[0], unreadable ? /unreadable Desktop record:/ : /parent Desktop record would be removed by Undo/)
+    for (const [file, bytes] of destination) assert.deepEqual(await readFile(file), bytes)
+    if (!unreadable) assert.equal(JSON.parse(await readFile(path.join(h.dir('T'), `local_${later}.json`))).forkedFromSessionId, `local_${SOURCE}`)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    const receipt = JSON.parse(await readFile(moved.file))
+    assert.equal(receipt.undoing.length, 2)
+    assert.deepEqual(receipt.superseded, moved.receipt.superseded)
+    for (const row of receipt.superseded) for (const [, parked] of row.moved) assert.equal(await readFile(parked).catch(() => null), null)
+    const retried = await finishPending(h.paths)
+    assert.equal(retried.ok, false)
+    assert.match(retried.reconciled.problems[0], unreadable ? /unreadable Desktop record:/ : /parent Desktop record would be removed by Undo/)
+    for (const [file, bytes] of destination) assert.deepEqual(await readFile(file), bytes)
+    await unlink(path.join(h.dir('T'), `local_${later}.json`))
+    const undone = await finishWorkflow(h.paths)
+    assert.ok(undone.dest)
+    assert.equal(undone.complete, true)
+    assert.equal(JSON.parse(await readFile(path.join(undone.dest, 'receipt.json'))).at, moved.receipt.at)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    assert.deepEqual(await readdir(h.dir('T')), [])
+  }
+})
+
+test('Undo rollback preserves foreign records and source forks while restoring every safe destination record', async () => {
+  for (const change of ['source record', 'destination parent', 'destination sibling', 'source fork']) {
+    const h = await home(), child = id(777), later = id(778), sourceFork = id(779), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(child, fork(base, SOURCE, child, 'Moved fork'))
+    await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = new Map(await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)])))
+    const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+    assert.equal(moved.ok, true)
+    const destination = new Map(await Promise.all(moved.receipt.sessions.map(async row => [row.record, await readFile(row.record)])))
+    const sourceParent = path.join(h.dir('P'), `local_${SOURCE}.json`), targetParent = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const targetChild = path.join(h.dir('T'), `local_${child}.json`), parkedParent = path.join(h.paths.state, 'quarantine', moved.receipt.at, path.basename(targetParent))
+    const foreignFile = change === 'source record' ? sourceParent : change === 'destination parent' ? targetParent : change === 'destination sibling' ? targetChild : path.join(h.dir('P'), `local_${sourceFork}.json`)
+    const originalRename = fs.rename
+    let injected = false, refused, foreignBytes
+    try {
+      fs.rename = async (source, target) => {
+        await originalRename(source, target)
+        if (injected || source !== targetParent || target !== parkedParent) return
+        injected = true
+        await h.record('T', later, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+        if (change === 'source fork') await h.record('P', sourceFork, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+        else await h.record(change === 'source record' ? 'P' : 'T', change === 'destination sibling' ? child : SOURCE,
+          rehomeRecord({ title: 'Independent change', ...(change === 'destination sibling' ? { forkedFromSessionId: `local_${SOURCE}` } : {}) }))
+        foreignBytes = await readFile(foreignFile)
+      }
+      syncBuiltinESMExports()
+      refused = await undo(h.paths)
+    } finally {
+      fs.rename = originalRename
+      syncBuiltinESMExports()
+    }
+    assert.equal(injected, true)
+    assert.equal(refused.dest, undefined)
+    assert.match(refused.restoreProblems[0], /parent Desktop record would be removed by Undo/)
+    if (change !== 'source fork') assert.ok(refused.restoreProblems.some(problem => /restore path occupied|recovery artifact changed/.test(problem)))
+    assert.deepEqual(await readFile(foreignFile), foreignBytes)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), file === foreignFile ? foreignBytes : bytes)
+    for (const [file, bytes] of destination) assert.deepEqual(await readFile(file), file === foreignFile ? foreignBytes : bytes)
+    if (change === 'destination parent') assert.deepEqual(await readFile(parkedParent), destination.get(targetParent))
+    const receipt = JSON.parse(await readFile(moved.file))
+    assert.equal(receipt.undoing.length, 2)
+    assert.deepEqual(receipt.superseded, moved.receipt.superseded)
+    if (change !== 'source fork') {
+      await rename(foreignFile, `${foreignFile}.foreign`)
+      if (change === 'source record') await writeFile(foreignFile, originals.get(foreignFile))
+      if (change === 'destination sibling') await writeFile(foreignFile, destination.get(foreignFile))
+    }
+    await unlink(path.join(h.dir('T'), `local_${later}.json`))
+    const undone = await finishWorkflow(h.paths)
+    assert.ok(undone.dest)
+    assert.equal(undone.complete, true)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    for (const file of destination.keys()) assert.equal(await readFile(file).catch(() => null), null)
+    assert.deepEqual(await readFile(change === 'source fork' ? foreignFile : `${foreignFile}.foreign`), foreignBytes)
+  }
 })
 
 test('destination parents survive forks added after inventory or during final preparation', async () => {
