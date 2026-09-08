@@ -6,6 +6,20 @@
 
 <p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="claude-transplant menubar panel moving Claude Code sessions from a Team account and a personal account into one destination in Claude Desktop" width="760"></p>
 
+Different accounts, the same conversations. Real Claude Desktop screenshots with anonymized account details.
+
+<table>
+<tr>
+<td width="50%" align="center"><a href="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/46897ffeb11a8fb14e175f023e2ee64c99c52e73/code-sidebar-work.png"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/46897ffeb11a8fb14e175f023e2ee64c99c52e73/code-sidebar-work.png" width="370" alt="Claude Desktop Code sidebar with three conversations under you@work.com, with Acme Inc. selected before Move"></a><br><strong>Work account before Move</strong><br>you@work.com · Acme Inc.</td>
+<td width="50%" align="center"><a href="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/46897ffeb11a8fb14e175f023e2ee64c99c52e73/code-sidebar-personal.png"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/46897ffeb11a8fb14e175f023e2ee64c99c52e73/code-sidebar-personal.png" width="370" alt="The same three conversations under you@home.com, with Personal selected after moving Claude Desktop Code history between accounts"></a><br><strong>Personal account after Move</strong><br>you@home.com · Personal</td>
+</tr>
+</table>
+
+1. Your work account shows your conversations in the Code sidebar.
+2. Sign into Personal and see an empty Code sidebar after switching accounts.
+3. Move the sessions from work to Personal, then reload that account in Desktop.
+4. Open a moved session and continue the same conversation.
+
 ## Quick start
 
 ```
@@ -154,7 +168,9 @@ Shorter answers:
 
 Anthropic issues that describe the same problem: [74662](https://github.com/anthropics/claude-code/issues/74662) tracks the per-account scoping, [85294](https://github.com/anthropics/claude-code/issues/85294) the root cause, [26452](https://github.com/anthropics/claude-code/issues/26452) and [48511](https://github.com/anthropics/claude-code/issues/48511) the disappearing sessions, [18435](https://github.com/anthropics/claude-code/issues/18435) and [30031](https://github.com/anthropics/claude-code/issues/30031) the request for account profiles.
 
-Discussed on [Hacker News](https://news.ycombinator.com/item?id=49583423). The mechanism and the manual fix, step by step: [Claude Desktop history missing after switching accounts, and how to get it back](https://dev.to/vitaliyhayda/claude-desktop-history-missing-after-switching-accounts-and-how-to-get-it-back-4a26).
+Discussed on [Hacker News](https://news.ycombinator.com/item?id=49583423)
+
+Manual walkthrough: [recovering missing Claude Desktop history](https://dev.to/vitaliyhayda/claude-desktop-history-missing-after-switching-accounts-and-how-to-get-it-back-4a26)
 
 ## How it works
 
@@ -197,7 +213,7 @@ Safety:
 ## Reading the output
 
 - without history: transcript no longer exists on disk
-- unreadable: Desktop record is not valid JSON. It is reported as a failure, and while it sits in a folder that retirement or undo would remove records from, that step refuses until it is fixed or removed
+- unreadable: Desktop record is not valid JSON. Retirement or undo cannot remove records from its folder until the file is fixed or removed
 - source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
 - compatible source versions: same history in several transcript files without an explicit Desktop fork, blocked unless the target already holds every version
 - overlapping versions: shared lineage kept separate, including Desktop forks with separate transcripts
