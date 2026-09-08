@@ -154,7 +154,7 @@ Shorter answers:
 
 Anthropic issues that describe the same problem: [74662](https://github.com/anthropics/claude-code/issues/74662) tracks the per-account scoping, [85294](https://github.com/anthropics/claude-code/issues/85294) the root cause, [26452](https://github.com/anthropics/claude-code/issues/26452) and [48511](https://github.com/anthropics/claude-code/issues/48511) the disappearing sessions, [18435](https://github.com/anthropics/claude-code/issues/18435) and [30031](https://github.com/anthropics/claude-code/issues/30031) the request for account profiles.
 
-Discussed on [Hacker News](https://news.ycombinator.com/item?id=49583423).
+Discussed on [Hacker News](https://news.ycombinator.com/item?id=49583423). The mechanism and the manual fix, step by step: [Claude Desktop history missing after switching accounts, and how to get it back](https://dev.to/vitaliyhayda/claude-desktop-history-missing-after-switching-accounts-and-how-to-get-it-back-4a26).
 
 ## How it works
 
@@ -197,7 +197,7 @@ Safety:
 ## Reading the output
 
 - without history: transcript no longer exists on disk
-- unreadable: Desktop record is not valid JSON
+- unreadable: Desktop record is not valid JSON. It is reported as a failure, and while it sits in a folder involved in a move, retirement and undo refuse until it is fixed or removed
 - source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
 - compatible source versions: same history in several transcript files without an explicit Desktop fork, blocked unless the target already holds every version
 - overlapping versions: shared lineage kept separate, including Desktop forks with separate transcripts
@@ -258,6 +258,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.0.4 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-08 |
 | 4.0.3 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-07 |
 
 Receipts, quarantine, drift evidence, cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
