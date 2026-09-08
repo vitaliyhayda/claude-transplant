@@ -46,7 +46,7 @@ npm i -g claude-transplant      # global install, then claude-transplant
 
 From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (append a tag or commit hash to pin).
 
-Nothing touches the network or Keychain unless you pass `--cloud`.
+The CLI touches the network and Keychain only when you pass `--cloud`. The menubar's Move always passes it, reconciling Remote Control through Desktop's own claude.ai session, and stores nothing.
 
 ## Menubar
 
@@ -54,6 +54,7 @@ Nothing touches the network or Keychain unless you pass `--cloud`.
 - When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Otherwise pick TO yourself.
 - Open local sessions offer Stop and restart. Finish move continues the same receipt. Keep completed cancels remaining work without reversing completed moves.
 - Held local work retries when its workers stop. Pending cloud sources retry when that account signs in.
+- Move always runs with `--cloud`, so the source's Remote Control mirrors are reconciled in the same run.
 - Starts at login, shows progress in the icon, notifies when done.
 - Bundles its own CLI, so rerun `menubar` after upgrading.
 - `menubar --snapshot panel.png` renders the live panel, `menubar --remove` uninstalls, `--demo <dir>` renders the animation above.
@@ -106,7 +107,7 @@ To    ↑↓ move · enter confirm
 - Which plans and accounts work? Any plan that runs Claude Code in Claude Desktop, Pro, Max, Team, or Enterprise. Two organizations on one email, a Team seat next to a personal plan, are two sidebars and both are supported.
 - Can a Team or Enterprise admin see moved history? Team owners get usage analytics only. Enterprise compliance tooling can retrieve Claude Code session transcripts, and the next message in a moved session sends its whole conversation to that organization.
 - What happens to sessions that are running when I switch? Desktop ends the workers of the account you leave. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
-- Is anything uploaded or read from Keychain? No, unless you pass `--cloud`, which uses Desktop's own claude.ai session to reconcile Remote Control mirrors and stores nothing.
+- Is anything uploaded or read from Keychain? From the CLI, not unless you pass `--cloud`. The menubar's Move always passes it: Desktop's claude.ai session is read from Keychain in memory, sent only to claude.ai to reconcile Remote Control mirrors, and never stored.
 - What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account.
 - Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side or is still open.
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
