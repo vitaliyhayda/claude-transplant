@@ -6,7 +6,7 @@
 
 <p align="center"><img src="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif" alt="claude-transplant menubar panel moving Claude Code sessions from a Team account and a personal account into one destination in Claude Desktop" width="760"></p>
 
-Different accounts, the same conversations. Real Claude Desktop screenshots with anonymized account details.
+Different accounts, the same conversations
 
 <table>
 <tr>
