@@ -1,0 +1,53 @@
+name: pages
+on:
+  push:
+    branches: [main]
+    paths: [README.md, package.json, .github/workflows/pages.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install markdown==3.7
+      - run: |
+          python3 - <<'PY'
+          import json, markdown, pathlib
+          pkg = json.load(open('package.json'))
+          src = pathlib.Path('README.md').read_text(encoding='utf-8').replace('<details>', '<details markdown="1">')
+          body = markdown.markdown(src, extensions=['tables', 'fenced_code', 'toc', 'md_in_html'])
+          url = pkg['homepage']
+          title = 'claude-transplant: move Claude Code history between accounts in Claude Desktop'
+          desc = pkg['description']
+          head = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}">
+          <meta property="og:title" content="{title}"><meta property="og:description" content="{desc}"><meta property="og:url" content="{url}">
+          <meta property="og:image" content="https://raw.githubusercontent.com/vitaliyhayda/claude-transplant/main/menubar.gif"><meta name="twitter:card" content="summary_large_image">
+          <style>:root{{color-scheme:light dark}}body{{margin:0 auto;max-width:800px;padding:24px 16px;font:16px/1.55 -apple-system,system-ui,sans-serif}}pre,code{{font:14px/1.45 ui-monospace,Menlo,monospace}}pre{{overflow:auto;padding:12px;background:rgba(127,127,127,.12);border-radius:8px}}table{{border-collapse:collapse;display:block;overflow:auto}}td,th{{border:1px solid rgba(127,127,127,.35);padding:6px 10px;text-align:left}}img{{max-width:100%}}a{{color:#2563eb}}details{{margin:12px 0}}</style></head><body><main>'''
+          tail = f'</main><footer><p><a href="{pkg["repository"]["url"].replace("git+", "").replace(".git", "")}">Source on GitHub</a> · <a href="https://www.npmjs.com/package/{pkg["name"]}">npm</a></p></footer></body></html>'
+          out = pathlib.Path('site'); out.mkdir(exist_ok=True)
+          (out / 'index.html').write_text(head + body + tail, encoding='utf-8')
+          (out / '.nojekyll').write_text('')
+          PY
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

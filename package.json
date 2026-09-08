@@ -20,7 +20,7 @@
     "type": "git",
     "url": "git+https://github.com/vitaliyhayda/claude-transplant.git"
   },
-  "homepage": "https://github.com/vitaliyhayda/claude-transplant#readme",
+  "homepage": "https://vitaliyhayda.github.io/claude-transplant/",
   "bugs": "https://github.com/vitaliyhayda/claude-transplant/issues",
   "keywords": [
     "claude",
@@ -43,5 +43,6 @@
   "license": "MIT",
   "os": [
     "darwin"
-  ]
+  ],
+  "author": "Vitaliy Hayda (https://github.com/vitaliyhayda)"
 }
