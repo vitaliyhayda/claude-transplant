@@ -1784,6 +1784,20 @@ test('accounts includes a known login organization with no Desktop directory', a
   assert.equal(await stat(row.dir).then(() => true, () => false), false)
 })
 
+test('accounts labels a login held in a claude-acc account directory', async () => {
+  const h = await home()
+  const account = id(922)
+  const org = id(923)
+  const profile = path.join(h.paths.switchAccounts, 'work')
+  await mkdir(profile, { recursive: true })
+  await writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress: 'switched@example.com', organizationName: 'Switched Team', organizationType: 'team' }
+  }))
+  const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
+
+  assert.equal(row.label, 'switched@example.com \u00b7 Switched Team')
+})
+
 test('menubar snapshot renders live accounts without installing', async () => {
   const h = await home()
   const output = path.join(h.root, 'snapshot', 'panel.png')
