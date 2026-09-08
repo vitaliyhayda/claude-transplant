@@ -211,9 +211,13 @@ export async function restartPlan(inv, paths, table = processTable(paths.claudeA
   let added = true
   while (added && inv) {
     added = false
-    for (const source of released) {
-      const parent = held.find((item) => item.sources.some((member) => inv.sources.find((row) => row.file === member.file)?.record.sessionId === source.record.forkedFromSessionId))
-      if (parent) added = add(source, source, parent.workers) || added
+    for (const source of [...released, ...inv.there]) {
+      const related = held.find((item) => item.sources.some((member) => {
+        const current = inv.sources.find((row) => row.file === member.file)
+        return current && (source.members ?? [source]).some((row) => sameAccount(row.account, current.account) &&
+          (row.record.forkedFromSessionId === current.record.sessionId || current.record.forkedFromSessionId === row.record.sessionId))
+      }))
+      if (related) added = add(source, source, related.workers) || added
     }
   }
   if (inv && !held.length) return null
@@ -1814,6 +1818,7 @@ async function finishUndo(receipt, file, paths) {
     if (ownsWorker(liveWorkers, row.targetId, row.targetRecordId)) problems.push(`${row.title} | running worker kept in destination`)
     if (row.taskFile && (await taskSessions(row.taskFile)).has(row.targetRecordId ?? `local_${row.targetId}`) !== row.taskOwned) problems.push(`${row.title} | scheduled tasks changed`)
   }
+  problems.push(...await undoParentProblems(receipt))
   if (problems.length) return { receipt, restoreProblems: problems }
   await restore(receipt.superseded ?? [], root)
   await park(receipt.undoing ?? [])
@@ -1921,6 +1926,8 @@ async function reconcileFiles(paths, options = {}) {
   receipt.failed ??= []
   receipt.superseded ??= []
   if (receipt.undoing) {
+    const blocked = await undoParentProblems(receipt)
+    if (blocked.length) return { title: 'undo recovery blocked', error: blocked.join(', '), problems: blocked }
     const remote = await restoreRemote(receipt, p.file, paths, options.cloud)
     if (remote.problems.length) return { title: 'Remote Control undo recovery blocked', error: remote.problems.join(', '), problems: remote.problems }
     if (remote.pending.length) return { title: 'Undo pending', error: `sign Claude Desktop into ${remote.pending.join(' or ')}`, pendingUndo: remote.pending, remoteRestored: remote.restored, receipt }
@@ -2070,12 +2077,21 @@ const owners = (sources, carried) => {
 async function parentReferences(directories) {
   const parents = new Map()
   for (const dir of directories) for (const file of await recordFiles(dir)) {
-    const record = await readJson(file)
+    const record = await readJson(file).catch(() => null)
     if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error(`unreadable Desktop record: ${file}`)
     const parent = record.forkedFromSessionId
     parents.set(file, LOCAL_RECORD.test(parent ?? '') ? path.join(dir, `${parent}.json`) : null)
   }
   return parents
+}
+
+async function undoParentProblems(receipt) {
+  const removing = new Set(receipt.sessions.map(row => row.record))
+  try {
+    const parents = await parentReferences(new Set([...removing].map(file => path.dirname(file))))
+    return [...parents].filter(([file, parent]) => !removing.has(file) && removing.has(parent))
+      .map(([file]) => `${path.basename(file)} | parent Desktop record would be removed by Undo`)
+  } catch (error) { return [error.message] }
 }
 
 async function retire(inv, to, receipt, paths, at, problems, save, report = () => {}, check = () => {}) {
@@ -3297,6 +3313,7 @@ export function undo(paths, options = {}) {
     }
     if (changedAfterSnapshot.length) return { receipt, changed: changedAfterSnapshot }
     const activationBlocked = await activationProblems(receipt)
+    activationBlocked.push(...await undoParentProblems(receipt))
     if (activationBlocked.length) return { receipt, restoreProblems: activationBlocked }
     receipt.undoing = plan
     if (receipt.remote?.length) receipt.remoteUndoing = structuredClone(receipt.remote)
