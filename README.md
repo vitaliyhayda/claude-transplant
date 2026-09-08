@@ -78,9 +78,9 @@ To    ↑↓ move · enter confirm
 - without history: transcript no longer exists on disk
 - unreadable: Desktop record is not valid JSON
 - source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
-- compatible source versions: same history in several transcript files, blocked unless the target already holds every version
-- grew apart: overlapping versions with different messages, all move
-- already there: target already holds every message and sidecar file
+- compatible source versions: same history in several transcript files without an explicit Desktop fork, blocked unless the target already holds every version
+- overlapping versions: shared lineage kept separate, including Desktop forks with separate transcripts
+- already there: a compatible Desktop record in the target holds every message and sidecar file
 - held: a Desktop worker owns a required record, restart approval is offered
 - blocked: needs merging, has a collision or unresolved parent, or is owned by a scheduled task, notification route, or external CLI worker
 - retired: source entries moved to quarantine after verification
@@ -103,7 +103,7 @@ Eligibility:
 - history is a single comparable version
 - record filename and identity are valid
 - no scheduled task, notification route, or running worker owns it
-- parent record is already in the target or moves first in the same batch
+- parent record is already in the target or moves first in the same batch, and stays while destination forks refer to it, including archived forks or forks without history
 - no id collision in the target
 
 Worker identity uses the Desktop record id, CLI session id, PID, process start time, and ancestry, plus `~/.claude/sessions/<pid>.json` for workers that omit the session id. External CLI workers are always refused because restarting Desktop does not stop them.

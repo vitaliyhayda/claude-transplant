@@ -1204,8 +1204,10 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       })
       const eligible = remoteConversation.length >= 4 ? candidates : [...new Set([...named, ...linked])]
       const covered = findCovered(eligible)
-      if (covered.length > 1) return { blocked: { id: session.id, title: session.title, account, error: 'multiple verified local target histories' } }
-      if (covered.length === 1) return { match: { session, target: covered[0], conversationSha: sha(stable(remoteConversation)), account } }
+      const linkedCovered = covered.filter(candidate => candidate.remoteIds.has(sessionId))
+      const verified = linkedCovered.length === 1 ? linkedCovered : covered
+      if (verified.length > 1) return { blocked: { id: session.id, title: session.title, account, error: 'multiple verified local target histories' } }
+      if (verified.length === 1) return { match: { session, target: verified[0], conversationSha: sha(stable(remoteConversation)), account } }
       if (remoteConversation.length < 4 && findCovered(candidates.filter((candidate) => !eligible.includes(candidate))).length) return { blocked: { id: session.id, title: session.title, account, error: 'remote history is too short to match a renamed local target' } }
       const anchors = linked.length ? linked : named
       if (anchors.length !== 1) return { blocked: { id: session.id, title: session.title, account, error: anchors.length ? 'multiple divergent local targets' : 'no linked or same-title local target' } }
@@ -2059,7 +2061,7 @@ const owners = (sources, carried) => {
   return sources.map(s => ({ s, owner: candidates.get(s.roots.values().next().value)?.find(carrier => included(s, carrier.history)) })).filter(row => row.owner)
 }
 
-async function retire(inv, receipt, paths, at, problems, save, report = () => {}, check = () => {}) {
+async function retire(inv, to, receipt, paths, at, problems, save, report = () => {}, check = () => {}) {
   check(true)
   report('retire', 'checking', { live: true })
   const bad = new Set(problems.map((p) => p.id))
@@ -2070,6 +2072,7 @@ async function retire(inv, receipt, paths, at, problems, save, report = () => {}
     const history = bad.has(row.targetId) ? null : inv.move.find((m) => m.id === row.id)
     if (history) landed.push({ by: row.targetId, history })
   }
+  const requiredParents = new Set([...to.sessions, ...inv.move].map(row => desktopRecordOf(row).forkedFromSessionId).filter(Boolean))
   const gone = new Set()
   const blocked = new Set()
   const sourceRows = new Map()
@@ -2082,7 +2085,7 @@ async function retire(inv, receipt, paths, at, problems, save, report = () => {}
   }
   for (const { by, history } of landed) {
     for (const t of inv.targets) {
-      if (gone.has(t) || !t.transcript || !included(t, history)) continue
+      if (gone.has(t) || requiredParents.has(t.record) || !t.transcript || !included(t, history)) continue
       const claim = ownership(t, liveWorkers)
       if (claim) {
         if (!blocked.has(t.session.file)) receipt.failed.push({ id: t.id, title: t.session.title, error: `${claim} kept in destination` })
@@ -2770,7 +2773,7 @@ async function transfer(inv, to, paths, report, context = {}) {
   const priorProblems = context.existing ? receipt.appendCheckpoint.verification?.problems ?? [] : []
   receipt.verification = { ok: ok && receipt.appendCheckpoint?.verification?.ok !== false && !priorProblems.length, problems: [...priorProblems, ...recordedProblems] }
   await save()
-  await retire(inv, receipt, paths, at, problems, save, report, context.check)
+  await retire(inv, to, receipt, paths, at, problems, save, report, context.check)
   if (inv.cloudRequested) {
     const current = await accounts(paths)
     const actual = receipt.fromAccounts.filter((source) => localCloudPending(current.find((account) => sameAccount(account, source))))
@@ -3749,7 +3752,7 @@ async function main(argv) {
       sourceRejected ? `${count(sourceRejected)} source rejected` : null,
       targetRejected ? `${count(targetRejected)} target rejected` : null,
       inv.twice ? `${count(inv.twice)} compatible source versions` : null,
-      inv.apart ? `${count(inv.apart)} grew apart, all kept` : null,
+      inv.apart ? `${count(inv.apart)} overlapping versions, kept separate` : null,
       inv.there.length ? `${count(inv.there.length)} already there` : null,
       inv.blocked.length ? `${count(inv.blocked.length)} blocked` : null,
       inv.cloud?.matches.length ? `${count(inv.cloud.matches.length)} cloud mirrors` : null,

@@ -2637,6 +2637,69 @@ test('a verified target archives its source Remote Control mirror and Undo resto
   assert.deepEqual(restored.promptAppendSnapshot, activated.promptAppendSnapshot)
 })
 
+test('a unique bridge link selects a fully verified Desktop fork and Undo restores its archive state', async () => {
+  for (const location of ['P', 'T']) {
+    const h = await home(), child = id(777), base = branchEntries(4, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('T', SOURCE, rehomeRecord({ title: 'Parent', isArchived: true }))
+    await h.write(child, [...fork(base, SOURCE, child, 'Fork'), { type: 'bridge-session', sessionId: child, bridgeSessionId: 'cse_linked_fork' }])
+    await h.record(location, child, rehomeRecord({ title: 'Fork', isArchived: true, forkedFromSessionId: `local_${SOURCE}`, bridgeSessionIds: ['session_linked_fork'] }))
+    const parentFile = path.join(h.dir('T'), `local_${SOURCE}.json`), targetFile = path.join(h.dir('T'), `local_${child}.json`)
+    const originalParent = await readFile(parentFile), originalFork = JSON.parse(await readFile(path.join(h.dir(location), `local_${child}.json`)))
+    let status = 'active'
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_linked_fork', title: 'Renamed remote fork', status })],
+      eventRows: async () => remoteRows(base),
+      session: async () => remoteState(status),
+      archive: async () => { assert.ok(await readFile(targetFile)); status = 'archived' },
+      unarchive: async () => { status = 'active' }
+    })
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+    assert.deepEqual(inv.cloud.blocked, [])
+    assert.deepEqual(inv.cloud.matches.map(row => [row.target.kind, row.target.id]), [[location === 'P' ? 'move' : 'existing', child]])
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(status, 'archived')
+    assert.deepEqual(moved.receipt.remote.map(row => row.targetId), [child])
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    const placed = JSON.parse(await readFile(targetFile))
+    assert.equal(placed.isArchived, false)
+    assert.equal(placed.forkedFromSessionId, `local_${SOURCE}`)
+    assert.deepEqual(placed.bridgeSessionIds, location === 'P' ? [] : ['session_linked_fork'])
+    assert.deepEqual(await readFile(parentFile), originalParent)
+    assert.ok((await undo(h.paths, { cloud })).dest)
+    assert.equal(status, 'active')
+    assert.deepEqual(await readFile(parentFile), originalParent)
+    assert.deepEqual(JSON.parse(await readFile(path.join(h.dir(location), `local_${child}.json`))), originalFork)
+  }
+})
+
+test('overlapping verified histories refuse absent, ambiguous, or unverified bridge links', async () => {
+  for (const links of ['none', 'multiple', 'unverified']) {
+    const h = await home(), child = id(777), base = branchEntries(4, SOURCE, 1)
+    const bridgeSessionIds = links === 'multiple' ? ['session_linked_fork'] : []
+    await h.write(SOURCE, base)
+    await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds }))
+    await h.write(child, fork(base, SOURCE, child, 'Fork'))
+    await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}`, bridgeSessionIds }))
+    if (links === 'unverified') {
+      const shorter = id(778)
+      await h.write(shorter, fork(base.slice(0, 3), SOURCE, shorter, 'Shorter fork'))
+      await h.record('T', shorter, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}`, bridgeSessionIds: ['session_linked_fork'] }))
+    }
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_linked_fork', title: 'Remote fork' })],
+      eventRows: async () => remoteRows(base)
+    })
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+    assert.deepEqual(inv.cloud.matches, [])
+    assert.equal(inv.cloud.blocked.length, 1)
+    assert.match(inv.cloud.blocked[0].error, /multiple .*local target/)
+  }
+})
+
 test('attachment prompts and tiny ordering drift prove semantic Remote Control containment', async () => {
   const h = await home()
   const remote = Array.from({ length: 100 }, (_, index) => entry(index % 2 ? 'assistant' : 'user', index + 100, index ? index + 99 : null, SOURCE))
@@ -3408,10 +3471,51 @@ test('a Desktop fork is preserved when its parent already covers its history in 
   const moved = await move(inv, to, h.paths)
   assert.equal(moved.ok, true)
   assert.equal(moved.receipt.superseded.some(row => !row.source), false)
+  assert.deepEqual(await readdir(h.dir('P')), [])
   assert.deepEqual((await readdir(h.dir('T'))).sort(), [`local_${SOURCE}.json`, `local_${child}.json`].sort())
   const archived = JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`)))
   assert.equal(archived.isArchived, true)
   assert.equal(archived.forkedFromSessionId, `local_${SOURCE}`)
+})
+
+test('destination parents survive richer replacements while Desktop forks still refer to them', async () => {
+  for (const location of ['source', 'destination', 'without history']) for (const isArchived of [false, true]) {
+    const h = await home(), richer = id(776), child = id(777)
+    const base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('T', SOURCE, rehomeRecord({ title: 'Parent' }))
+    await h.write(richer, [...fork(base, SOURCE, richer, 'Richer copy'), entry('user', 3, null, richer)])
+    await h.record('P', richer, rehomeRecord({ title: 'Richer copy' }))
+    if (location !== 'without history') await h.write(child, fork(base, SOURCE, child, 'Fork'))
+    await h.record(location === 'source' ? 'P' : 'T', child, rehomeRecord({ title: 'Fork', isArchived, forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all([...from.sessions, ...to.sessions].map(async row => [row.file, await readFile(row.file)]))
+    const inv = await inventory([from], to, h.paths)
+    assert.deepEqual(inv.move.map(row => row.id), location === 'source' ? [richer, child] : [richer])
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.superseded.some(row => !row.source), false)
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    assert.deepEqual((await readdir(h.dir('T'))).sort(), [SOURCE, richer, child].map(sid => `local_${sid}.json`).sort())
+    const placed = JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`)))
+    assert.equal(placed.forkedFromSessionId, `local_${SOURCE}`)
+    assert.equal(placed.isArchived, isArchived)
+    assert.ok((await undo(h.paths)).dest)
+    assert.deepEqual((await readdir(h.dir('T'))).sort(), to.sessions.map(row => path.basename(row.file)).sort())
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+  }
+})
+
+test('identical Desktop parent and fork histories are reported as overlapping versions', async () => {
+  const h = await home(), child = id(777), base = branchEntries(2, SOURCE, 1)
+  await h.write(SOURCE, base)
+  await h.write(child, fork(base, SOURCE, child, 'Fork'))
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+  const result = await cli(h.root, ['--from', 'p@example.com personal', '--to', 'z@example.com personal', '--dry-run'])
+  assert.equal(result.code, 0)
+  assert.match(result.stdout, /2 overlapping versions, kept separate/)
+  assert.doesNotMatch(result.stdout, /grew apart/)
 })
 
 test('progress begins before analysis and every counted phase reaches its total', async () => {
