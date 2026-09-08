@@ -345,6 +345,7 @@ export function layout(home = os.homedir()) {
     pool: path.join(home, '.claude/projects'),
     login: path.join(home, '.claude.json'),
     backups: path.join(home, '.claude/backups'),
+    switchAccounts: path.join(home, '.claude-switch/accounts'),
     state: path.join(support, 'claude-transplant')
   }
 }
@@ -540,6 +541,9 @@ async function logins(paths) {
   }
   for (const e of await readdir(paths.home, { withFileTypes: true }).catch(() => [])) {
     if (e.name.startsWith('.claude')) await take(e.isDirectory() ? path.join(paths.home, e.name, '.claude.json') : path.join(paths.home, e.name))
+  }
+  for (const e of await readdir(paths.switchAccounts, { withFileTypes: true }).catch(() => [])) {
+    if (e.isDirectory()) await take(path.join(paths.switchAccounts, e.name, '.claude.json'))
   }
   for (const f of await readdir(paths.backups).catch(() => [])) if (f.startsWith('.claude.json.backup')) await take(path.join(paths.backups, f))
   await take(paths.login)
