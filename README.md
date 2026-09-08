@@ -6,13 +6,15 @@
 
 ## What it does
 
-Claude Desktop lists each Claude Code session under the account and organization that created it. Switch accounts and the history stays behind.
+Switch accounts in Claude Desktop and the Code sidebar goes empty. The session history is not lost. Desktop lists each Claude Code session under the account and organization that created it, so a personal plan, a Team seat, or a second Max subscription each sees only its own. This tool moves that history to the account you are using.
 
 - Moves local Desktop session records to another account. Transcripts and sidecars stay on disk, sessions keep their ids, nothing is copied.
 - Sessions owned by a running Desktop worker are held until you approve a restart, or skipped with Move only the rest.
 - `--cloud` reconciles Remote Control for the signed-in source. No model runs, no artifact is recreated.
 - `undo` reverses the whole move.
 - macOS only. Unofficial, not affiliated with Anthropic.
+
+Not an account switcher. claude-swap, claude-acc, and `CLAUDE_CONFIG_DIR` swap the CLI's login. This never touches logins. It moves the Desktop sidebar's records, which those tools do not see.
 
 ## Install
 
@@ -24,6 +26,8 @@ npx claude-transplant           # CLI
 ```
 
 From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (append a tag or commit hash to pin).
+
+Nothing touches the network or Keychain unless you pass `--cloud`.
 
 ## Menubar
 
@@ -94,6 +98,14 @@ Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile di
 
 Active identity comes from the newest complete initialization entry in Claude Desktop's `main.log` for the current Desktop process. A logout, unfinished switch, initialization failure, or config conflict clears it and the panel shows unknown. No Keychain access or network request is used for the badge. Desktop must be running.
 
+## FAQ
+
+- Why is the Code sidebar empty after switching accounts? Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account and untouched.
+- Can I continue the same session under the other account? Yes. It keeps its id, and the next message goes through the account you are signed into with the whole conversation as context. Personal history moved into a Team or Enterprise organization becomes that organization's data.
+- Does the CLI have this problem? No. `claude --resume` reads the shared transcripts regardless of login. Only Claude Desktop's Code tab is affected, and only that is handled here.
+- What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
+- Windows or Linux? No, macOS only.
+
 ## How it works
 
 A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. The transcript pool is shared across accounts, so a move writes the same record into the target organization with the same `cliSessionId`, verifies that transcript, sidecars, and both records are unchanged, then parks the source record in quarantine.
@@ -163,7 +175,11 @@ Safety:
 - Artifact ownership, versions, comments, and share links stay with the original account.
 - Embedded base64, text, and HTTP(S) images and documents can be rescued. Account-owned file ids and unknown shapes are refused.
 - Remote Control uses private Claude endpoints and fails closed if their shape or auth changes.
-- File layouts, log wording, and endpoints are undocumented and may change. Verified with Claude Desktop 1.46388.4 and Claude Code 2.1.260.
+- File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 - Moving history out of a Team organization is your organization's decision.
+
+| claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
+|---|---|---|---|---|
+| 4.0.3 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-07 |
 
 Receipts, quarantine, drift evidence, cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
