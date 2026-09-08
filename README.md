@@ -73,6 +73,23 @@ To    ↑↓ move · enter confirm
 | `--json` | one event per line |
 | `--version` | print the version |
 
+## What each command touches
+
+Every command may write the tool's own files under `~/Library/Application Support/claude-transplant`: cache, lock, restart plan, receipts, quarantine, and drift evidence. A move, `finish`, `sweep`, `undo`, and `restart` first finish any interrupted move, retirement, undo, or restart, which can move records, rewrite the receipt and quarantine, and reopen Claude Desktop. `--dry-run` and `keep-local` refuse in that state instead.
+
+| Command | Beyond the tool's own folder |
+|---|---|
+| `accounts`, `--dry-run`, `--version`, `keep-local` | nothing, `--dry-run --cloud` also reads Remote Control metadata over the network |
+| `restart` without a token | nothing beyond the recovery above |
+| move, `finish`, `sweep`, `undo` | Desktop session records under `claude-code-sessions` |
+| `--restart-approved <token>` | quits and reopens Claude Desktop, then the same as a move |
+| a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control mirrors archived or restored there, rescued local transcripts when a remote branch diverged |
+| `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
+| Move in the menubar | the same as a move with `--cloud`, the panel always passes it |
+| `menubar --snapshot <png>` | that image file |
+
+Command and flag names are stable. Renames get a deprecation release first.
+
 ## Reading the output
 
 - without history: transcript no longer exists on disk
