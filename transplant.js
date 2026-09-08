@@ -502,13 +502,14 @@ async function locked(paths, work) {
   }
 }
 
+const recordFiles = async (dir) => (await readdir(dir)).filter(name => name.startsWith('local_') && name.endsWith('.json')).sort().map(name => path.join(dir, name))
+
 async function records(root) {
   const out = []
   for (const account of await dirs(root)) {
     for (const org of await dirs(path.join(root, account))) {
       const dir = path.join(root, account, org)
-      const names = (await readdir(dir).catch(() => [])).filter((f) => f.startsWith('local_') && f.endsWith('.json')).sort()
-      out.push({ account, org, dir, files: names.map((f) => path.join(dir, f)) })
+      out.push({ account, org, dir, files: await recordFiles(dir).catch(() => []) })
     }
   }
   return out
@@ -1110,7 +1111,11 @@ const sameEvents = (a, b) => {
 const historyIncluded = (a, b) => a.comparable && b.comparable && a.roots.isSubsetOf(b.roots) && a.state === b.state && sameEvents(a, b)
 const carries = (a, b) => Boolean(a.sidecar && b.sidecar && a.sidecar.set.isSubsetOf(b.sidecar.set))
 const desktopRecordOf = (row) => row.session?.record ?? row.record ?? {}
-const canShareRecord = (a, b) => a.transcript === b.transcript || !(desktopRecordOf(a).forkedFromSessionId || desktopRecordOf(b).forkedFromSessionId)
+const canShareRecord = (a, b, requiredParents) => {
+  const first = desktopRecordOf(a), second = desktopRecordOf(b)
+  if (first.sessionId !== second.sessionId && (requiredParents?.has(first.sessionId) || requiredParents?.has(second.sessionId))) return false
+  return a.transcript === b.transcript || !(first.forkedFromSessionId || second.forkedFromSessionId)
+}
 const included = (a, b) => canShareRecord(a, b) && historyIncluded(a, b) && carries(a, b)
 const progress = (report, stage, completed, total) => report(stage, `${completed}/${total}`, { live: true, completed, total })
 const desktopFileOf = (row) => typeof row === 'string' ? row : row.session?.file ?? row.file
@@ -1345,12 +1350,13 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     }
   }
   unreadable.push(...(to.unreadable ?? []).map((file) => ({ file, account: to, target: true })))
+  const requiredParents = new Set(found.map(row => row.record.forkedFromSessionId).filter(Boolean))
   const ranked = found.toSorted((a, b) => b.roots.size - a.roots.size || b.activeAt - a.activeAt || a.forks - b.forks || a.createdAt - b.createdAt)
   const reps = []
   for (const source of ranked) {
     const at = reps.findIndex((candidate) => {
       if (!historyIncluded(source, candidate) && !historyIncluded(candidate, source)) return false
-      return candidate.members.every((member) => canShareRecord(member, source) && sidecarsAgree(member.sidecar, source.sidecar))
+      return candidate.members.every((member) => canShareRecord(member, source, requiredParents) && sidecarsAgree(member.sidecar, source.sidecar))
     })
     if (at >= 0) {
       const prior = reps[at]
@@ -1386,7 +1392,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     const remembered = options.cloudBridgeIds?.get(target.id) ?? []
     if (remembered.length) target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...remembered.map(remoteId).filter(Boolean)])]
   }
-  const covering = (s) => targets.find((target) => target.record && s.members.every((member) => included(member, target))) ?? null
+  const covering = (s) => targets.find((target) => target.record && s.members.every((member) => included(member, target) && (!requiredParents.has(member.record.sessionId) || target.record === member.record.sessionId))) ?? null
   const there = []
   const pending = []
   for (const s of reps) {
@@ -2061,6 +2067,17 @@ const owners = (sources, carried) => {
   return sources.map(s => ({ s, owner: candidates.get(s.roots.values().next().value)?.find(carrier => included(s, carrier.history)) })).filter(row => row.owner)
 }
 
+async function parentReferences(directories) {
+  const parents = new Map()
+  for (const dir of directories) for (const file of await recordFiles(dir)) {
+    const record = await readJson(file)
+    if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error(`unreadable Desktop record: ${file}`)
+    const parent = record.forkedFromSessionId
+    parents.set(file, LOCAL_RECORD.test(parent ?? '') ? path.join(dir, `${parent}.json`) : null)
+  }
+  return parents
+}
+
 async function retire(inv, to, receipt, paths, at, problems, save, report = () => {}, check = () => {}) {
   check(true)
   report('retire', 'checking', { live: true })
@@ -2161,10 +2178,26 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
   }
   plan = readyPlan
   if (!plan.length) return
-  receipt.retiring = plan
-  await save()
   try {
+    const directories = new Set(plan.map(item => path.dirname(item.moved[0][0])))
+    const parents = await parentReferences(directories)
+    const retiring = new Set(plan.map(item => item.moved[0][0]))
+    const kept = [...parents.keys()].filter(file => !retiring.has(file))
+    for (const file of kept) {
+      const parent = parents.get(file)
+      if (retiring.delete(parent)) kept.push(parent)
+    }
+    plan = plan.filter(item => retiring.has(item.moved[0][0]))
+    if (!plan.length) return
+    const checkParents = async (parked = false) => {
+      for (const [file, parent] of await parentReferences(directories)) {
+        if (retiring.has(parent) && (parked || !retiring.has(file))) throw new Error(`parent reference changed during retirement: ${file}`)
+      }
+    }
+    receipt.retiring = plan
+    await save()
     check(true)
+    await checkParents()
     const parkWorkers = workers()
     await park(plan, async (item) => {
       check()
@@ -2187,6 +2220,7 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
       const row = sourceRows.get(item.moved[0][0])
       if (!row || !(await witnessed(row, postWorkers, row.strategy !== 'rehome'))) throw new Error(`source changed after retirement: ${item.id}`)
     }
+    await checkParents(true)
   } catch (error) {
     const root = path.dirname(dest)
     const blocked = await restoreProblems(plan, root, true)

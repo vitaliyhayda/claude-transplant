@@ -1,7 +1,7 @@
 {
   "name": "claude-transplant",
   "version": "4.0.4",
-  "description": "Move Claude Code history between accounts. Either via menubar or CLI. macOS only.",
+  "description": "Claude Desktop shows an empty Code sidebar after you switch accounts. This moves the session history to the account you are using. macOS, menubar or CLI.",
   "type": "module",
   "bin": {
     "claude-transplant": "transplant.js"
@@ -30,7 +30,15 @@
     "history",
     "accounts",
     "migrate",
-    "transfer"
+    "transfer",
+    "multi-account",
+    "account-switching",
+    "session-history",
+    "claude-max",
+    "sidebar",
+    "claude-code-sessions",
+    "claude-team",
+    "claude-pro"
   ],
   "license": "MIT",
   "os": [
