@@ -277,4 +277,6 @@ Active identity comes from the newest complete initialization entry in Claude De
 | 4.0.4 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-08 |
 | 4.0.3 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-07 |
 
+4.0.5 passed 190 automated tests, Swift typechecking, and published npm package verification on 2026-09-08.
+
 Receipts, quarantine, drift evidence, cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
