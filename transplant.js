@@ -71,6 +71,8 @@ const waitingSessions = (receipt) => [...new Map([
 ].map(row => [row.localId ?? remoteId(row.id) ?? row.id, row])).values()]
 const legacyLocalFailures = (receipt) => receipt.localCancelledAt ? [] : (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
 const needsRecovery = (receipt) => Boolean(receipt.pending || receipt.retiring || receipt.finalizing || receipt.undoing || receipt.remotePending || receipt.remoteUndoing?.length)
+const recoveryFamilies = (receipt) => (receipt.taskTransfers ?? []).slice(receipt.undoing ? 0 : receipt.appendCheckpoint?.taskTransfers ?? 0)
+const inspector = (paths, options) => options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
 const receiptOkay = (receipt) => receipt.verification?.ok !== false && !receipt.failed?.length
 const finishOkay = (receipt) => receipt.verification?.ok !== false && !receipt.verification?.problems?.length &&
   !(receipt.failed ?? []).some(row => row.cloudAccount) && !receipt.cloudError
@@ -1562,7 +1564,6 @@ async function rehomeOne(s, to, journal, guard) {
   const recordSha = sha(recordText)
   await journal({ strategy: 'rehome', recordSha })
   guard.check?.()
-  await guard.taskCheck?.()
   await writeNew(record, recordText, async ({ dev, ino }) => {
     guard.created.set(record, { dev, ino })
     await journal({ created: { dev, ino } })
@@ -1576,7 +1577,6 @@ async function rehomeOne(s, to, journal, guard) {
   if (sha(afterRecord) !== sourceRecordSha) throw new Error('source Desktop record changed during move')
   if (afterSidecars.fingerprint !== sourceSidecars.fingerprint) throw new Error('source sidecars changed during move')
   guard.check?.()
-  await guard.taskCheck?.()
   for (const member of s.members ?? [s]) {
     member.strategy = 'rehome'
     member.transcriptFingerprint = transcriptFingerprint
@@ -1770,7 +1770,7 @@ async function deferredWorkflow(paths) {
     return { ...latest, mode: 'undo', sources }
   }
   if ((receipt.pending || receipt.retiring || receipt.finalizing || receipt.undoing) && receipt.taskTransfers?.length) {
-    const transfers = receipt.undoing ? receipt.taskTransfers : receipt.taskTransfers.slice(receipt.appendCheckpoint?.taskTransfers ?? 0)
+    const transfers = recoveryFamilies(receipt)
     const sources = [...new Map(transfers.map(row => [`${row.from.account}/${row.from.org}`, row.from])).values()]
     if (sources.length) return { ...latest, mode: receipt.undoing ? 'undo' : 'recovery', recovery: true, sources }
   }
@@ -1905,7 +1905,11 @@ async function taskTransferProblems(transfers, paths, inspect, partial = false, 
   for (const family of transfers ?? []) {
     check()
     try {
+      const ids = new Set(family.ids), recordIds = new Set(family.recordIds)
+      const links = new Map(family.links.map(link => [link[0], stable(link)])), cliIds = new Set(family.links.map(link => link[1]))
+      const expectedTasks = stable(family.tasks.toSorted((a, b) => a.id.localeCompare(b.id)))
       const table = inspect?.() ?? processTable(paths.claudeApp)
+      const liveWorkers = new Set(table.filter(row => row.worker).flatMap(row => row.ids))
       if (await schedulerBusy(paths, [family.from, family.to], table)) problems.push(SCHEDULER_OWNS)
       if (sameAccount(family.from, family.to)) throw new Error('scheduled task namespaces must differ')
       const selected = []
@@ -1913,23 +1917,27 @@ async function taskTransferProblems(transfers, paths, inspect, partial = false, 
         if (!UUID.test(namespace.account) || !UUID.test(namespace.org) || file !== path.join(paths.records, namespace.account, namespace.org, 'scheduled-tasks.json')) throw new Error('scheduled task namespace mismatch')
         const registry = (await taskSessions(file)).registry
         const tasks = registry?.scheduledTasks ?? []
-        const owned = tasks.filter(task => family.ids.includes(task.id))
-        if (owned.length && stable(owned.toSorted((a, b) => a.id.localeCompare(b.id))) !== stable(family.tasks.toSorted((a, b) => a.id.localeCompare(b.id)))) throw new Error('scheduled task registrations changed')
-        if (tasks.some(task => !family.ids.includes(task.id) && family.recordIds.includes(task.notifySessionId))) throw new Error('new scheduled task dependency')
+        const owned = tasks.filter(task => ids.has(task.id))
+        if (owned.length && stable(owned.toSorted((a, b) => a.id.localeCompare(b.id))) !== expectedTasks) throw new Error('scheduled task registrations changed')
+        if (tasks.some(task => !ids.has(task.id) && recordIds.has(task.notifySessionId))) throw new Error('new scheduled task dependency')
         if (family.state) {
           const expected = owned.length ? family.state : file === family.targetFile ? family.targetState : taskState(null, [])
           if (stable(taskState(registry, family.ids)) !== stable(expected)) throw new Error('scheduled task state changed')
         }
         selected.push(owned.length > 0)
-        for (const recordFile of await recordFiles(path.dirname(file))) {
+        const files = await recordFiles(path.dirname(file)).catch(error => {
+          if (file === family.targetFile && error.code === 'ENOENT') return []
+          throw error
+        })
+        for (const recordFile of files) {
           check()
           const record = await readJson(recordFile)
           if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('unreadable scheduled task family dependency')
-          const member = family.recordIds.includes(record.sessionId)
-          if (!member && file === family.targetFile && family.links.some(link => link[1] === record.cliSessionId)) throw new Error('target scheduled task session id collision')
-          if (!member && (family.ids.includes(record.scheduledTaskId) || family.recordIds.includes(record.notifySessionId) || family.recordIds.includes(record.forkedFromSessionId))) throw new Error('new scheduled task family dependency')
-          if (member && (!validDesktopRecord({ file: recordFile, record }) || !family.links.some(link => stable(link) === stable(taskLinks(record))))) throw new Error('scheduled task family identity or route changed')
-          if (table.some(worker => worker.worker && ownsWorker(new Set(worker.ids), record.cliSessionId, record.sessionId)) && member) throw new Error('running worker owns scheduled task family')
+          const member = recordIds.has(record.sessionId)
+          if (!member && file === family.targetFile && cliIds.has(record.cliSessionId)) throw new Error('target scheduled task session id collision')
+          if (!member && (ids.has(record.scheduledTaskId) || recordIds.has(record.notifySessionId) || recordIds.has(record.forkedFromSessionId))) throw new Error('new scheduled task family dependency')
+          if (member && (!validDesktopRecord({ file: recordFile, record }) || links.get(record.sessionId) !== stable(taskLinks(record)))) throw new Error('scheduled task family identity or route changed')
+          if (member && ownsWorker(liveWorkers, record.cliSessionId, record.sessionId)) throw new Error('running worker owns scheduled task family')
         }
       }
       if (family.tasks.length && (selected.every(Boolean) || !partial && (selected[0] || !selected[1]))) throw new Error('scheduled task ownership changed')
@@ -1970,6 +1978,8 @@ async function writeTaskRegistrations(transfers, side, present, paths, inspect, 
     const remove = !present && side === 'target' && !family.targetExisted && !Object.keys(after).length
     if (remove) await unlink(file)
     else await saveText(file, jsonText(after), async () => {
+      const problems = await taskTransferProblems([family], paths, inspect, true, check)
+      if (problems.length) throw new Error(problems.join(', '))
       check(true)
       if (stable((await taskSessions(file)).registry) !== stable(registry)) throw new Error('scheduled task registry changed before publication')
       if (await schedulerBusy(paths, [family.from, family.to], inspect?.())) throw new Error(SCHEDULER_OWNS)
@@ -1986,7 +1996,7 @@ async function finishUndo(receipt, file, paths, options = {}) {
     ...await restoreProblems(superseded, root),
     ...await restoreProblems(undoing, root),
     ...await activationProblems(receipt),
-    ...await taskTransferProblems(receipt.taskTransfers, paths, options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp)), true, options.check)
+    ...await taskTransferProblems(receipt.taskTransfers, paths, inspector(paths, options), true, options.check)
   ]
   if (await exists(path.join(dest, 'receipt.json'))) problems.push('undo receipt path occupied')
   const liveWorkers = workers()
@@ -1997,7 +2007,7 @@ async function finishUndo(receipt, file, paths, options = {}) {
   problems.push(...await undoParentProblems(receipt))
   if (problems.length) return { receipt, restoreProblems: problems }
   let failure
-  const inspect = options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
+  const inspect = inspector(paths, options)
   try {
     await writeTaskRegistrations(receipt.taskTransfers, 'target', false, paths, inspect, options.check)
     await restore(superseded, root, options.check)
@@ -2120,9 +2130,10 @@ async function reconcileFiles(paths, options = {}) {
     return { title: p.name, error: 'corrupt receipt set aside' }
   }
   const { receipt } = p
-  const inspect = options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
+  const inspect = inspector(paths, options)
   const checkpoint = receipt.appendCheckpoint
-  const taskProblems = await taskTransferProblems(receipt.undoing ? receipt.taskTransfers : (receipt.taskTransfers ?? []).slice(checkpoint?.taskTransfers ?? 0), paths, inspect, true, options.check)
+  const taskTransfers = recoveryFamilies(receipt)
+  const taskProblems = await taskTransferProblems(taskTransfers, paths, inspect, true, options.check)
   if (taskProblems.length && !(receipt.undoing && receipt.remoteUndoing?.length && taskProblems.every(problem => problem === SCHEDULER_OWNS) && !options.check)) return { title: 'scheduled task recovery blocked', error: taskProblems.join(', '), problems: taskProblems }
   if (checkpoint && (!Number.isSafeInteger(checkpoint.sessions) || checkpoint.sessions < 0 || checkpoint.sessions > (receipt.sessions?.length ?? 0) || !Number.isSafeInteger(checkpoint.superseded) || checkpoint.superseded < 0 || checkpoint.superseded > (receipt.superseded?.length ?? 0) || !Array.isArray(checkpoint.held))) return { title: 'recovery blocked', error: 'invalid append checkpoint' }
   receipt.failed ??= []
@@ -2186,7 +2197,7 @@ async function reconcileFiles(paths, options = {}) {
     const used = strategy === 'rehome'
       ? await readFile(made[0]).then((raw) => Boolean(receipt.pending.recordSha && sha(raw) !== receipt.pending.recordSha), () => false)
       : await changed(made[0], targetId, knownOf(receipt.pending))
-    if ((used || foreign) && receipt.taskTransfers?.some(family => family.recordIds.includes(path.basename(made[0], '.json')))) return { title: 'scheduled task recovery blocked', error: 'scheduled task target record changed, recovery remains pending' }
+    if ((used || foreign) && taskTransfers.some(family => family.recordIds.includes(path.basename(made[0], '.json')))) return { title: 'scheduled task recovery blocked', error: 'scheduled task target record changed, recovery remains pending' }
     if (!used && !foreign) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
     const changedCopy = strategy === 'rehome' ? 'target record' : 'remote rescue'
     const error = foreign ? 'interrupted, independently created target left in place' : used ? `interrupted, ${changedCopy} changed since, left in place` : 'interrupted'
@@ -2199,7 +2210,6 @@ async function reconcileFiles(paths, options = {}) {
     const checkpoint = receipt.appendCheckpoint
     const root = path.join(paths.state, 'quarantine')
     const superseded = receipt.superseded.slice(checkpoint?.superseded ?? 0)
-    const taskTransfers = (receipt.taskTransfers ?? []).slice(checkpoint?.taskTransfers ?? 0)
     const blocked = await restoreProblems(superseded, root)
     if (blocked.length) return { title: 'recovery blocked', error: blocked.join(', '), problems: blocked }
     await writeTaskRegistrations(taskTransfers, 'target', false, paths, inspect, options.check)
@@ -2993,11 +3003,11 @@ async function transfer(inv, to, paths, report, context = {}) {
   }
   const cloud = { ...inv.cloud, matches: (inv.cloud?.matches ?? []).map(match => {
     const base = match.target.kind === 'rescue' && match.target.base
-    if (base?.kind !== 'move' || !result.receipt.superseded.some(row => row.source && row.moved.some(([file]) => file === base.row.file))) return match
-    const placed = result.receipt.sessions.find(row => row.id === base.id && row.record === path.join(to.dir, path.basename(base.row.file)))
-    if (!placed) return match
-    return { ...match, target: { ...match.target, base: { ...base, kind: 'existing', row: { ...base.row, file: placed.record, record: placed.recordSnapshot,
-      recordSemantic: placed.recordSemantic, recordSha: placed.recordSha, account: to, taskOwned: placed.taskOwned } } } }
+    if (!base) return match
+    const parked = result.receipt.superseded.flatMap(row => row.moved).find(([file]) => file === desktopFileOf(base.row))?.[1]
+    if (!parked) return match
+    const row = { ...base.row, file: parked, ...(base.row.session ? { session: { ...base.row.session, file: parked } } : {}) }
+    return { ...match, target: { ...match.target, base: { ...base, row } } }
   }) }
   result = await transferRecords({ ...inv, cloud, move: [], sources: [], targets: [], there: [], blocked: [], unreadable: [], rejected: [], held: result.receipt.held },
     to, paths, unitReport(true), { ...context, existing: { file, receipt: result.receipt }, wholeOperation: true })
@@ -3080,10 +3090,6 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     for (const row of inv.sources) row.taskOwned = false
   }
   const rehomeGuard = { workers: workers(), taskSessions: new Map(), created: new Map(), check: context.check }
-  if (family) rehomeGuard.taskCheck = async () => {
-    const problems = await taskTransferProblems(receipt.taskTransfers.filter(row => row.key === family.key), paths, inv.inspect, true, context.check)
-    if (problems.length) throw new Error(problems.join(', '))
-  }
   for (const file of new Set([...inv.move.map((row) => row.account.taskFile), to.taskFile])) {
     rehomeGuard.taskSessions.set(file, await taskSessions(file))
   }
@@ -3130,13 +3136,22 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   const priorProblems = context.existing ? receipt.appendCheckpoint.verification?.problems ?? [] : []
   receipt.verification = { ok: ok && receipt.appendCheckpoint?.verification?.ok !== false && !priorProblems.length, problems: [...priorProblems, ...recordedProblems] }
   await save()
+  if (family) {
+    const problems = await taskTransferProblems(recoveryFamilies(receipt), paths, inv.inspect, true, context.check)
+    if (problems.length) throw new Error(problems.join(', '))
+  }
   await retire(inv, to, receipt, paths, at, problems, save, report, context.check)
   if (family) {
     if (!ok || inv.sources.some(source => !receipt.superseded.some(row => row.source && row.moved.some(([file]) => file === source.file)))) throw new Error('scheduled task family did not move completely')
     const transfers = receipt.taskTransfers.filter(row => row.key === family.key)
     await writeTaskRegistrations(transfers, 'target', true, paths, inv.inspect, context.check)
     const tasks = transfers[0].tasks
-    for (const row of receipt.sessions.filter(row => row.taskFamily === family.key)) row.taskOwned = tasks.some(task => task.notifySessionId === row.targetRecordId)
+    const liveWorkers = workers(inv.inspect())
+    for (const row of receipt.sessions.filter(row => row.taskFamily === family.key)) {
+      row.taskOwned = tasks.some(task => task.notifySessionId === row.targetRecordId)
+      context.check?.()
+      if ((await targetChanges(row, liveWorkers, false)).length) throw new Error('scheduled task family target changed during publication')
+    }
     const taskProblems = await taskTransferProblems(transfers, paths, inv.inspect, false, context.check)
     if (taskProblems.length) throw new Error(taskProblems.join(', '))
   }
@@ -3397,12 +3412,28 @@ export function executeMove(from, to, paths, options = {}) {
   options = { ...options, cloudRequested: options.cloudRequested === true || Boolean(options.cloud) }
   const report = options.report ?? (() => {})
   const now = options.io?.now ?? (() => performance.now())
-  const approvedAt = options.approve ? options.approvalStartedAt ?? now() : null
+  const approving = options.approve != null
+  const approvedAt = approving ? options.approvalStartedAt ?? now() : null
   return locked(paths, async () => {
+    const inspect = () => options.io?.inspect?.() ?? options.processes ?? processTable(paths.claudeApp)
+    const kind = options.recover ? 'recover' : options.undo ? 'undo' : from ? 'move' : options.finish ? 'finish' : 'refresh'
+    const receiptFile = (options.resume ? options.resumeFile : options.receiptFile) ?? null
+    const planFile = path.join(paths.state, 'restart-plan.json')
+    const saved = approving ? await readJson(planFile).catch(() => null) : null
+    if (approving && (!saved || saved.token !== options.approve || sha(stable(without(saved, ['token']))) !== saved.token || saved.kind !== kind)) {
+      return { ok: false, reason: 'Restart approval is missing or does not match the saved plan' }
+    }
+    if (saved && (saved.receiptFile ?? null) !== receiptFile) return { ok: false, reason: 'The approved pending receipt changed' }
+    if ((options.undo || options.recover || saved?.receiptFile) && (await latestReceipt(paths))?.file !== receiptFile) return { ok: false, reason: 'The operation receipt changed' }
+    const selection = from ? { from: from.map((account) => ({ ...accountRef(account), files: [...account.sessions, ...account.unreadable].map(desktopFileOf) })), to: accountRef(to) } : null
+    if (saved && (Boolean(saved.selection) !== Boolean(selection) || selection && (!sameAccount(saved.selection.to, selection.to) || saved.selection.from.length !== selection.from.length || !saved.selection.from.every((source) => selection.from.some((row) => sameAccount(row, source)))))) {
+      return { ok: false, reason: 'The selected accounts changed after the restart plan' }
+    }
     const recovery = options.recover ? await recoveryPending(paths) : null
-    if (options.recover && (!recovery?.receipt?.taskTransfers?.length || recovery.file !== options.receiptFile || recovery.receipt.remotePending || recovery.receipt.remoteUndoing?.length)) return { ok: false, reason: 'Task recovery changed or still needs cloud restoration' }
+    const taskTransfers = recovery?.receipt ? recoveryFamilies(recovery.receipt) : []
+    if (options.recover && (!taskTransfers.length || recovery.file !== options.receiptFile || recovery.receipt.remotePending || recovery.receipt.remoteUndoing?.length)) return { ok: false, reason: 'Task recovery changed or still needs cloud restoration' }
     if (recovery) {
-      const problems = (await taskTransferProblems(recovery.receipt.taskTransfers, paths, options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp)), true)).filter(problem => problem !== SCHEDULER_OWNS)
+      const problems = (await taskTransferProblems(taskTransfers, paths, inspect, true)).filter(problem => problem !== SCHEDULER_OWNS)
       if (problems.length) return { ok: false, reason: problems.join(', ') }
     }
     const reconciled = options.recover ? null : await reconcile(paths, options)
@@ -3414,21 +3445,8 @@ export function executeMove(from, to, paths, options = {}) {
     const drift = await inspectPlaced(paths)
     if (drift.changed.length) report('changed', `${quantity(drift.changed.length, 'moved session')} now has different metadata. Evidence saved with the receipt.`)
     if (options.finish && deferred?.file !== options.receiptFile) return { ok: false, reason: 'The pending move changed before its restart' }
-    const receiptFile = existing?.file ?? options.receiptFile ?? null
-    const kind = options.recover ? 'recover' : options.undo ? 'undo' : from ? 'move' : options.finish ? 'finish' : 'refresh'
-    const planFile = path.join(paths.state, 'restart-plan.json')
-    const saved = options.approve ? await readJson(planFile).catch(() => null) : null
-    if (options.approve && (!saved || saved.token !== options.approve || sha(stable(without(saved, ['token']))) !== saved.token || saved.kind !== kind)) {
-      return { ok: false, reason: 'Restart approval is missing or does not match the saved plan' }
-    }
-    if (saved && (saved.receiptFile ?? null) !== receiptFile) return { ok: false, reason: 'The approved pending receipt changed' }
-    const selection = from ? { from: from.map((account) => ({ ...accountRef(account), files: [...account.sessions, ...account.unreadable].map(desktopFileOf) })), to: accountRef(to) } : null
-    if (saved && (Boolean(saved.selection) !== Boolean(selection) || selection && (!sameAccount(saved.selection.to, selection.to) || saved.selection.from.length !== selection.from.length || !saved.selection.from.every((source) => selection.from.some((row) => sameAccount(row, source)))))) {
-      return { ok: false, reason: 'The selected accounts changed after the restart plan' }
-    }
     const chosen = saved?.selection ?? selection
     const requestedAt = saved?.requestedAt ?? existing?.receipt.startedAt ?? options.requestedAt ?? new Date().toISOString()
-    const inspect = () => options.io?.inspect?.() ?? options.processes ?? processTable(paths.claudeApp)
     const replan = async (cloud = null, check = () => {}) => {
       check()
       const latest = await accounts(paths)
@@ -3539,8 +3557,9 @@ async function completeActiveCloud(result, paths, options = {}) {
 export async function finishWorkflow(paths, options = {}) {
   const recovery = await recoveryPending(paths)
   if (recovery) {
-    if (!options.background && recovery.receipt?.taskTransfers?.length && !recovery.receipt.remotePending && !recovery.receipt.remoteUndoing?.length &&
-      (options.approve || await schedulerBusy(paths, recovery.receipt.taskTransfers.flatMap(row => [row.from, row.to]), options.io?.inspect?.() ?? options.processes))) {
+    const taskTransfers = recovery.receipt ? recoveryFamilies(recovery.receipt) : []
+    if (!options.background && taskTransfers.length && !recovery.receipt.remotePending && !recovery.receipt.remoteUndoing?.length &&
+      (options.approve || await schedulerBusy(paths, taskTransfers.flatMap(row => [row.from, row.to]), options.io?.inspect?.() ?? options.processes))) {
       return executeMove(null, null, paths, { ...options, recover: true, receiptFile: recovery.file })
     }
     return finishPending(paths, options)
@@ -3631,24 +3650,30 @@ export async function sweep(paths, options = {}) {
 }
 
 export async function undo(paths, options = {}) {
-  const recovery = await recoveryPending(paths)
-  if (options.approve && recovery?.receipt?.taskTransfers?.length) return executeMove(null, null, paths, { ...options, recover: true, receiptFile: recovery.file })
+  if (options.approve != null) {
+    const recovery = await recoveryPending(paths)
+    const recover = Boolean(recovery?.receipt?.taskTransfers?.length)
+    const latest = recovery ?? await latestReceipt(paths)
+    return executeMove(null, null, paths, { ...options, undo: !recover, recover, receiptFile: latest?.file })
+  }
   const result = await locked(paths, () => undoFiles(paths, options))
   if (!result.restartNeeded) return result
   return executeMove(null, null, paths, { ...options, undo: !result.receipt.undoing, recover: Boolean(result.receipt.undoing), receiptFile: result.file })
 }
 
 async function undoFiles(paths, options = {}) {
+  if (options.receiptFile && (await latestReceipt(paths))?.file !== options.receiptFile) return { ok: false, reason: 'The operation receipt changed' }
   const reconciled = options.check ? null : await reconcile(paths, options)
   if (reconciled?.undo) return reconciled.undo
   if (reconciled?.pendingUndo) return { receipt: reconciled.receipt, pendingUndo: reconciled.pendingUndo, remoteRestored: reconciled.remoteRestored ?? 0 }
   if (reconciled) return { reconciled }
   const latest = await latestReceipt(paths)
+  if (options.receiptFile && latest?.file !== options.receiptFile) return { ok: false, reason: 'The operation receipt changed' }
   if (!latest) return { nothing: true }
   const { file, receipt } = latest
   if (receipt.retained?.length) return { receipt, retained: receipt.retained }
   const kept = []
-  const inspect = options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
+  const inspect = inspector(paths, options)
   const liveWorkers = workers(inspect())
   for (const r of receipt.sessions) {
     const changes = await targetChanges(r, liveWorkers, r.strategy !== 'rehome')

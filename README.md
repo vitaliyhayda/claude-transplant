@@ -164,7 +164,7 @@ Shorter answers:
 - Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side, is still open, or a new fork still needs the moved parent.
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
-- Can I do it by hand? Yes. Quit Desktop, move the session's record file into the other account's organization folder, reopen Desktop. Do it only while Desktop is closed, it rewrites records it has open from memory.
+- Can I do it by hand? For task-free sessions, quit Desktop, move the record file into the other account's organization folder, then reopen Desktop. Do it only while Desktop is closed, it rewrites records it has open from memory.
 
 Anthropic issues that describe the same problem: [74662](https://github.com/anthropics/claude-code/issues/74662) tracks the per-account scoping, [85294](https://github.com/anthropics/claude-code/issues/85294) the root cause, [26452](https://github.com/anthropics/claude-code/issues/26452) and [48511](https://github.com/anthropics/claude-code/issues/48511) the disappearing sessions, [18435](https://github.com/anthropics/claude-code/issues/18435) and [30031](https://github.com/anthropics/claude-code/issues/30031) the request for account profiles.
 
@@ -189,7 +189,7 @@ Worker identity uses the Desktop record id, CLI session id, PID, process start t
 Restarts:
 
 - When an operation needs Desktop to close, the engine emits a plan first. The menubar warns which Code workers, windows, Chat, Cowork, and background commands will close.
-- Stop and restart approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or a known inactive account and organization. An active or unknown scheduler requires this plan even without a worker. Cold moves show no dialog.
+- Stop and restart approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or both source and target account/organization pairs to be known inactive. An active or unknown scheduler requires this plan even without a worker. Other cold moves show no dialog.
 - An approved restart sends a graceful quit, waits for Desktop and its descendants to exit, moves the held records, and reopens Desktop. 30 second budget, no force kill, no cloud work in that window. A veto or missed deadline leaves held records untouched.
 - Background retries never start a new shutdown.
 
@@ -204,7 +204,7 @@ Safety:
 
 - One receipt owns the move, held records, cloud checks, failures, and retries. Another move cannot start until it is complete, kept local, or undone.
 - Records are written to a private temp inode, journaled, then exposed by an atomic no-clobber hard link. A record is either absent or complete.
-- Interrupted retirement or undo resumes from the receipt. Finish move exposes interrupted task recovery and offers restart approval when the scheduler is active. Task families keep task ids, schedules, enabled and last-run state, skip history, retry state, shared prompt paths and bytes, and unrelated registry fields, with selected scheduling state and records restored together. A corrupt newest receipt stops undo.
+- Interrupted retirement or undo resumes from the receipt. Finish move exposes interrupted task recovery and offers restart approval when the scheduler is active. Task families preserve reminders, run history, prompts and unrelated settings. Recovery rolls back only unfinished families. Undo restores the whole move. A corrupt newest receipt stops undo.
 - Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. Undo, retirement, and source archival also ignore branch and PR bookkeeping.
 - Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
 - Lineage follows `forkedFrom` pointers to their roots. Duplicate message ids count as sync replays when only runtime metadata differs, or an otherwise identical copy leaves command output or file-read content empty. Conflicting contents are refused.
@@ -236,7 +236,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
 - No transcript or sidecar is renamed, edited, or deleted. The quarantined record is the rollback.
-- Cold moves need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
+- Moves with no active worker or affected scheduler need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
 - Remote rescue copies payloads exactly. No model reconstructs history.
 - Remote Control is touched only with `--cloud`, with no credential persistence.
 - Automatic retries cover the receipt's named work only. They never start a restart, store credentials, or create destination bridges.
