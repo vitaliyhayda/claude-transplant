@@ -1988,7 +1988,7 @@ async function writeTaskRegistrations(transfers, side, present, paths, inspect, 
     }
     if (!present && side === 'target' && !family.targetHadTasks && !next.length) delete after.scheduledTasks
     const remove = !present && side === 'target' && !family.targetExisted && !Object.keys(after).length
-    if (remove) await unlink(file)
+    if (remove) await unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error })
     else await saveText(file, jsonText(after), async () => {
       const problems = await taskTransferProblems([family], paths, inspect, true, check)
       if (problems.length) throw new Error(problems.join(', '))
@@ -3565,11 +3565,13 @@ async function completeActiveCloud(result, paths, options = {}) {
 }
 
 export async function finishWorkflow(paths, options = {}) {
+  const approving = options.approve != null
+  if (approving && (typeof options.approve !== 'string' || !/^[a-f0-9]{64}$/.test(options.approve))) return { ok: false, reason: 'Restart approval is missing or does not match the saved plan' }
   const recovery = await recoveryPending(paths)
   if (recovery) {
     const taskTransfers = recovery.receipt ? recoveryFamilies(recovery.receipt) : []
     if (!options.background && taskTransfers.length && !recovery.receipt.remotePending && !recovery.receipt.remoteUndoing?.length &&
-      (options.approve || await schedulerBusy(paths, taskTransfers.flatMap(row => [row.from, row.to]), options.io?.inspect?.() ?? options.processes))) {
+      (approving || await schedulerBusy(paths, taskTransfers.flatMap(row => [row.from, row.to]), options.io?.inspect?.() ?? options.processes))) {
       return executeMove(null, null, paths, { ...options, recover: true, receiptFile: recovery.file })
     }
     return finishPending(paths, options)
@@ -3579,7 +3581,7 @@ export async function finishWorkflow(paths, options = {}) {
   const deferred = await deferredWorkflow(paths)
   if (deferred?.mode === 'local') return completeActiveCloud(await finishHeld(paths, options), paths, options)
   if (deferred?.mode === 'undo') return finishPending(paths, options)
-  if (options.approve) {
+  if (approving) {
     if (!deferred || deferred.mode !== 'cloud') return { ok: false, reason: 'The pending move changed before its restart' }
     const restarted = await executeMove(null, null, paths, { ...options, finish: true, receiptFile: deferred.file })
     if (!restarted.ok || restarted.plan) return restarted
@@ -3923,7 +3925,7 @@ function parse(argv) {
   const incompatible = args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot
   if (['accounts', 'keep-local', 'sweep'].includes(args.cmd) && (incompatible || args.restartApproved || args.moveOnly)) throw new Error(`${args.cmd} accepts only --json`)
   if (['finish', 'undo'].includes(args.cmd) && (incompatible || args.cmd === 'undo' && args.moveOnly)) throw new Error(`${args.cmd} accepts only --json and --restart-approved`)
-  if (args.restartApproved && !/^[a-f0-9]{64}$/.test(args.restartApproved)) throw new Error('restart approval token must be the one displayed by the engine')
+  if (args.restartApproved != null && !/^[a-f0-9]{64}$/.test(args.restartApproved)) throw new Error('restart approval token must be the one displayed by the engine')
   if (args.moveOnly && (args.restartApproved || args.dry || (args.cmd && args.cmd !== 'finish'))) throw new Error('--move-only applies only to a move or held continuation')
   if (args.restartApproved && (args.dry || (args.cmd && !['restart', 'finish', 'undo'].includes(args.cmd)))) throw new Error('restart approval applies only to a move, finish, undo, or restart')
   if (args.cmd === 'restart' && incompatible) throw new Error('restart accepts only --json and --restart-approved')
