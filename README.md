@@ -97,16 +97,16 @@ To    ↑↓ move · enter confirm
 |---|---|
 | `claude-transplant` | pick From and To, move, print a receipt |
 | `--dry-run` | plan only, write nothing |
-| `undo` | quarantine the last move and restore source entries, refused if a target changed or a source cannot be restored |
-| `finish` | finish held local records or active-source cloud checks, continue a staged cloud undo, and list sessions the last move refused |
+| `undo` | quarantine the last move and restore source entries and task registrations, refused if a target changed or a source cannot be restored |
+| `finish` | recover interrupted task transfers, finish held local records or active-source cloud checks, continue a staged undo, and list earlier refusals as information |
 | `sweep` | verify placed records and retry eligible pending work, never requests a restart |
 | `restart` | show the plan for the existing Desktop refresh action |
-| `keep-local` | cancel held work and pending cloud checks without reversing completed moves |
+| `keep-local` | cancel remaining work and cloud checks, keep completed moves |
 | `accounts` | list accounts |
 | `menubar` | install the menubar app (`--snapshot <png>`, `--remove`) |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
 | `--move-only` | move eligible records, leave Desktop-owned records held |
-| `--restart-approved <token>` | approve the exact plan printed by the prior move, finish, or restart call |
+| `--restart-approved <token>` | approve the exact restart plan printed for the requested operation |
 | `--cloud` | reconcile the active source, queue inaccessible sources that still have unreadable or unarchived local records |
 | `--json` | one event per line |
 | `--version` | print the version |
@@ -119,8 +119,8 @@ Every command may write the tool's own files under `~/Library/Application Suppor
 |---|---|
 | `accounts`, `--dry-run`, `--version`, `keep-local` | nothing, `--dry-run --cloud` also reads Remote Control metadata over the network |
 | `restart` without a token | nothing beyond the recovery above |
-| move, `finish`, `sweep`, `undo` | Desktop session records under `claude-code-sessions` |
-| `--restart-approved <token>` | quits and reopens Claude Desktop, then the same as a move |
+| move, `finish`, `sweep`, `undo` | Desktop session records and scheduled task registries under `claude-code-sessions` |
+| `--restart-approved <token>` | quits and reopens Claude Desktop around the requested operation |
 | a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control mirrors archived or restored there, rescued local transcripts when a remote branch diverged |
 | `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
 | Move in the menubar | the same as a move with `--cloud`, the panel always passes it |
@@ -180,7 +180,7 @@ Eligibility:
 
 - history is a single comparable version
 - record filename and identity are valid
-- no scheduled task, notification route, or running worker owns it
+- no running worker owns it, and any task registrations, generated runs, notification routes, parents, and forks form a complete movable family
 - parent record is already in the target or moves first in the same batch, and stays wherever surviving forks refer to it, including archived forks or forks without history
 - no id collision in the target
 
@@ -189,7 +189,7 @@ Worker identity uses the Desktop record id, CLI session id, PID, process start t
 Restarts:
 
 - When an operation needs Desktop to close, the engine emits a plan first. The menubar warns which Code workers, windows, Chat, Cowork, and background commands will close.
-- Stop and restart approves that exact process inventory. A changed inventory invalidates approval. Cold moves show no dialog.
+- Stop and restart approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or a known inactive account and organization. An active or unknown scheduler requires this plan even without a worker. Cold moves show no dialog.
 - An approved restart sends a graceful quit, waits for Desktop and its descendants to exit, moves the held records, and reopens Desktop. 30 second budget, no force kill, no cloud work in that window. A veto or missed deadline leaves held records untouched.
 - Background retries never start a new shutdown.
 
@@ -204,7 +204,7 @@ Safety:
 
 - One receipt owns the move, held records, cloud checks, failures, and retries. Another move cannot start until it is complete, kept local, or undone.
 - Records are written to a private temp inode, journaled, then exposed by an atomic no-clobber hard link. A record is either absent or complete.
-- Interrupted retirement or undo resumes from the receipt. A corrupt newest receipt stops undo.
+- Interrupted retirement or undo resumes from the receipt. Finish move exposes interrupted task recovery and offers restart approval when the scheduler is active. Task families keep task ids, schedules, enabled and last-run state, skip history, retry state, shared prompt paths and bytes, and unrelated registry fields, with selected scheduling state and records restored together. A corrupt newest receipt stops undo.
 - Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. Undo, retirement, and source archival also ignore branch and PR bookkeeping.
 - Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
 - Lineage follows `forkedFrom` pointers to their roots. Duplicate message ids count as sync replays when only runtime metadata differs, or an otherwise identical copy leaves command output or file-read content empty. Conflicting contents are refused.
@@ -218,8 +218,8 @@ Safety:
 - compatible source versions: same history in several transcript files without an explicit Desktop fork, blocked unless the target already holds every version
 - overlapping versions: shared lineage kept separate, including Desktop forks with separate transcripts
 - already there: a compatible Desktop record in the target holds every message and sidecar file
-- held: a Desktop worker owns a required record, restart approval is offered
-- blocked: needs merging, has a collision or unresolved parent, or is owned by a scheduled task, notification route, or external CLI worker
+- held: a Desktop worker or scheduler owns required records, restart approval is offered
+- blocked: needs merging, has a collision or unresolved parent, has an incomplete task family, or is owned by an external CLI worker
 - retired: source entries moved to quarantine after verification
 - cloud mirrors: active or paused Remote Control rows under the signed-in source
 - cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads

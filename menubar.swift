@@ -102,6 +102,7 @@ struct Event: Decodable {
     let pendingUndo: [String]?
     let retired: Int?
     let failed: [Failure]?
+    let notMoved: [Failure]?
     let problems: [Problem]?
     let note: String?
     let restart: Bool?
@@ -297,6 +298,7 @@ final class Model: ObservableObject {
     var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
+        if pendingAccounts.contains(where: { $0.pending == "recovery" }) { return "Finish the interrupted move" }
         let moved = pendingAccounts.compactMap(\.receiptMoved).max() ?? 0
         let waiting = Set(pendingAccounts.flatMap { $0.pendingWaiting ?? [] }.map(\.id)).count
         let issues = pendingAccounts.reduce(0) { $0 + ($1.pendingFailures?.count ?? 0) }
@@ -505,6 +507,7 @@ final class Model: ObservableObject {
     }
 
     private func recordIssues(_ event: Event) {
+        if let notMoved = event.notMoved, !notMoved.isEmpty { lines.append(("not moved", notMoved.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
         if let failed = event.failed, !failed.isEmpty { lines.append(("issue", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
         for problem in event.problems ?? [] { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " verification failed")) }
     }
