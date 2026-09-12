@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile, spawn, spawnSync } from 'node:child_process'
+import childProcess, { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
@@ -13,6 +13,14 @@ import { promisify } from 'node:util'
 import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
+const fixtureCommand = run => (file, ...args) => {
+  if (file === '/usr/bin/security') return { status: 1, stdout: '', stderr: 'fixture login unavailable' }
+  if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl'].includes(file)) throw new Error('fixture native command requires a mock')
+  return run(file, ...args)
+}
+childProcess.spawnSync = fixtureCommand(childProcess.spawnSync)
+childProcess.spawn = fixtureCommand(childProcess.spawn)
+syncBuiltinESMExports()
 const SOURCE = '00000000-0000-4000-8000-000000000001'
 const MESSAGES = new Set(['user', 'assistant', 'attachment', 'system'])
 const id = (k) => `00000000-0000-4000-8000-${String(k).padStart(12, '0')}`
@@ -61,7 +69,15 @@ async function moveWithPending(h, from, to, cloud = null) {
   return result
 }
 const branchEntries = (count, session, start) => Array.from({ length: count }, (_, index) => entry(index % 2 ? 'assistant' : 'user', start + index, index ? start + index - 1 : null, session))
-const cli = (home, args) => promisify(execFile)(process.execPath, [path.join(here, 'transplant.js'), ...args], {
+const cli = (home, args) => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+  import childProcess from 'node:child_process'
+  import { syncBuiltinESMExports } from 'node:module'
+  childProcess.spawnSync = (${fixtureCommand.toString()})(childProcess.spawnSync)
+  childProcess.spawn = (${fixtureCommand.toString()})(childProcess.spawn)
+  syncBuiltinESMExports()
+  process.argv.splice(1, 0, ${JSON.stringify(path.join(here, 'transplant.js'))})
+  await import(${JSON.stringify(path.join(here, 'transplant.js'))})
+`, '--', ...args], {
   env: { ...process.env, HOME: home },
   cwd: here
 }).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }))
@@ -447,7 +463,7 @@ test('held continuation shares one receipt and Undo restores both phases', async
   assert.deepEqual(await readdir(h.dir('T')), [])
 })
 
-test('a failed held continuation preserves the earlier completed phase', async () => {
+test('a failed held continuation preserves the earlier completed phase with a legacy checkpoint', async () => {
   const h = await home()
   const cold = id(300)
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -457,6 +473,11 @@ test('a failed held continuation preserves the earlier completed phase', async (
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
   await assert.rejects(finishHeld(h.paths, { processes: [], report: (stage, text) => { if (stage === 'retire' && text === 'checking') throw new Error('interrupted append') } }), /interrupted append/)
+  const interrupted = JSON.parse(await readFile(first.file))
+  assert.equal(interrupted.appendCheckpoint.taskTransfers, 0)
+  delete interrupted.appendCheckpoint.taskTransfers
+  delete interrupted.taskTransfers
+  await writeFile(first.file, JSON.stringify(interrupted))
   const recovered = await undo(h.paths)
   assert.ok(recovered.reconciled)
   const receipt = JSON.parse(await readFile(first.file))
@@ -1023,8 +1044,9 @@ test('idle Finish reports refused sessions quietly while verification errors rem
   assert.match(text.stdout, /nothing pending\n.*not moved.*conflicting duplicate uuids/s)
   const refused = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
   assert.equal(refused.receipt, moved.file)
-  assert.equal(refused.complete, false)
-  assert.equal(refused.failed.length, 1)
+  assert.equal(refused.complete, true)
+  assert.equal(refused.failed.length, 0)
+  assert.equal(refused.notMoved.length, 1)
   const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
   receipt.failed = []
   await writeFile(moved.file, JSON.stringify(receipt))
@@ -1291,7 +1313,9 @@ test('an unreadable scheduled task registry fails closed', async () => {
   let by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
   assert.match(by[h.acct.P].taskError, /invalid scheduled task registry/)
   assert.match(by[h.acct.P].stats, /task registry unreadable/)
-  await assert.rejects(inventory([by[h.acct.P]], by[h.acct.Z], h.paths), /invalid scheduled task registry/)
+  const blocked = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  assert.equal(blocked.move.length, 0)
+  assert.match(blocked.blocked[0].error, /invalid scheduled task registry/)
   await writeFile(taskFile, JSON.stringify({ scheduledTasks: [] }))
   by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
   const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
@@ -1996,7 +2020,7 @@ test('a refused retirement restores the source cloud check', async () => {
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
   const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true })
-  assert.equal(inv.cloudCheckAccounts.length, 0)
+  assert.equal(inv.cloudCheckAccounts.length, 1)
   const result = await move(inv, to, h.paths)
 
   assert.equal(result.pendingCloud, 1)
@@ -2050,6 +2074,50 @@ test('Keep local accepts a valid rehome record used after the move', async () =>
   assert.equal(kept.cancelled, 1)
 })
 
+test('Keep local tolerates independent Desktop metadata and destination bridges', async () => {
+  for (const extra of [
+    { bridgeSessionIds: ['session_destination'] },
+    { toolSurfaceSnapshot: { familyHashes: { builtin: 'changed' }, recordedAt: 123 } },
+    { bridgeSessionIds: ['session_destination'], toolSurfaceSnapshot: { recordedAt: 456 } },
+    { lastActivityAt: 999, completedTurns: 8, futureMetadata: { display: true } }
+  ]) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('T', SOURCE, rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.T), to = all.find(row => row.account === h.acct.Z)
+    const moved = await moveWithPending(h, [from], to)
+    const row = moved.receipt.sessions[0]
+    await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), ...extra }))
+    const kept = await keepLocal(h.paths)
+    assert.equal(kept.ok, true)
+    assert.equal(kept.cancelled, 1)
+    assert.deepEqual(JSON.parse(await readFile(row.record)).bridgeSessionIds, extra.bridgeSessionIds ?? [])
+    if (extra.bridgeSessionIds) assert.match((await undo(h.paths)).changed[0], /desktop record/)
+  }
+})
+
+test('Finish cloud success retains historical local refusals as information', async () => {
+  for (const failure of ['none', 'verification', 'verification without details', 'cloud']) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('T', SOURCE, rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.T), to = all.find(row => row.account === h.acct.Z)
+    const moved = await moveWithPending(h, [from], to)
+    const receipt = JSON.parse(await readFile(moved.file))
+    receipt.failed.push({ id: id(998), title: 'Unmoved task', error: 'scheduled task family missing' })
+    if (failure.startsWith('verification')) receipt.verification = { ok: false, problems: failure === 'verification' ? [{ id: SOURCE, check: 'transcript' }] : [] }
+    await writeFile(moved.file, JSON.stringify(receipt))
+    const cloud = cloudFixture(h, { account: from.account, org: from.org,
+      list: async () => { if (failure === 'cloud') throw new Error('fixture offline'); return [] } })
+    const result = await finishPending(h.paths, { cloud })
+    assert.equal(result.ok, failure === 'none')
+    assert.equal(result.complete, failure !== 'cloud')
+    assert.equal(result.receipt.failed.some(row => row.title === 'Unmoved task'), true)
+    assert.equal(result.failed.length, failure === 'cloud' ? 1 : 0)
+    if (failure !== 'cloud') assert.equal((await cli(h.root, ['finish', '--json'])).code, failure === 'none' ? 0 : 1)
+  }
+})
+
 test('Keep local refuses structural rehome record drift', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -2075,7 +2143,7 @@ test('Keep local keeps strict validation for older receipts', async () => {
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
   const moved = await moveWithPending(h, [from], to)
   const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
-  delete receipt.sessions[0].recordKeepSemantic
+  delete receipt.sessions[0].recordSnapshot
   await writeFile(moved.file, JSON.stringify(receipt))
   const record = path.join(h.dir('Z'), `local_${SOURCE}.json`)
   await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), cwd: '/tmp/changed' }))
@@ -3368,6 +3436,1213 @@ test('an interrupted unapplied archive leaves a tagged failure that retry clears
   assert.equal(status, 'archived')
 })
 
+async function taskFamilyFixture(enabled = false, taskCount = 2, eventCount = 1) {
+  const h = await home(), run = id(701), second = id(702), cold = id(703)
+  const runs = [run, second].slice(0, taskCount)
+  const tasks = runs.map((sid, index) => ({ id: `task_${index}`, notifySessionId: `local_${SOURCE}`,
+    enabled, fireAt: 123456 + index, filePath: path.join(h.root, '.claude', 'scheduled-tasks', `task_${index}`, 'SKILL.md'), createdAt: 123,
+    lastRunAt: '2026-09-01T00:00:00Z', lastScheduledFor: '2026-09-01T00:00:00Z' }))
+  for (const task of tasks) {
+    await mkdir(path.dirname(task.filePath), { recursive: true })
+    await writeFile(task.filePath, `---\nname: ${task.id}\n---\nSynthetic reminder prompt\n`)
+  }
+  for (const [index, sid] of [SOURCE, ...runs, cold].entries()) {
+    await h.write(sid, branchEntries(eventCount, sid, 80 + index * eventCount))
+    await h.record('P', sid, rehomeRecord(runs.includes(sid) ? { scheduledTaskId: tasks[index - 1].id, notifySessionId: `local_${SOURCE}` } : {}))
+  }
+  const skips = Object.fromEntries(tasks.map(task => [task.id, [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }]]))
+  const retries = { task_0: { slot: '2026-09-02T00:00:00Z', attempts: 2, notBefore: '2026-09-02T00:05:00Z' } }
+  const unrelatedSkips = { unrelated_task: [{ at: '2026-09-01T01:00:00Z', reason: 'missed' }] }
+  const unrelatedRetries = { unrelated_task: { slot: '2026-09-01T01:00:00Z', attempts: 1, notBefore: '2026-09-01T01:05:00Z' } }
+  const sourceRegistry = { scheduledTasks: tasks, recordedSkips: { ...skips, ...unrelatedSkips }, runRetries: { ...retries, ...unrelatedRetries }, sundayAliasBoundaryStamped: true,
+    dayFieldsOrBoundaryStamped: false, future: { preserved: 'source' } }
+  const targetRegistry = { scheduledTasks: [{ id: 'unrelated_task', enabled: true, cronExpression: '0 0 * * *', filePath: '/tmp/fixture/other.md' }],
+    recordedSkips: { other_task: [{ at: '2026-09-03T00:00:00Z', reason: 'disabled' }] }, runRetries: { other_task: { slot: '2026-09-03T00:00:00Z', attempts: 3, notBefore: '2026-09-03T00:10:00Z' } }, future: { preserved: 'target' } }
+  const sourceAfter = { ...sourceRegistry, scheduledTasks: [], recordedSkips: unrelatedSkips, runRetries: unrelatedRetries }
+  const targetAfter = { ...targetRegistry, scheduledTasks: [...targetRegistry.scheduledTasks, ...tasks], recordedSkips: { ...targetRegistry.recordedSkips, ...skips }, runRetries: { ...targetRegistry.runRetries, ...retries } }
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  await writeFile(sourceFile, JSON.stringify(sourceRegistry))
+  await writeFile(targetFile, JSON.stringify(targetRegistry))
+  const selection = async () => {
+    const all = await accounts(h.paths, [])
+    return { from: all.find(row => row.account === h.acct.P), to: all.find(row => row.account === h.acct.T) }
+  }
+  return { ...h, run, second, cold, tasks, sourceRegistry, targetRegistry, sourceAfter, targetAfter, sourceFile, targetFile, selection }
+}
+
+function taskHarness(rows = [desktopFixture()[0]], reopened = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]) {
+  const mock = { rows, calls: [], time: 0 }
+  mock.io = { inspect: () => mock.rows, now: () => mock.time, command: async file => {
+    mock.calls.push(file)
+    mock.time += 100
+    if (file.endsWith('osascript')) await mock.beforeQuit?.()
+    mock.rows = file.endsWith('osascript') ? [] : reopened
+    return { status: 0 }
+  } }
+  return mock
+}
+
+async function fixtureSnapshot(h, directories = [h.paths.records, h.paths.pool, h.paths.state]) {
+  const files = {}
+  const visit = async dir => {
+    for (const entry of await readdir(dir, { withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error })) {
+      const file = path.join(dir, entry.name)
+      if (entry.isDirectory()) await visit(file)
+      else if (dir !== h.paths.state || /^\d.*\.json(?:\.journal)?$/.test(entry.name)) files[file] = createHash('sha256').update(await readFile(file)).digest('hex')
+    }
+  }
+  for (const dir of directories) await visit(dir)
+  return files
+}
+
+async function taskCheckpointFixture() {
+  const h = await home(), sessions = [SOURCE, id(791)]
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  const tasks = sessions.map((sid, index) => ({ id: `task_${index + 1}`, notifySessionId: `local_${sid}`, enabled: true, fireAt: 123456 + index }))
+  const sourceRegistry = { scheduledTasks: tasks,
+    recordedSkips: Object.fromEntries(tasks.map(task => [task.id, [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }]])),
+    runRetries: Object.fromEntries(tasks.map(task => [task.id, { slot: '2026-09-02T00:00:00Z', attempts: 2, notBefore: '2026-09-02T00:05:00Z' }])) }
+  for (const [index, sid] of sessions.entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const originalRecords = await Promise.all(sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`))))
+  await writeFile(sourceFile, JSON.stringify(sourceRegistry))
+  return { ...h, sessions, tasks, sourceFile, targetFile, sourceRegistry, originalRecords }
+}
+
+async function checkpointAccountsFixture() {
+  const h = await taskCheckpointFixture()
+  await interruptTaskFamily({ ...h, interruptAfter: 2 }, 'move', 'source')
+  const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+  const original = await readFile(file), receipt = JSON.parse(original)
+  assert.equal(receipt.taskTransfers.length, 2)
+  assert.deepEqual([receipt.appendCheckpoint.sessions, receipt.appendCheckpoint.superseded, receipt.appendCheckpoint.taskTransfers], [1, 1, 1])
+  receipt.appendCheckpoint.taskTransfers = 0
+  await writeFile(file, JSON.stringify(receipt))
+  const before = await fixtureSnapshot(h)
+  const discovered = (await accounts(h.paths, [])).map(row => [row.account, row.org, row.sessions.length, row.unreadable.length])
+  const corrupted = await cli(h.root, ['accounts', '--json'])
+  assert.equal(corrupted.code, 0, corrupted.stderr)
+  assert.equal(lines(corrupted.stdout).length, 1)
+  const listed = lines(corrupted.stdout)[0]
+  assert.equal(listed.length, 4)
+  assert.deepEqual(listed.map(row => [row.account, row.org, row.sessions, row.unreadable]), discovered)
+  for (const row of listed) {
+    assert.deepEqual(row.recoveryProblem, { receipt: file, error: 'invalid append checkpoint' })
+    assert.equal(row.pending, null)
+    assert.equal(row.pendingAction, null)
+  }
+  assert.deepEqual(await fixtureSnapshot(h), before)
+  await writeFile(file, original)
+  const repairedBefore = await fixtureSnapshot(h)
+  const repaired = await cli(h.root, ['accounts', '--json'])
+  assert.equal(repaired.code, 0, repaired.stderr)
+  const restored = lines(repaired.stdout)[0]
+  assert.ok(restored.every(row => row.recoveryProblem === null))
+  assert.deepEqual(restored.filter(row => row.pending).map(row => [row.account, row.pending, row.pendingAction, row.receipt]), [[h.acct.P, 'recovery', 'finish', file]])
+  assert.deepEqual(await fixtureSnapshot(h), repairedBefore)
+  return { corrupted: corrupted.stdout.trim(), repaired: repaired.stdout.trim() }
+}
+
+test('CLI accounts reports checkpoint corruption without changing recovery data', async () => {
+  await checkpointAccountsFixture()
+})
+
+test('Undo validates every supplied approval before changing records or receipts', async () => {
+  for (const scenario of ['stale receipt', 'invalid', 'empty', 'wrong operation', 'consumed', 'stopped scheduler', 'pending recovery']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const moved = await executeMove([from], to, h.paths, { processes: [] })
+    const mock = taskHarness(), { calls, io } = mock
+    const planned = await (scenario === 'wrong operation' ? executeMove(null, null, h.paths, { io }) : undo(h.paths, { io }))
+    assert.ok(planned.plan, scenario)
+    assert.equal(planned.plan.receiptFile, scenario === 'wrong operation' ? null : moved.file)
+    if (scenario === 'consumed') assert.ok((await undo(h.paths, { io, approve: planned.plan.token })).dest)
+    if (['stale receipt', 'consumed'].includes(scenario)) {
+      const sid = id(798)
+      await h.write(sid, branchEntries(1, sid, 600))
+      await h.record('Q', sid, rehomeRecord())
+      const all = await accounts(h.paths, [])
+      assert.equal((await executeMove([all.find(row => row.account === h.acct.Q)], all.find(row => row.account === h.acct.T), h.paths, { processes: [] })).ok, true)
+    }
+    if (scenario === 'pending recovery') {
+      const receipt = JSON.parse(await readFile(moved.file))
+      receipt.finalizing = true
+      await writeFile(moved.file, JSON.stringify(receipt))
+    }
+    if (scenario === 'stopped scheduler') mock.rows = []
+    calls.length = 0
+    const before = await fixtureSnapshot(h)
+    const refused = await undo(h.paths, { io, approve: scenario === 'empty' ? '' : scenario === 'invalid' || scenario === 'pending recovery' ? '0'.repeat(64) : planned.plan.token })
+    assert.equal(refused.ok, false, scenario)
+    assert.match(refused.reason, /approval|receipt changed|Open Claude sessions changed/, scenario)
+    assert.deepEqual(await fixtureSnapshot(h), before, scenario)
+    assert.equal(calls.some(file => file.endsWith('osascript')), false, scenario)
+  }
+})
+
+test('task approval tokens reject empty and malformed values without file mutations through API and CLI', async () => {
+  for (const operation of ['move', 'finish', 'undo', 'restart', 'idle finish', 'held finish']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), { io, calls } = taskHarness([])
+    if (operation === 'finish') await interruptTaskFamily(h, 'move', 'target')
+    if (operation === 'undo' || operation === 'held finish') await executeMove([from], to, h.paths, { processes: operation === 'undo' ? [] : desktopFixture(), moveOnly: true })
+    const command = operation === 'move' ? ['--from', 'p@example.com', '--to', 't@example.com'] : [operation.endsWith('finish') ? 'finish' : operation]
+    const before = await fixtureSnapshot(h, [h.root])
+    for (const approve of ['', 'invalid']) {
+      const options = { io, processes: [], approve }
+      const result = await (operation.endsWith('finish') ? finishWorkflow(h.paths, options) : operation === 'undo' ? undo(h.paths, options) : executeMove(operation === 'move' ? [from] : null, operation === 'move' ? to : null, h.paths, options))
+      assert.deepEqual(result, { ok: false, reason: 'Restart approval is missing or does not match the saved plan' }, operation)
+      assert.deepEqual(await fixtureSnapshot(h, [h.root]), before, operation)
+      const rejected = await cli(h.root, [...command, '--restart-approved', approve, '--json'])
+      assert.equal(rejected.code, 1, operation)
+      assert.match(rejected.stderr, /restart approval token must be the one displayed by the engine/, operation)
+      assert.deepEqual(await fixtureSnapshot(h, [h.root]), before, operation)
+      assert.deepEqual(calls, [], operation)
+    }
+  }
+})
+
+test('Undo rechecks its receipt under the lock between preflight and restart planning', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), sid = id(798)
+  await executeMove([from], to, h.paths, { processes: [] })
+  await h.write(sid, branchEntries(1, sid, 600))
+  await h.record('Q', sid, rehomeRecord())
+  const all = await accounts(h.paths, []), original = fs.mkdir
+  let entries = 0, before, rows = [desktopFixture()[0]]
+  fs.mkdir = async (...args) => {
+    if (args[0] === h.paths.state && ++entries === 2) {
+      const next = await executeMove([all.find(row => row.account === h.acct.Q)], all.find(row => row.account === h.acct.T), h.paths, { processes: [] })
+      assert.equal(next.ok, true)
+      before = await fixtureSnapshot(h)
+      rows = []
+    }
+    return original(...args)
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await undo(h.paths, { io: { inspect: () => rows, command: async () => assert.fail('stale receipt must not restart') } }) }
+  finally { fs.mkdir = original; syncBuiltinESMExports() }
+  assert.ok(before)
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /receipt changed/)
+  assert.deepEqual(await fixtureSnapshot(h), before)
+})
+
+test('task recovery scopes validation, restart and accounts to the unfinished family', async () => {
+  for (const active of ['T', 'Q']) {
+    const h = await taskFamilyFixture()
+    h.tasks[1].notifySessionId = `local_${h.second}`
+    await h.record('P', h.second, rehomeRecord({ scheduledTaskId: h.tasks[1].id, notifySessionId: `local_${h.second}` }))
+    for (const sid of [SOURCE, h.run]) await rename(path.join(h.dir('P'), `local_${sid}.json`), path.join(h.dir('Q'), `local_${sid}.json`))
+    const firstRegistry = { scheduledTasks: [h.tasks[0]], recordedSkips: { task_0: h.sourceRegistry.recordedSkips.task_0 }, runRetries: { task_0: h.sourceRegistry.runRetries.task_0 } }
+    await writeFile(path.join(h.dir('Q'), 'scheduled-tasks.json'), JSON.stringify(firstRegistry))
+    h.sourceRegistry.scheduledTasks = [h.tasks[1]]
+    delete h.sourceRegistry.recordedSkips.task_0
+    delete h.sourceRegistry.runRetries.task_0
+    await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    h.sourceAccounts = [h.acct.Q, h.acct.P]
+    await interruptTaskFamily(h, 'move', 'source')
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+    const interrupted = JSON.parse(await readFile(file))
+    assert.equal(interrupted.taskTransfers.length, 2)
+    assert.equal(interrupted.appendCheckpoint.taskTransfers, 1)
+    const target = JSON.parse(await readFile(h.targetFile)), completed = target.scheduledTasks.find(task => task.id === 'task_0')
+    completed.enabled = true
+    completed.lastRunAt = '2026-09-10T00:00:00Z'
+    await writeFile(h.targetFile, JSON.stringify(target))
+    const originals = await Promise.all([SOURCE, h.run].map(sid => readFile(path.join(h.dir('T'), `local_${sid}.json`))))
+    const badge = lines((await cli(h.root, ['accounts', '--json'])).stdout).at(-1)
+    assert.deepEqual(badge.filter(row => row.pending).map(row => row.account), [h.acct.P])
+    const f = await identityFixture(h)
+    await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct[active] }))
+    await f.write(f.init(1, h.acct[active], h.org[active]))
+    const { calls, io } = taskHarness(f.processes, f.processes)
+    let result = await finishWorkflow(h.paths, { io })
+    if (active === 'T') {
+      assert.ok(result.plan)
+      assert.equal(result.plan.kind, 'recover')
+      result = await finishWorkflow(h.paths, { io, approve: result.plan.token })
+      assert.equal(result.restarted, true)
+    } else {
+      assert.equal(result.plan, undefined)
+      assert.deepEqual(calls, [])
+    }
+    assert.equal(result.recoveryRequired, true)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), target)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(await Promise.all([SOURCE, h.run].map(sid => readFile(path.join(h.dir('T'), `local_${sid}.json`)))), originals)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${h.second}.json`)))
+    const receipt = JSON.parse(await readFile(file))
+    assert.equal(receipt.taskTransfers.length, 1)
+    assert.equal(receipt.finalizing, false)
+    const before = await fixtureSnapshot(h)
+    const refused = await undo(h.paths, { processes: [] })
+    assert.match(refused.restoreProblems.join(' '), /registrations changed/)
+    assert.deepEqual(await fixtureSnapshot(h), before)
+  }
+})
+
+test('task checkpoint integrity refuses corruption before recovery writes or restart', async t => {
+  const checkpoints = [
+    ['inconsistent zero', { taskTransfers: 0 }],
+    ['missing offset', { taskTransfers: undefined }],
+    ['null offset', { taskTransfers: null }],
+    ['negative offset', { taskTransfers: -1 }],
+    ['fractional offset', { taskTransfers: 0.5 }],
+    ['out-of-range offset', { taskTransfers: 3 }],
+    ['uncommitted family offset', { taskTransfers: 2 }],
+    ['missing committed records', { sessions: 0 }],
+    ['missing committed retirement', { superseded: 0 }],
+    ['valid checkpoint', {}]
+  ]
+  for (const mode of ['stopped Desktop', 'approved restart']) for (const [scenario, patch] of checkpoints) await t.test(`${scenario}, ${mode}`, async () => {
+    const h = await taskCheckpointFixture(), { sessions, tasks, sourceFile, targetFile, sourceRegistry, originalRecords } = h
+    await interruptTaskFamily({ ...h, interruptAfter: 2 }, 'move', 'source')
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+    const interrupted = JSON.parse(await readFile(file)), checkpoint = interrupted.appendCheckpoint
+    assert.equal(interrupted.finalizing, true)
+    assert.deepEqual([checkpoint.sessions, checkpoint.superseded, checkpoint.taskTransfers], [1, 1, 1])
+    assert.equal(interrupted.taskTransfers.length, 2)
+    const targetBefore = await readFile(targetFile), firstRecord = await readFile(path.join(h.dir('T'), `local_${sessions[0]}.json`))
+    assert.deepEqual(JSON.parse(targetBefore).scheduledTasks, [tasks[0]])
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)).scheduledTasks, [])
+    const { calls, io } = taskHarness(mode === 'approved restart' ? [desktopFixture()[0]] : [])
+    const planned = mode === 'approved restart' ? await finishWorkflow(h.paths, { io }) : null
+    if (planned) assert.equal(planned.plan.kind, 'recover')
+    const options = { io, processes: [], ...(planned ? { approve: planned.plan.token } : {}) }
+    const planFile = path.join(h.paths.state, 'restart-plan.json'), planBefore = await readFile(planFile).catch(() => null)
+    if (scenario !== 'valid checkpoint') {
+      await writeFile(file, JSON.stringify({ ...interrupted, appendCheckpoint: { ...checkpoint, ...patch } }))
+      const before = await fixtureSnapshot(h), writes = []
+      const originals = new Map(['writeFile', 'appendFile', 'open', 'rename', 'link', 'unlink', 'rm'].map(key => [key, fs[key]]))
+      for (const [key, original] of originals) fs[key] = async (...args) => { writes.push(key); return original(...args) }
+      syncBuiltinESMExports()
+      try {
+        await assert.rejects(finishWorkflow(h.paths, options), /invalid append checkpoint/)
+        await assert.rejects(planned
+          ? executeMove(null, null, h.paths, { ...options, recover: true, receiptFile: file })
+          : finishPending(h.paths, options), /invalid append checkpoint/)
+      } finally {
+        for (const [key, original] of originals) fs[key] = original
+        syncBuiltinESMExports()
+      }
+      assert.deepEqual(writes, [])
+      assert.deepEqual(calls, [])
+      assert.deepEqual(await fixtureSnapshot(h), before)
+      assert.deepEqual(await readFile(planFile).catch(() => null), planBefore)
+      const retained = JSON.parse(await readFile(file))
+      assert.equal(retained.finalizing, true)
+      assert.equal(retained.taskTransfers.length, 2)
+      retained.appendCheckpoint = checkpoint
+      await writeFile(file, JSON.stringify(retained))
+    }
+    const recovered = await finishWorkflow(h.paths, options)
+    assert.equal(recovered.recoveryRequired, true)
+    assert.deepEqual(calls, planned ? ['/usr/bin/osascript', '/usr/bin/open'] : [])
+    if (planned) assert.equal(recovered.restarted, true)
+    const receipt = JSON.parse(await readFile(file))
+    assert.equal(receipt.finalizing, false)
+    assert.equal(receipt.appendCheckpoint, undefined)
+    assert.deepEqual(receipt.sessions.map(row => row.id), [sessions[0]])
+    assert.equal(receipt.superseded.length, 1)
+    assert.equal(receipt.taskTransfers.length, 1)
+    assert.deepEqual(await readFile(targetFile), targetBefore)
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)), { scheduledTasks: [tasks[1]],
+      recordedSkips: { task_2: sourceRegistry.recordedSkips.task_2 }, runRetries: { task_2: sourceRegistry.runRetries.task_2 } })
+    assert.deepEqual(await readFile(path.join(h.dir('T'), `local_${sessions[0]}.json`)), firstRecord)
+    assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${sessions[1]}.json`)), originalRecords[1])
+    assert.equal(await stat(path.join(h.dir('P'), `local_${sessions[0]}.json`)).catch(() => null), null)
+    assert.equal(await stat(path.join(h.dir('T'), `local_${sessions[1]}.json`)).catch(() => null), null)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)), sourceRegistry)
+    assert.deepEqual(await Promise.all(sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), originalRecords)
+    assert.equal(await stat(targetFile).catch(() => null), null)
+  })
+})
+
+test('task checkpoint integrity keeps interrupted Undo scoped to the whole receipt', async () => {
+  const h = await taskCheckpointFixture(), all = await accounts(h.paths, [])
+  const moved = await executeMove([all.find(row => row.account === h.acct.P)], all.find(row => row.account === h.acct.T), h.paths, { processes: [] })
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.taskTransfers.length, 2)
+  await interruptTaskFamily(h, 'undo', 'target')
+  const receipt = JSON.parse(await readFile(moved.file))
+  assert.ok(receipt.undoing)
+  receipt.appendCheckpoint = { sessions: 1, superseded: 1, taskTransfers: 1, held: [] }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  assert.ok((await finishWorkflow(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(await Promise.all(h.sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), h.originalRecords)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { scheduledTasks: [], recordedSkips: {}, runRetries: {} })
+  assert.deepEqual(await readdir(h.dir('T')), ['scheduled-tasks.json'])
+})
+
+test('task preflight refuses absent sources and unreadable destination data', async () => {
+  for (const scenario of ['missing source', 'unreadable source', 'unreadable target', 'denied target']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const inv = await inventory([{ ...from, sessions: from.sessions.filter(row => row.id !== h.cold) }], to, h.paths, () => {}, { processes: [] })
+    if (scenario === 'missing source') await fs.rm(h.dir('P'), { recursive: true })
+    if (scenario.startsWith('unreadable')) await writeFile(path.join(h.dir(scenario === 'unreadable source' ? 'P' : 'T'), `local_${id(796)}.json`), '{broken')
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), original = fs.readdir
+    if (scenario === 'denied target') {
+      fs.readdir = async (...args) => {
+        if (args[0] === h.dir('T')) throw Object.assign(new Error('fixture target access denied'), { code: 'EACCES' })
+        return original(...args)
+      }
+      syncBuiltinESMExports()
+    }
+    let result
+    try { result = await move(inv, to, h.paths) }
+    finally { fs.readdir = original; syncBuiltinESMExports() }
+    assert.equal(result.ok, false, scenario)
+    assert.equal(result.receipt.sessions.length, 0, scenario)
+    assert.ok(result.receipt.failed.length, scenario)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before, scenario)
+  }
+})
+
+test('task families preserve registration state, generated records and registry fields through Undo', async () => {
+  for (const enabled of [false, true]) {
+    const h = await taskFamilyFixture(enabled), { from, to } = await h.selection()
+    const prompts = await Promise.all(h.tasks.map(task => readFile(task.filePath)))
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.move.length, 4)
+    const moved = await executeMove([from], to, h.paths, { processes: [] })
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 4)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceAfter)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+    assert.deepEqual(await Promise.all(h.tasks.map(task => readFile(task.filePath))), prompts)
+    assert.deepEqual(moved.receipt.taskTransfers[0].state, { recordedSkips: { task_0: h.sourceRegistry.recordedSkips.task_0, task_1: h.sourceRegistry.recordedSkips.task_1 }, runRetries: { task_0: h.sourceRegistry.runRetries.task_0 } })
+    for (const sid of [SOURCE, h.run, h.second]) {
+      const record = JSON.parse(await readFile(path.join(h.dir('T'), `local_${sid}.json`)))
+      assert.equal(record.cliSessionId, sid)
+      assert.equal(record.sessionId, `local_${sid}`)
+      if (sid !== SOURCE) assert.equal(record.notifySessionId, `local_${SOURCE}`)
+    }
+    const undone = await undo(h.paths, { processes: [] })
+    assert.ok(undone.dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    assert.deepEqual(await Promise.all(h.tasks.map(task => readFile(task.filePath))), prompts)
+    for (const sid of [SOURCE, h.run, h.second, h.cold]) assert.ok(await readFile(path.join(h.dir('P'), `local_${sid}.json`)))
+  }
+})
+
+test('task family cloud work follows all local placements and reports the entire operation', async () => {
+  for (const scenario of ['match', 'rescue', 'remote changed', 'family refused']) {
+    const h = await taskFamilyFixture(false, 1, 8), { from, to } = await h.selection()
+    const anchor = scenario === 'rescue' ? h.cold : SOURCE
+    const base = lines(await readFile(path.join(h.project, `${anchor}.jsonl`), 'utf8'))
+    const remote = scenario === 'rescue' ? [...base, entry('assistant', 300, 87, 'cse_task_family')] : base
+    let status = 'active', archived = 0, changed = false
+    const reports = []
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_task_family', title: `Session ${anchor.slice(-3)}`, status })],
+      eventRows: async () => remoteRows(changed ? [...remote, entry('user', 301, 87, 'cse_task_family')] : remote),
+      session: async () => remoteState(status),
+      archive: async () => {
+        assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+        for (const sid of [SOURCE, h.run, h.cold]) {
+          assert.ok(await readFile(path.join(h.dir('T'), `local_${sid}.json`)))
+          assert.equal(await stat(path.join(h.dir('P'), `local_${sid}.json`)).catch(() => null), null)
+        }
+        archived++
+        status = 'archived'
+      }
+    })
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [], cloud })
+    assert.equal(inv.move.length, 3)
+    assert.equal(inv.cloud.matches.length, 1)
+    assert.deepEqual(inv.cloud.blocked, [])
+    if (scenario === 'remote changed') changed = true
+    if (scenario === 'family refused') await writeFile(h.sourceFile, JSON.stringify({ ...h.sourceRegistry, scheduledTasks: [{ ...h.tasks[0], notifySessionId: `local_${id(799)}` }] }))
+    const moved = await move(inv, to, h.paths, (stage, text, extra) => reports.push({ stage, text, ...extra }))
+    assert.equal((await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name)).length, 1)
+    const succeeds = ['match', 'rescue'].includes(scenario)
+    assert.equal(moved.ok, succeeds, scenario)
+    assert.equal(archived, succeeds ? 1 : 0, scenario)
+    assert.equal(moved.pendingCloud, succeeds ? 0 : 1, scenario)
+    assert.equal(moved.receipt.sessions.length, scenario === 'family refused' ? 1 : scenario === 'rescue' ? 4 : 3, scenario)
+    if (succeeds) {
+      const moves = reports.filter(row => row.stage === 'move' && !row.live)
+      assert.equal(moves.length, 1)
+      assert.match(moves[0].text, scenario === 'rescue' ? /4 ✓ \| 33 events/ : /3 ✓ \| 24 events/)
+      for (const stage of ['move', 'verify', 'retire']) {
+        const progress = reports.filter(row => row.stage === stage && row.completed !== undefined)
+        const total = stage === 'retire' ? 3 : moved.receipt.sessions.length
+        assert.ok(progress.length, stage)
+        assert.ok(progress.every((row, index) => row.total === total && row.completed >= (progress[index - 1]?.completed ?? 0)), stage)
+        assert.equal(progress.at(-1).completed, total, stage)
+      }
+    } else {
+      assert.ok(moved.receipt.failed.some(row => row.cloudAccount === h.acct.P))
+      assert.match(moved.receipt.failed.map(row => row.error).join(' '), scenario === 'family refused' ? /changed since inventory/ : /Remote Control history changed/)
+      if (scenario === 'family refused') assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    }
+  }
+})
+
+test('deferred cloud rescue preserves a retired destination anchor and rejects changed anchors', async () => {
+  for (const scenario of ['ordinary', 'mixed', 'changed', 'unsafe', 'parked changed']) {
+    const h = await taskFamilyFixture(false, 1), anchor = id(795), remoteId = 'cse_retired_anchor'
+    const prefix = branchEntries(8, h.cold, 800).map(row => ({ ...row, entrypoint: 'anchor-entry' }))
+    await h.write(h.cold, [...prefix, entry('user', 808, 807, h.cold, { version: 'survivor-version', entrypoint: 'survivor-entry' })])
+    const anchorEntries = fork(prefix, h.cold, anchor, 'Anchor').map(row => ({ ...row, cwd: '/tmp/anchor', version: 'anchor-version', entrypoint: 'anchor-entry', gitBranch: 'anchor-branch' }))
+    await h.write(anchor, anchorEntries)
+    await h.record('T', anchor, rehomeRecord({ title: 'Remote anchor', cwd: '/tmp/anchor', originCwd: '/tmp/anchor', sessionSettings: { from: 'anchor' }, remoteMcpServersConfig: [{ name: 'anchor-server' }] }))
+    await h.record('P', h.cold, rehomeRecord({ title: 'Local branch', sessionSettings: { from: 'survivor' } }))
+    const { from, to } = await h.selection(), remote = [...prefix, entry('assistant', 809, 807, remoteId)]
+    let status = 'active', archived = 0
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: remoteId, title: 'Remote anchor', status })],
+      eventRows: async () => remoteRows(remote),
+      session: async () => remoteState(status),
+      archive: async () => { status = 'archived'; archived++ },
+      unarchive: async () => { status = 'active' }
+    })
+    const source = scenario === 'ordinary' ? { ...from, sessions: from.sessions.filter(row => row.id === h.cold) } : from
+    const inv = await inventory([source], to, h.paths, () => {}, { processes: [], cloud })
+    assert.equal(inv.cloud.matches.length, 1)
+    assert.equal(inv.cloud.matches[0].target.base.kind, 'existing')
+    assert.equal(inv.cloud.matches[0].target.base.id, anchor)
+    const file = path.join(h.dir('T'), `local_${anchor}.json`), before = await readFile(file)
+    if (scenario === 'changed') await writeFile(file, JSON.stringify({ ...JSON.parse(before), sessionSettings: { edited: true } }))
+    if (scenario === 'unsafe') await writeFile(h.targetFile, JSON.stringify({ ...h.targetRegistry, scheduledTasks: [...h.targetRegistry.scheduledTasks, { id: 'new_anchor_owner', notifySessionId: `local_${anchor}`, enabled: false }] }))
+    const original = fs.rename
+    let edited = false
+    if (scenario === 'parked changed') {
+      fs.rename = async (...args) => {
+        const result = await original(...args)
+        if (args[0] === file && !edited) {
+          edited = true
+          await writeFile(args[1], JSON.stringify({ ...JSON.parse(before), cwd: '/tmp/changed-anchor' }))
+        }
+        return result
+      }
+      syncBuiltinESMExports()
+    }
+    let result
+    try { result = await move(inv, to, h.paths) }
+    finally { fs.rename = original; syncBuiltinESMExports() }
+    const succeeds = ['ordinary', 'mixed'].includes(scenario)
+    assert.equal(result.ok, succeeds, JSON.stringify({ scenario, failed: result.receipt.failed }))
+    assert.equal(archived, succeeds ? 1 : 0, scenario)
+    assert.equal(status, succeeds ? 'archived' : 'active', scenario)
+    if (succeeds) {
+      assert.equal(result.receipt.superseded.filter(row => !row.source && row.id === anchor).length, 1)
+      assert.equal(await stat(file).catch(() => null), null)
+      const rescued = result.receipt.sessions.find(row => row.strategy === 'remote')
+      assert.equal(rescued.rescueAnchorId, anchor)
+      const record = JSON.parse(await readFile(rescued.record)), entries = lines(await readFile(rescued.targetTranscript, 'utf8')).filter(row => row.message)
+      assert.equal(record.cwd, '/tmp/anchor')
+      assert.deepEqual(record.sessionSettings, { from: 'anchor' })
+      assert.deepEqual(record.remoteMcpServersConfig, [{ name: 'anchor-server' }])
+      assert.ok(entries.every(row => row.cwd === '/tmp/anchor' && row.version === 'anchor-version' && row.entrypoint === 'anchor-entry' && row.gitBranch === 'anchor-branch'))
+      assert.deepEqual(entries.map(row => row.message), remote.map(row => row.message))
+      assert.deepEqual(await readFile(path.join(h.project, `${anchor}.jsonl`), 'utf8'), anchorEntries.map(row => JSON.stringify(row)).join('\n') + '\n')
+      assert.ok((await undo(h.paths, { processes: [], cloud })).dest)
+      assert.deepEqual(await readFile(file), before)
+      assert.equal(status, 'active')
+    } else {
+      assert.equal(result.receipt.sessions.some(row => row.strategy === 'remote'), false)
+      assert.match(result.receipt.failed.map(row => row.error).join(' '), /rescue anchor changed/)
+      if (scenario === 'parked changed') assert.equal(edited, true)
+    }
+  }
+})
+
+test('task family preflight errors cannot modify an earlier completed receipt', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const ordinary = { ...from, sessions: from.sessions.filter(row => row.id === h.cold) }
+  const first = await executeMove([ordinary], to, h.paths, { processes: [] })
+  const before = await readFile(first.file)
+  const fresh = await h.selection()
+  const inv = await inventory([fresh.from], fresh.to, h.paths, () => {}, { processes: [] })
+  h.sourceRegistry.scheduledTasks[0].notifySessionId = `local_${h.cold}`
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  const result = await move(inv, fresh.to, h.paths)
+  assert.equal(result.ok, false)
+  assert.notEqual(result.file, first.file)
+  assert.deepEqual(await readFile(first.file), before)
+  assert.equal(result.receipt.sessions.length, 0)
+  assert.equal(result.added ?? 0, 0)
+  assert.equal(result.targetChanged ?? false, false)
+  assert.match(result.receipt.failed.map(row => row.error).join(' '), /changed since inventory/)
+})
+
+test('task state conflicts preserve pre-existing destination entries before and after planning', async () => {
+  for (const key of ['recordedSkips', 'runRetries']) for (const late of [false, true]) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const planned = late ? await inventory([from], to, h.paths, () => {}, { processes: [] }) : null
+    const conflict = { ...h.targetRegistry, [key]: { ...h.targetRegistry[key], task_0: { conflict: true } } }
+    await writeFile(h.targetFile, JSON.stringify(conflict))
+    const fresh = await h.selection()
+    const result = await move(planned ?? await inventory([fresh.from], fresh.to, h.paths, () => {}, { processes: [] }), fresh.to, h.paths)
+    assert.equal(result.ok, false)
+    assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+    assert.match(result.receipt.failed.map(row => row.error).join(' '), /task state collision/)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), conflict)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('task Undo preserves identical pre-existing selected destination state', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const target = { ...h.targetRegistry, recordedSkips: { ...h.targetRegistry.recordedSkips, task_0: h.sourceRegistry.recordedSkips.task_0 } }
+  await writeFile(h.targetFile, JSON.stringify(target))
+  const moved = await executeMove([from], to, h.paths, { processes: [] })
+  assert.equal(moved.ok, true)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), target)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+})
+
+test('unsafe task families leave ordinary records movable', async () => {
+  for (const reason of ['missing record', 'missing history', 'task collision', 'source collision', 'record collision', 'omitted member']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (reason === 'missing record') await unlink(path.join(h.dir('P'), `local_${SOURCE}.json`))
+    if (reason === 'missing history') await unlink(path.join(h.project, `${h.run}.jsonl`))
+    if (reason === 'task collision') await writeFile(h.targetFile, JSON.stringify({ ...h.targetRegistry, scheduledTasks: [...h.targetRegistry.scheduledTasks, h.tasks[0]] }))
+    if (reason === 'source collision') {
+      await h.record('Q', h.run, rehomeRecord({ scheduledTaskId: h.tasks[0].id }))
+      await writeFile(path.join(h.dir('Q'), 'scheduled-tasks.json'), JSON.stringify({ scheduledTasks: [h.tasks[0]] }))
+    }
+    if (reason === 'record collision') await h.record('T', h.run, rehomeRecord({ scheduledTaskId: h.tasks[0].id }))
+    const fresh = await h.selection()
+    if (reason === 'omitted member') fresh.from.sessions = fresh.from.sessions.filter(row => row.id !== h.run)
+    const sources = [fresh.from]
+    if (reason === 'source collision') sources.push((await accounts(h.paths)).find(row => row.account === h.acct.Q))
+    const inv = await inventory(sources, fresh.to, h.paths, () => {}, { processes: [] })
+    assert.deepEqual(inv.move.map(row => row.id), [h.cold], reason)
+    const moved = await move(inv, fresh.to, h.paths)
+    assert.equal(moved.receipt.sessions.length, 1, reason)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('task schedulers require an explicit restart for active or unknown namespaces', async () => {
+  for (const identity of ['active', 'unknown', 'inactive']) {
+    const h = await taskFamilyFixture(), f = await identityFixture(h)
+    if (identity === 'unknown') await f.write(f.event(1, '[LocalSessionManager] Org changed'))
+    if (identity === 'inactive') {
+      await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
+      await f.write(f.init(1, h.acct.Z, h.org.Z))
+    }
+    const { from, to } = await h.selection()
+    const result = await executeMove([from], to, h.paths, { processes: f.processes })
+    if (identity === 'inactive') assert.equal(result.receipt.sessions.length, 4)
+    else {
+      assert.ok(result.plan)
+      assert.equal(new Set(result.plan.held.flatMap(row => row.sources.map(source => source.id))).size, 3)
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+      const partial = await executeMove([from], to, h.paths, { processes: f.processes, moveOnly: true })
+      assert.equal(partial.receipt.sessions.length, 1)
+      assert.equal(partial.complete, false)
+      const background = await sweep(h.paths, { processes: f.processes })
+      assert.equal(background.result.pendingLocal, true)
+      const completed = await finishHeld(h.paths, { processes: [] })
+      assert.equal(completed.receipt.sessions.length, 4)
+      assert.equal(completed.complete, true)
+    }
+  }
+})
+
+test('a Desktop worker holds the entire task family in the exact source namespace', async () => {
+  for (const sameLogin of [false, true]) {
+    const h = await taskFamilyFixture(false, 1), f = await identityFixture(h), other = id(704)
+    if (sameLogin) { h.acct.Q = h.acct.P; await mkdir(h.dir('Q'), { recursive: true }) }
+    await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
+    await f.write(f.init(1, h.acct.Z, h.org.Z))
+    await h.write(other, branchEntries(1, other, 400))
+    await h.record('Q', other, rehomeRecord({ notifySessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths, f.processes)
+    const from = all.filter(row => [h.org.P, h.org.Q].includes(row.org)), to = all.find(row => row.account === h.acct.T)
+    const rows = [{ ...f.processes[0], desktopPid: 500 }, desktopFixture()[1]]
+    const inv = await inventory(from, to, h.paths, () => {}, { processes: rows })
+    assert.ok(inv.sources.filter(row => row.account.org === h.org.P).every(row => !row.schedulerBusy))
+    const plan = await restartPlan(inv, h.paths, rows)
+    assert.deepEqual(new Set(plan.held.flatMap(row => row.sources.map(source => source.id))), new Set([SOURCE, h.run]))
+    assert.ok(plan.held.every(row => row.sources.every(source => source.account === h.acct.P && source.org === h.org.P)))
+    const partial = await executeMove(from, to, h.paths, { processes: rows, moveOnly: true })
+    assert.deepEqual(partial.receipt.sessions.map(row => row.id), [h.cold])
+    assert.equal(partial.receipt.failed.length, 1)
+    assert.equal(partial.receipt.failed[0].id, other)
+    assert.ok(!partial.receipt.failed.some(row => [SOURCE, h.run].includes(row.id)))
+    assert.equal(new Set(partial.receipt.failed.map(row => JSON.stringify(row))).size, partial.receipt.failed.length)
+    const finished = await finishHeld(h.paths, { processes: f.processes })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.complete, true)
+    assert.equal(finished.receipt.sessions.length, 3)
+    assert.equal(finished.added, 2)
+    assert.equal(finished.targetChanged, true)
+    assert.equal(finished.file, partial.file)
+    assert.equal(finished.notMoved.length, 1)
+    assert.deepEqual(finished.failed, [])
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+    assert.ok(await readFile(path.join(h.dir('Q'), `local_${other}.json`)))
+  }
+})
+
+test('resumed mixed ordinary and task work counts every newly placed record', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), firstId = id(705)
+  await h.write(firstId, branchEntries(1, firstId, 405))
+  await h.record('P', firstId, rehomeRecord())
+  const fresh = await h.selection()
+  const rows = [...desktopFixture(h.cold), { ...desktopFixture(SOURCE)[1], pid: 502, started: 'family worker' }]
+  const first = await executeMove([fresh.from], to, h.paths, { processes: rows, moveOnly: true })
+  assert.deepEqual(first.receipt.sessions.map(row => row.id), [firstId])
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.file, first.file)
+  assert.equal(finished.ok, true)
+  assert.equal(finished.added, 4)
+  assert.equal(finished.receipt.sessions.length, 5)
+  assert.equal(finished.targetChanged, true)
+  assert.equal(finished.complete, true)
+})
+
+async function interruptTaskFamily(h, operation, stage) {
+  const hook = stage === 'record' ? 'link' : 'rename'
+  const destination = stage === 'record' ? path.join(h.dir('T'), `local_${h.notificationId ?? SOURCE}.json`) : stage === 'source' ? h.sourceFile : h.targetFile
+  const matches = stage === 'receipt' ? `args[1].startsWith(paths.state + '/') && JSON.parse(await fs.readFile(args[1], 'utf8')).taskTransfers?.length` : `args[1] === ${JSON.stringify(destination)}`
+  const script = `
+    import childProcess from 'node:child_process'
+    import fs from 'node:fs/promises'
+    import { syncBuiltinESMExports } from 'node:module'
+    import { accounts, executeMove, layout, undo } from './transplant.js'
+    childProcess.spawnSync = (${fixtureCommand.toString()})(childProcess.spawnSync)
+    childProcess.spawn = (${fixtureCommand.toString()})(childProcess.spawn)
+    const original = fs.${hook}
+    let mutations = 0
+    fs.${hook} = async (...args) => {
+      const result = await original(...args)
+      if (${matches} && ++mutations === ${JSON.stringify(h.interruptAfter ?? 1)}) process.exit(23)
+      return result
+    }
+    syncBuiltinESMExports()
+    const paths = layout(${JSON.stringify(h.root)})
+    const all = await accounts(paths, [])
+    if (${JSON.stringify(operation)} === 'undo') await undo(paths, { processes: [] })
+    else await executeMove(${JSON.stringify(h.sourceAccounts ?? [h.acct.P])}.map(account => all.find(row => row.account === account)), all.find(row => row.account === ${JSON.stringify(h.acct.T)}), paths, { processes: [] })
+  `
+  const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root } })
+    .then(() => ({ code: 0 }), error => error)
+  assert.equal(result.code, 23, result.stderr)
+}
+
+test('task registry and record interruptions recover moves and Undo in the existing receipt', async () => {
+  for (const [operation, stage] of [['move', 'source'], ['move', 'record'], ['move', 'target'], ['move', 'receipt'], ['undo', 'target'], ['undo', 'source']]) {
+    const h = await taskFamilyFixture(true), { from, to } = await h.selection()
+    if (operation === 'undo') await executeMove([from], to, h.paths, { processes: [] })
+    if (stage === 'receipt') await unlink(h.targetFile)
+    await interruptTaskFamily(h, operation, stage)
+    if (operation === 'undo') {
+      const pending = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].filter(row => row.pending)
+      assert.deepEqual(pending.map(row => [row.pending, row.pendingAction]), [['undo', 'finish']])
+    }
+    const files = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
+    assert.equal(files.length, 1)
+    const file = path.join(h.paths.state, files[0]), interrupted = JSON.parse(await readFile(file))
+    if (stage === 'receipt') {
+      assert.equal(interrupted.finalizing, true)
+      assert.equal(interrupted.taskTransfers.length, 1)
+      assert.equal(interrupted.taskTransfers[0].targetExisted, false)
+      await assert.rejects(readFile(h.targetFile), { code: 'ENOENT' })
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+    const result = await finishWorkflow(h.paths, { processes: [] })
+    if (operation === 'undo') assert.ok(result.dest)
+    else {
+      assert.equal(result.recoveryRequired, true)
+      assert.deepEqual((await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name)), files)
+      const receipt = JSON.parse(await readFile(file))
+      assert.equal(receipt.finalizing, false)
+      assert.deepEqual(receipt.sessions.map(row => row.id), [h.cold])
+      assert.deepEqual(receipt.taskTransfers, [])
+    }
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(await readFile(h.targetFile).then(JSON.parse, error => { if (error.code === 'ENOENT') return null; throw error }), stage === 'receipt' ? null : h.targetRegistry)
+    for (const sid of [SOURCE, h.run, h.second]) {
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${sid}.json`)))
+      assert.equal(await stat(path.join(h.dir('T'), `local_${sid}.json`)).catch(() => null), null)
+    }
+    if (operation === 'move') assert.ok((await undo(h.paths, { processes: [] })).dest)
+  }
+})
+
+test('CLI accounts exposes task recovery through Finish without selecting historical refusals', async () => {
+  const h = await taskFamilyFixture(true, 1)
+  await interruptTaskFamily(h, 'move', 'target')
+  const name = (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)), file = path.join(h.paths.state, name)
+  const receipt = JSON.parse(await readFile(file))
+  assert.equal(receipt.finalizing, true)
+  assert.deepEqual(receipt.held, [])
+  assert.equal(receipt.taskTransfers.length, 1)
+  receipt.fromAccounts.push({ account: h.acct.Q, org: h.org.Q, label: 'Unrelated source' })
+  receipt.failed.push({ id: id(799), title: 'Historical refusal', error: 'scheduled task family member missing' })
+  await writeFile(file, JSON.stringify(receipt))
+  const before = await readFile(file)
+  const listed = await cli(h.root, ['accounts', '--json'])
+  assert.equal(listed.code, 0)
+  const pending = lines(listed.stdout)[0].filter(row => row.pending)
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].account, h.acct.P)
+  assert.equal(pending[0].org, h.org.P)
+  assert.equal(pending[0].pending, 'recovery')
+  assert.equal(pending[0].pendingAction, 'finish')
+  assert.equal(pending[0].receipt, file)
+  assert.deepEqual(pending[0].pendingFailures, [])
+  assert.deepEqual(await readFile(file), before)
+  const { calls, io } = taskHarness()
+  const plan = await finishWorkflow(h.paths, { io })
+  assert.ok(plan.plan)
+  assert.equal(plan.plan.kind, 'recover')
+  assert.equal(plan.plan.receiptFile, file)
+  assert.deepEqual(calls, [])
+  const recovered = await finishWorkflow(h.paths, { io, approve: plan.plan.token })
+  assert.equal(recovered.restarted, true)
+  assert.equal(recovered.recoveryRequired, true)
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+  const again = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].filter(row => row.pending)
+  assert.deepEqual(again.map(row => [row.account, row.pending, row.pendingAction]), [[h.acct.P, 'local', 'finish']])
+  const finished = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(finished.file, file)
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.receipt.sessions.length, 3)
+  assert.ok(finished.notMoved.some(row => row.title === 'Historical refusal'))
+  assert.ok(lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].every(row => row.pending === null))
+})
+
+test('task edits and dependencies block Undo and interrupted recovery without overwriting registries', async () => {
+  for (const recovery of [false, true]) for (const change of ['task', 'dependency', 'skip', 'retry', 'skip removed', 'retry removed', 'retry added', 'source skip', 'source retry']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (recovery) await interruptTaskFamily(h, 'move', 'target')
+    else await executeMove([from], to, h.paths, { processes: [] })
+    const source = change.startsWith('source'), file = source ? h.sourceFile : h.targetFile
+    const before = await readFile(file), target = await readFile(h.targetFile), changed = JSON.parse(before)
+    if (change === 'task') changed.scheduledTasks.find(task => task.id === h.tasks[0].id).enabled = true
+    else if (change === 'dependency') changed.scheduledTasks.push({ id: 'new_task', notifySessionId: `local_${SOURCE}`, enabled: false })
+    else if (change === 'skip') changed.recordedSkips.task_0[0].reason = 'edited'
+    else if (change === 'retry') changed.runRetries.task_0.attempts++
+    else if (change === 'skip removed') delete changed.recordedSkips.task_0
+    else if (change === 'retry removed') delete changed.runRetries.task_0
+    else if (change === 'retry added') changed.runRetries.task_1 = { slot: '2026-09-05T00:00:00Z', attempts: 1, notBefore: '2026-09-05T00:00:00Z' }
+    else if (change === 'source skip') changed.recordedSkips.task_0 = [{ at: '2026-09-09T00:00:00Z', reason: 'missed' }]
+    else changed.runRetries.task_0 = { slot: '2026-09-09T00:00:00Z', attempts: 1, notBefore: '2026-09-09T00:05:00Z' }
+    await writeFile(file, JSON.stringify(changed))
+    const result = await (recovery ? finishWorkflow : undo)(h.paths, { processes: [] })
+    assert.match((result.reconciled?.problems ?? result.restoreProblems ?? result.changed).join(' '), source ? /scheduled task state changed/ : /scheduled task/)
+    assert.deepEqual(JSON.parse(await readFile(file)), changed)
+    if (source) assert.deepEqual(await readFile(h.targetFile), target)
+    assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+    await writeFile(file, before)
+    const retried = await (recovery ? finishWorkflow : undo)(h.paths, { processes: [] })
+    assert.ok(recovery ? retried.recoveryRequired : retried.dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('task transfer uses final registration state and preserves later unrelated registry edits', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  h.sourceRegistry.scheduledTasks[0].lastRunAt = '2026-09-02T00:00:00Z'
+  h.sourceRegistry.scheduledTasks[0].enabled = true
+  h.sourceRegistry.recordedSkips.task_0[0].reason = 'missed before transfer'
+  h.sourceRegistry.runRetries.task_0.attempts = 4
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  let changed = false
+  const result = await move(inv, to, h.paths, (stage, text, extra) => {
+    if (stage !== 'move' || extra?.completed !== 1 || changed) return
+    const source = JSON.parse(readFileSync(h.sourceFile))
+    if (source.scheduledTasks.length) return
+    changed = true
+    for (const file of [h.sourceFile, h.targetFile]) writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file)), futureDuringMove: { intact: true } }))
+  })
+  assert.equal(result.ok, true)
+  assert.equal(changed, true)
+  assert.equal(JSON.parse(await readFile(h.targetFile)).scheduledTasks.find(task => task.id === h.tasks[0].id).enabled, true)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)).recordedSkips.task_0, h.sourceRegistry.recordedSkips.task_0)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)).runRetries.task_0, h.sourceRegistry.runRetries.task_0)
+  for (const file of [h.sourceFile, h.targetFile]) await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file)), futureDuringUndo: [1, 2] }))
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), { ...h.sourceRegistry, futureDuringMove: { intact: true }, futureDuringUndo: [1, 2] })
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { ...h.targetRegistry, futureDuringMove: { intact: true }, futureDuringUndo: [1, 2] })
+})
+
+test('task families include parent and fork closure without merging matching history', async () => {
+  const h = await taskFamilyFixture(), parent = id(704), child = id(705)
+  await h.write(parent, [entry('user', 90, null, parent)])
+  await h.record('P', parent, rehomeRecord())
+  await h.record('P', SOURCE, rehomeRecord({ forkedFromSessionId: `local_${parent}` }))
+  await h.write(child, [entry('user', 91, null, child)])
+  await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}`, isArchived: true }))
+  await h.record('Q', SOURCE, rehomeRecord())
+  const { from, to } = await h.selection()
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  assert.equal(inv.move.filter(row => row.taskFamily).length, 5)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 6)
+  assert.ok(await readFile(path.join(h.dir('Q'), `local_${SOURCE}.json`)))
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+})
+
+test('task moves, Undo and recovery use the approved restart and preserve final scheduler state', async () => {
+  for (const operation of ['move', 'undo', 'recovery']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (operation === 'undo') await executeMove([from], to, h.paths, { processes: [] })
+    if (operation === 'recovery') await interruptTaskFamily(h, 'move', 'target')
+    const mock = taskHarness(), { calls, io } = mock
+    if (operation === 'move') mock.beforeQuit = async () => {
+      h.sourceRegistry.scheduledTasks[0].lastScheduledFor = '2026-09-03T00:00:00Z'
+      h.sourceRegistry.scheduledTasks[0].enabled = true
+      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    }
+    const run = options => operation === 'move' ? executeMove([from], to, h.paths, options) : operation === 'undo' ? undo(h.paths, options) : finishWorkflow(h.paths, options)
+    const plan = await run({ io })
+    assert.ok(plan.plan, operation)
+    assert.deepEqual(calls, [])
+    const result = await run({ io, approve: plan.plan.token })
+    assert.equal(result.restarted, true, JSON.stringify({ operation, reason: result.reason, outcome: result.restartOutcome?.outcome }))
+    assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.ok(mock.time < 30000)
+    if (operation === 'move') {
+      assert.equal(result.ok, true)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)).scheduledTasks.slice(1), h.sourceRegistry.scheduledTasks)
+    } else {
+      assert.ok(operation === 'undo' ? result.dest : result.recoveryRequired)
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+  }
+})
+
+test('task workers and changed restart inventories never authorize an external stop', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const table = [...desktopFixture(), { pid: 600, worker: true, ids: [h.run], desktopPid: null }]
+  const result = await executeMove([from], to, h.paths, { processes: table })
+  assert.equal(result.plan, undefined)
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  const calls = []
+  let rows = [desktopFixture()[0]]
+  const io = { inspect: () => rows, command: async file => { calls.push(file); return { status: 0 } } }
+  const planned = await finishWorkflow(h.paths, { io })
+  assert.ok(planned.plan)
+  rows = [...rows, { ...desktopFixture(h.run)[1], pid: 701 }]
+  const stale = await finishWorkflow(h.paths, { io, approve: planned.plan.token })
+  assert.equal(stale.ok, false)
+  assert.deepEqual(calls, [])
+})
+
+test('task restart deadline preserves held families after completed ordinary work', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const mock = taskHarness(), { io } = mock
+  const planned = await executeMove([from], to, h.paths, { io })
+  const original = fs.rename
+  fs.rename = async (...args) => {
+    const result = await original(...args)
+    if (path.dirname(args[1]) === h.paths.state && /^\d.*\.json$/.test(path.basename(args[1]))) {
+      const receipt = JSON.parse(await readFile(args[1]))
+      if (receipt.finalizing === false && receipt.sessions.length === 1) mock.time = 23000
+    }
+    return result
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token }) }
+  finally { fs.rename = original; syncBuiltinESMExports() }
+  assert.equal(result.ok, false)
+  assert.equal(result.restarted, true)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  const receipts = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
+  const receipt = JSON.parse(await readFile(path.join(h.paths.state, receipts[0])))
+  assert.deepEqual(receipt.sessions.map(row => row.id), [h.cold])
+  assert.equal(receipt.held.flatMap(row => row.sources).length, 3)
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.receipt.sessions.length, 4)
+})
+
+test('a failed task-family placement rolls back the family and keeps ordinary moves', async () => {
+  const h = await taskFamilyFixture(true), { from, to } = await h.selection()
+  const original = fs.link
+  let failed = false
+  fs.link = async (...args) => {
+    if (!failed && args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`)) { failed = true; throw new Error('fixture publication failure') }
+    return original(...args)
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { processes: [] }) }
+  finally { fs.link = original; syncBuiltinESMExports() }
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+  assert.equal((await finishHeld(h.paths, { processes: [] })).receipt.sessions.length, 4)
+})
+
+test('registry changes during a task move remain recoverable without lost edits', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  let edited = false
+  const result = await executeMove([from], to, h.paths, { processes: [], report: (stage, text, extra) => {
+    if (stage !== 'move' || extra?.completed !== 1 || edited) return
+    const source = JSON.parse(readFileSync(h.sourceFile))
+    if (source.scheduledTasks.length) return
+    edited = true
+    source.scheduledTasks = [{ ...h.tasks[0], enabled: true }]
+    source.unrelatedEdit = 9
+    writeFileSync(h.sourceFile, JSON.stringify(source))
+  } })
+  assert.equal(edited, true)
+  assert.equal(result.recoveryRequired, true)
+  const changed = JSON.parse(await readFile(h.sourceFile))
+  assert.equal(changed.scheduledTasks[0].enabled, true)
+  assert.equal(changed.unrelatedEdit, 9)
+  changed.scheduledTasks = []
+  await writeFile(h.sourceFile, JSON.stringify(changed))
+  await finishWorkflow(h.paths, { processes: [] })
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), { ...h.sourceRegistry, unrelatedEdit: 9 })
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${h.cold}.json`)))
+})
+
+test('task transaction boundaries retain late dependencies, worker and record edits for recovery', async () => {
+  for (const phase of ['placement', 'retirement', 'publication']) for (const change of ['registration', 'route', 'external worker', 'source edit', 'target edit', 'account switch']) {
+    const h = await taskFamilyFixture(false, 1), f = await identityFixture(h)
+    await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
+    await f.write(f.init(1, h.acct.Z, h.org.Z))
+    const { from, to } = await h.selection()
+    let rows = f.processes, injected = false, editedFile, editedBefore, editedAfter
+    const hook = phase === 'placement' ? 'link' : phase === 'retirement' ? 'rename' : 'writeFile', original = fs[hook]
+    const write = fs.writeFile
+    const source = path.join(h.dir('P'), `local_${h.run}.json`), target = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    fs[hook] = async (...args) => {
+      const result = await original(...args)
+      const matches = phase === 'placement' ? args[1] === target : phase === 'retirement' ? args[0] === path.join(h.dir('P'), `local_${SOURCE}.json`) : String(args[0]).startsWith(h.targetFile + '.')
+      if (!matches || injected) return result
+      injected = true
+      if (change === 'external worker') rows = [...rows, { pid: 600, worker: true, ids: [h.run], desktopPid: null }]
+      else if (change === 'account switch') {
+        editedFile = path.join(h.paths.logs, 'main.log')
+        editedBefore = await readFile(editedFile)
+        editedAfter = f.event(2, '[LocalSessionManager] Org changed')
+      } else {
+        editedFile = change === 'registration' ? h.sourceFile : change === 'source edit' ? phase === 'publication' ? path.join(h.dir('P'), `local_${id(797)}.json`) : source : target
+        editedBefore = await readFile(editedFile).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+        const value = editedBefore ? JSON.parse(editedBefore) : { sessionId: `local_${id(797)}`, cliSessionId: id(797), scheduledTaskId: h.tasks[0].id }
+        if (change === 'registration') value.scheduledTasks.push({ id: 'new_dependency', notifySessionId: `local_${SOURCE}`, enabled: false })
+        else if (change === 'route') value.notifySessionId = `local_${id(797)}`
+        else value.title = 'Edited during transfer'
+        editedAfter = JSON.stringify(value)
+      }
+      if (editedFile) await write(editedFile, editedAfter)
+      return result
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { io: { inspect: () => rows }, processes: f.processes }) }
+    finally { fs[hook] = original; syncBuiltinESMExports() }
+    assert.equal(injected, true, `${phase}: ${change}`)
+    assert.equal(result.ok, false, `${phase}: ${change}`)
+    if (editedFile) assert.equal(await readFile(editedFile, 'utf8'), editedAfter, `${phase}: ${change}`)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry, `${phase}: ${change}`)
+    if (editedFile) {
+      if (editedBefore) await writeFile(editedFile, editedBefore)
+      else await unlink(editedFile)
+    }
+    rows = []
+    if (result.recoveryRequired) await finishWorkflow(h.paths, { processes: [] })
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry, `${phase}: ${change}`)
+    const finished = await finishHeld(h.paths, { processes: [] })
+    assert.equal(finished.ok, true, `${phase}: ${change}`)
+    assert.equal(finished.receipt.sessions.length, 3, `${phase}: ${change}`)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('Keep local validates target identity and recovery even when only held work remains', async () => {
+  for (const change of ['sessionId', 'cliSessionId', 'cwd', 'missing transcript', 'missing record']) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(id(710), [entry('user', 2, null, id(710))])
+    await h.record('P', id(710), rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const moved = await executeMove([from], to, h.paths, { processes: desktopFixture(id(710)), moveOnly: true })
+    const row = moved.receipt.sessions[0]
+    if (change === 'missing transcript') await unlink(row.targetTranscript)
+    else if (change === 'missing record') await unlink(row.record)
+    else await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), [change]: change === 'sessionId' ? `local_${id(711)}` : change === 'cliSessionId' ? id(711) : '/tmp/changed' }))
+    const kept = await keepLocal(h.paths)
+    assert.ok(kept.refused.length, change)
+    assert.equal(kept.receipt.held.length, 1)
+  }
+})
+
+test('Finish of held local work treats an earlier refusal as information', async () => {
+  const h = await home(), cold = id(712)
+  for (const [index, sid] of [SOURCE, cold].entries()) {
+    await h.write(sid, [entry('user', index + 1, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  first.receipt.failed.push({ id: id(713), title: 'Earlier refusal', error: 'scheduled task family member missing' })
+  await writeFile(first.file, JSON.stringify(first.receipt))
+  const finished = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.deepEqual(finished.failed, [])
+  assert.equal(finished.notMoved.length, 1)
+})
+
+test('task scheduler safety uses the exact organization and rechecks account switches', async () => {
+  for (const switching of [false, true]) {
+    const h = await taskFamilyFixture(), f = await identityFixture(h)
+    await f.write(f.init(1, h.acct.P, h.org.Q))
+    const { from, to } = await h.selection()
+    let switched = false
+    const result = await executeMove([from], to, h.paths, { processes: f.processes, report: (stage, text, extra) => {
+      if (!switching || switched || stage !== 'move' || extra?.completed !== 1 || JSON.parse(readFileSync(h.sourceFile)).scheduledTasks.length) return
+      switched = true
+      writeFileSync(path.join(h.paths.logs, 'main.log'), f.event(2, '[LocalSessionManager] Org changed'))
+    } })
+    if (!switching) assert.equal(result.receipt.sessions.length, 4)
+    else {
+      assert.equal(switched, true)
+      assert.equal(result.recoveryRequired, true)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+      const swept = await sweep(h.paths, { processes: f.processes })
+      assert.equal(swept.ok, false)
+      assert.match(swept.error, /scheduler requires/)
+      await finishWorkflow(h.paths, { processes: [] })
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+  }
+})
+
+test('task Undo preserves absent directories and registries and only tolerates ENOENT on removal', async () => {
+  for (const scenario of ['directory', 'registry', 'fields', 'ENOENT', 'EACCES']) {
+    const h = await taskFamilyFixture(), registry = scenario === 'fields' ? { future: { intact: true } } : null
+    if (registry) await writeFile(h.targetFile, JSON.stringify(registry))
+    else if (scenario === 'directory') await fs.rm(h.dir('T'), { recursive: true })
+    else await unlink(h.targetFile)
+    const { from, to } = await h.selection()
+    assert.deepEqual(to.sessions, [])
+    const moved = await executeMove([from], to, h.paths, { processes: [] })
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 4)
+    const target = await readFile(h.targetFile), original = fs.unlink
+    assert.deepEqual(JSON.parse(target), { ...registry, scheduledTasks: h.tasks,
+      recordedSkips: { task_0: h.sourceRegistry.recordedSkips.task_0, task_1: h.sourceRegistry.recordedSkips.task_1 }, runRetries: { task_0: h.sourceRegistry.runRetries.task_0 } })
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceAfter)
+    let removals = 0, undone
+    fs.unlink = async (...args) => {
+      if (args[0] !== h.targetFile || !scenario.startsWith('E')) return original(...args)
+      removals++
+      if (scenario === 'ENOENT') await original(...args)
+      throw Object.assign(new Error('fixture registry removal failure'), { code: scenario })
+    }
+    syncBuiltinESMExports()
+    try {
+      if (scenario === 'EACCES') await assert.rejects(undo(h.paths, { processes: [] }), { code: scenario, message: 'fixture registry removal failure' })
+      else undone = await undo(h.paths, { processes: [] })
+    } finally { fs.unlink = original; syncBuiltinESMExports() }
+    if (scenario.startsWith('E')) assert.equal(removals, 1)
+    if (scenario === 'EACCES') {
+      assert.deepEqual(await readFile(h.targetFile), target)
+      undone = await finishWorkflow(h.paths, { processes: [] })
+    }
+    assert.ok(undone.dest)
+    assert.deepEqual(await readdir(h.dir('T')), registry ? ['scheduled-tasks.json'] : [])
+    assert.deepEqual(await readFile(h.targetFile).then(JSON.parse, error => { if (error.code === 'ENOENT') return null; throw error }), registry)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    for (const sid of [SOURCE, h.run, h.second, h.cold]) assert.ok(await readFile(path.join(h.dir('P'), `local_${sid}.json`)))
+  }
+})
+
+test('task notification identities may differ from CLI ids and remain protected during recovery', async () => {
+  const h = await taskFamilyFixture()
+  h.notificationId = id(714)
+  await h.record('P', SOURCE, rehomeRecord({ sessionId: `local_${h.notificationId}` }))
+  await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('P'), `local_${h.notificationId}.json`))
+  for (const task of h.tasks) task.notifySessionId = `local_${h.notificationId}`
+  for (const [index, sid] of [h.run, h.second].entries()) await h.record('P', sid, rehomeRecord({ scheduledTaskId: h.tasks[index].id, notifySessionId: `local_${h.notificationId}` }))
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  await interruptTaskFamily(h, 'move', 'record')
+  const file = path.join(h.dir('T'), `local_${h.notificationId}.json`), before = await readFile(file)
+  await writeFile(file, JSON.stringify({ ...JSON.parse(before), title: 'Changed after interruption' }))
+  const refused = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(refused.recoveryRequired, true)
+  assert.match(refused.reconciled.error, /task.*record changed/)
+  await writeFile(file, before)
+  await finishWorkflow(h.paths, { processes: [] })
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.ok, true)
+  assert.equal(JSON.parse(await readFile(file)).sessionId, `local_${h.notificationId}`)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+})
+
+test('task registry edits during publication and Undo retain their values and recovery', async () => {
+  for (const phase of ['publication', 'undo']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (phase === 'undo') await executeMove([from], to, h.paths, { processes: [] })
+    const hook = phase === 'publication' ? 'writeFile' : 'rename', original = fs[hook]
+    let injected = false
+    fs[hook] = async (...args) => {
+      const result = await original(...args)
+      const matches = phase === 'publication' ? String(args[0]).startsWith(h.targetFile + '.') : args[0] === path.join(h.dir('T'), `local_${SOURCE}.json`)
+      if (matches && !injected) {
+        injected = true
+        const registry = JSON.parse(await readFile(h.targetFile))
+        registry.duringWrite = { preserved: true }
+        if (phase === 'undo') registry.scheduledTasks.push({ ...h.tasks[0], enabled: true })
+        await originalWrite(h.targetFile, JSON.stringify(registry))
+      }
+      return result
+    }
+    const originalWrite = phase === 'publication' ? original : fs.writeFile
+    syncBuiltinESMExports()
+    let result
+    try { result = phase === 'publication' ? await executeMove([from], to, h.paths, { processes: [] }) : await undo(h.paths, { processes: [] }) }
+    finally { fs[hook] = original; syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)).duringWrite, { preserved: true })
+    if (phase === 'publication') {
+      assert.equal(result.ok, false)
+      assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+      assert.equal((await finishHeld(h.paths, { processes: [] })).ok, true)
+      assert.ok((await undo(h.paths, { processes: [] })).dest)
+    } else {
+      assert.match(result.restoreProblems.join(' '), /scheduled task/)
+      const registry = JSON.parse(await readFile(h.targetFile))
+      assert.equal(registry.scheduledTasks.find(task => task.id === h.tasks[0].id).enabled, true)
+      registry.scheduledTasks = registry.scheduledTasks.filter(task => !h.tasks.some(owned => owned.id === task.id))
+      await writeFile(h.targetFile, JSON.stringify(registry))
+      assert.ok((await finishWorkflow(h.paths, { processes: [] })).dest)
+    }
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { ...h.targetRegistry, duringWrite: { preserved: true } })
+  }
+})
+
+test('a late destination alias cannot take a task family through an id collision', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), alias = id(715)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  await h.record('T', SOURCE, rehomeRecord({ sessionId: `local_${alias}` }))
+  await rename(path.join(h.dir('T'), `local_${SOURCE}.json`), path.join(h.dir('T'), `local_${alias}.json`))
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.match(result.receipt.failed.at(-1).error, /session id collision/)
+})
+
 test('rehome eligibility stays narrow around ownership locks', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
@@ -3704,7 +4979,9 @@ test('unreadable Desktop metadata stops retirement and preserves recoverable sou
     assert.deepEqual(await readFile(file), bytes)
     assert.equal(JSON.parse(await readFile(path.join(h.dir('T'), path.basename(file)))).sessionId, JSON.parse(bytes).sessionId)
   }
-  assert.equal((await sweep(h.paths, { processes: [] })).complete, false)
+  const swept = await sweep(h.paths, { processes: [] })
+  assert.equal(swept.complete, true)
+  assert.match(swept.verification.notMoved.at(-1).error, /unreadable Desktop record/)
   await unlink(corruptFile)
   assert.ok((await undo(h.paths)).dest)
   for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
@@ -4377,6 +5654,66 @@ test('a thousand source records finish one restart with bounded polling and a li
   assert.equal((await readdir(h.dir('T'))).length, 0)
 })
 
+test('a thousand records in one task family finish the real restart budget with linear reads', async t => {
+  const h = await home(), amount = 1000, first = id(10000)
+  const registry = { scheduledTasks: [{ id: 'large_task', notifySessionId: `local_${first}`, enabled: false, fireAt: 123456 }],
+    recordedSkips: { large_task: [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }] },
+    runRetries: { large_task: { slot: '2026-09-02T00:00:00Z', attempts: 2, notBefore: '2026-09-02T00:05:00Z' } } }
+  for (let i = 0; i < amount; i++) {
+    const sid = id(10000 + i)
+    await h.write(sid, [entry('user', 20000 + i, null, sid)])
+    await h.record('P', sid, rehomeRecord(i ? { scheduledTaskId: 'large_task', notifySessionId: `local_${first}` } : {}))
+  }
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  await writeFile(sourceFile, JSON.stringify(registry))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = [desktopFixture()[0]], recordReads = 0, namespaceReads = 0
+  const calls = [], io = { inspect: () => rows, command: async file => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  assert.equal(planned.plan.held.length, amount)
+  const read = fs.readFile, list = fs.readdir
+  fs.readFile = async (...args) => {
+    if (/^local_.*\.json$/.test(path.basename(String(args[0])))) recordReads++
+    return read(...args)
+  }
+  fs.readdir = async (...args) => {
+    if ([h.dir('P'), h.dir('T')].includes(args[0])) namespaceReads++
+    return list(...args)
+  }
+  syncBuiltinESMExports()
+  const began = performance.now()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token }) }
+  finally { fs.readFile = read; fs.readdir = list; syncBuiltinESMExports() }
+  const seconds = (performance.now() - began) / 1000
+  t.diagnostic(JSON.stringify({ benchmark: 'task-family-1000', root: h.root, seconds, recordReads, namespaceReads,
+    moved: result.receipt?.sessions.length ?? 0, ok: result.ok, reason: result.reason ?? null }))
+  assert.equal(result.ok, true, result.reason)
+  assert.equal(result.restarted, true)
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(result.receipt.sessions.length, amount)
+  assert.equal(result.receipt.superseded.length, amount)
+  assert.equal(result.receipt.taskTransfers.length, 1)
+  assert.equal(result.receipt.finalizing, false)
+  assert.deepEqual(JSON.parse(await readFile(sourceFile)), { scheduledTasks: [], recordedSkips: {}, runRetries: {} })
+  assert.deepEqual(JSON.parse(await readFile(targetFile)), registry)
+  assert.deepEqual(await readdir(h.dir('P')), ['scheduled-tasks.json'])
+  assert.equal((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')).length, amount)
+  assert.ok(recordReads < 80 * amount, `Unexpected record reads: ${recordReads}`)
+  assert.ok(namespaceReads < 80, `Unexpected namespace scans: ${namespaceReads}`)
+  const receipt = JSON.parse(await readFile(result.file))
+  assert.equal(receipt.taskTransfers[0].links.length, amount)
+  assert.equal(receipt.taskTransfers[0].recordIds.length, amount)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(sourceFile)), registry)
+  assert.equal((await readdir(h.dir('P'))).filter(name => name.startsWith('local_')).length, amount)
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
 test('interrupted placement replays complete journal entries and ignores only a torn final append', async () => {
   for (const keep of [3, 4]) {
     const h = await home()
@@ -4646,6 +5983,11 @@ test('process registry identifies a new worker without argv ids and rejects stal
 
 test('Swift preserves command, progress, metadata, and completion states', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
+  const checkpointAccounts = await checkpointAccountsFixture()
+  const h = await taskFamilyFixture(true, 1)
+  await interruptTaskFamily(h, 'move', 'target')
+  const recoveryAccounts = await cli(h.root, ['accounts', '--json'])
+  assert.equal(recoveryAccounts.code, 0)
   let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct TransplantApp: App {')[0]
   const start = source.indexOf('    private func run(_ args: [String]')
   const end = source.indexOf('\nstruct RowKey: PreferenceKey', start)
@@ -4655,7 +5997,7 @@ test('Swift preserves command, progress, metadata, and completion states', async
     }
 }
 ` + source.slice(end)
-  source = source.replace('guard !running, !sweeping, !snapshot else { return }', 'guard !running, !sweeping else { return }')
+  source = source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
   source += String.raw`
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 extension Model {
@@ -4818,6 +6160,70 @@ struct StateChecks {
                 return row
             }), encoding: .utf8)!
         }
+        let corruptedAccounts = String(data: Data(base64Encoded: "CORRUPTED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
+        let repairedAccounts = String(data: Data(base64Encoded: "REPAIRED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
+        let discoveredAccounts = try! JSONDecoder().decode([Account].self, from: Data(corruptedAccounts.utf8))
+        for populated in [false, true] {
+            requests = []
+            let inventory = Model(demo: populated ? Demo.accounts : [])
+            if populated {
+                inventory.note = "An earlier result"
+                inventory.lines = [("metadata", "An earlier detail")]
+                inventory.completion = ("An earlier result", "History verified")
+                inventory.symbol = "info.circle"
+                inventory.badge = "100%"
+                inventory.restartAvailable = true
+            }
+            let previousNote = inventory.note, previousLines = inventory.lines
+            let previousSymbol = inventory.symbol, previousBadge = inventory.badge
+            for _ in 0..<2 {
+                let index = requests.count
+                inventory.refresh()
+                precondition(requests[index].0 == ["accounts", "--json"])
+                requests[index].1(corruptedAccounts)
+                requests[index].2(0, "")
+                precondition(inventory.accounts.map(\.id) == discoveredAccounts.map(\.id))
+                precondition(inventory.accounts.map(\.stats) == discoveredAccounts.map(\.stats))
+                precondition(inventory.displaySummary == "The move receipt needs repair")
+                precondition(inventory.visibleCompletion == nil)
+                precondition(!inventory.canMutate && !inventory.ready && !inventory.pendingReady && !inventory.canKeepLocal)
+                precondition(inventory.recoveryProblem?.receipt == discoveredAccounts[0].recoveryProblem?.receipt)
+                precondition(inventory.detailLines.contains { $0.0 == "recovery" && $0.1 == "Invalid append checkpoint" })
+                precondition(inventory.detailLines.contains { $0.0 == "receipt" && $0.1 == inventory.recoveryProblem?.receipt })
+                precondition(inventory.detailLines.count == previousLines.count + 2)
+                inventory.move()
+                inventory.finishPending()
+                inventory.keepLocal()
+                inventory.undo()
+                inventory.restartDesktop()
+                inventory.checkSweep()
+                precondition(requests.count == index + 1 && !inventory.running && !inventory.sweeping)
+            }
+            let index = requests.count
+            inventory.refresh()
+            requests[index].1(repairedAccounts)
+            requests[index].2(0, "")
+            precondition(inventory.recoveryProblem == nil && inventory.canMutate)
+            precondition(inventory.pendingReady && !inventory.ready && !inventory.canKeepLocal)
+            precondition(inventory.note == previousNote && inventory.lines.elementsEqual(previousLines, by: ==))
+            precondition(inventory.symbol == previousSymbol && inventory.badge == previousBadge)
+            precondition(inventory.restartAvailable == populated)
+            precondition(inventory.detailLines.elementsEqual(previousLines, by: ==))
+            precondition(inventory.displaySummary == (populated ? previousNote : "Finish the interrupted move"))
+            inventory.finishPending()
+            precondition(requests.last!.0 == ["finish", "--json"] && inventory.running)
+        }
+        requests = []
+        let taskRecovery = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(base64Encoded: "TASK_RECOVERY_ACCOUNTS")!))
+        precondition(taskRecovery.pendingReady && !taskRecovery.ready && !taskRecovery.canKeepLocal)
+        precondition(taskRecovery.pendingButtonTitle == "Finish move")
+        precondition(taskRecovery.pendingPrompt == "Finish the interrupted move")
+        taskRecovery.skipRestartWarning = true
+        taskRecovery.finishPending()
+        precondition(requests[0].0 == ["finish", "--json"])
+        requests[0].1(#"{"plan":true,"kind":"recover","token":"task-recovery-token","affected":[]}"#)
+        requests[0].2(0, "")
+        precondition(requests[1].0 == ["finish", "--json", "--restart-approved", "task-recovery-token"])
         requests = []
         let recovering = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
         recovering.finishPending()
@@ -4902,10 +6308,25 @@ struct StateChecks {
         requests[1].2(0, "")
         precondition(failed.note == "1 need attention")
         precondition(failed.lines.contains { $0.1.contains("conflicting history") })
+        requests = []
+        let completedCloud = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        completedCloud.finishPending()
+        requests[0].1(#"{"done":true,"ok":true,"complete":true,"moved":1,"failed":[],"notMoved":[{"id":"fixture","title":"Earlier refusal","error":"task family missing"}]}"#)
+        requests[0].2(0, "")
+        requests[1].1(accountResponse(false))
+        requests[1].2(0, "")
+        precondition(!completedCloud.note.contains("attention"))
+        precondition(completedCloud.lines.contains { $0.0 == "not moved" && $0.1.contains("task family missing") })
+        let recoveredCloud = failedFinishModel()
+        sweepReply(recoveredCloud, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[],"notMoved":[{"id":"fixture","error":"task family missing"}]}"#)
+        precondition(recoveredCloud.note == "No remaining work")
         print("Swift queue and metadata states passed")
     }
 }
 `
+  source = source.replace('TASK_RECOVERY_ACCOUNTS', Buffer.from(recoveryAccounts.stdout.trim()).toString('base64'))
+  source = source.replace('CORRUPTED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.corrupted).toString('base64'))
+  source = source.replace('REPAIRED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.repaired).toString('base64'))
   const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
   await writeFile(file, source)
   await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
