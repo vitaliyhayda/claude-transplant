@@ -33,8 +33,8 @@ const HELP = `claude-transplant   move Claude Code history between accounts
 
   claude-transplant             pick from → to, move, retire the source entries, print receipt
   claude-transplant --dry-run   plan only, write nothing, refuses while a move or recovery is pending
-  claude-transplant undo        quarantine the last move, put the source entries back
-  claude-transplant finish      finish held local records or active-source cloud work
+  claude-transplant undo        restore source entries and task registrations, with restart approval if needed
+  claude-transplant finish      recover interrupted transfers, finish held records or active-source cloud work
   claude-transplant keep-local  cancel held work and cloud checks, keep completed moves
   claude-transplant accounts    list accounts
   claude-transplant restart     plan an explicit Desktop restart
@@ -1773,8 +1773,8 @@ async function latestReceipt(paths) {
   return receipt ? { name, file, receipt } : { name, file, corrupt: true }
 }
 
-async function deferredWorkflow(paths) {
-  const latest = await latestReceipt(paths)
+async function deferredWorkflow(paths, latest) {
+  if (latest === undefined) latest = await latestReceipt(paths)
   if (!latest || latest.corrupt) return null
   const { receipt } = latest
   if (receipt.remoteUndoing?.length) {
@@ -4126,7 +4126,12 @@ async function main(argv) {
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
     if (args.json) {
-      const deferred = await deferredWorkflow(paths)
+      const latest = await latestReceipt(paths)
+      let recoveryProblem = null
+      const deferred = await deferredWorkflow(paths, latest).catch(error => {
+        recoveryProblem = { receipt: latest.file, error: error.message }
+        return null
+      })
       const table = deferred ? processTable(paths.claudeApp) : []
       return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
@@ -4154,7 +4159,8 @@ async function main(argv) {
           receiptMoved: source ? deferred.receipt.sessions.length : null,
           receiptDestination: source ? `${deferred.receipt.toAccount.account}/${deferred.receipt.toAccount.org}` : null,
           pendingFailures: source?.failures ?? [],
-          receipt: source ? deferred.file : null
+          receipt: source ? deferred.file : null,
+          recoveryProblem
         }
       }))
     }

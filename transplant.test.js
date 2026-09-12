@@ -3499,6 +3499,44 @@ async function taskCheckpointFixture() {
   return { ...h, sessions, tasks, sourceFile, targetFile, sourceRegistry, originalRecords }
 }
 
+async function checkpointAccountsFixture() {
+  const h = await taskCheckpointFixture()
+  await interruptTaskFamily({ ...h, interruptAfter: 2 }, 'move', 'source')
+  const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+  const original = await readFile(file), receipt = JSON.parse(original)
+  assert.equal(receipt.taskTransfers.length, 2)
+  assert.deepEqual([receipt.appendCheckpoint.sessions, receipt.appendCheckpoint.superseded, receipt.appendCheckpoint.taskTransfers], [1, 1, 1])
+  receipt.appendCheckpoint.taskTransfers = 0
+  await writeFile(file, JSON.stringify(receipt))
+  const before = await fixtureSnapshot(h)
+  const discovered = (await accounts(h.paths, [])).map(row => [row.account, row.org, row.sessions.length, row.unreadable.length])
+  const corrupted = await cli(h.root, ['accounts', '--json'])
+  assert.equal(corrupted.code, 0, corrupted.stderr)
+  assert.equal(lines(corrupted.stdout).length, 1)
+  const listed = lines(corrupted.stdout)[0]
+  assert.equal(listed.length, 4)
+  assert.deepEqual(listed.map(row => [row.account, row.org, row.sessions, row.unreadable]), discovered)
+  for (const row of listed) {
+    assert.deepEqual(row.recoveryProblem, { receipt: file, error: 'invalid append checkpoint' })
+    assert.equal(row.pending, null)
+    assert.equal(row.pendingAction, null)
+  }
+  assert.deepEqual(await fixtureSnapshot(h), before)
+  await writeFile(file, original)
+  const repairedBefore = await fixtureSnapshot(h)
+  const repaired = await cli(h.root, ['accounts', '--json'])
+  assert.equal(repaired.code, 0, repaired.stderr)
+  const restored = lines(repaired.stdout)[0]
+  assert.ok(restored.every(row => row.recoveryProblem === null))
+  assert.deepEqual(restored.filter(row => row.pending).map(row => [row.account, row.pending, row.pendingAction, row.receipt]), [[h.acct.P, 'recovery', 'finish', file]])
+  assert.deepEqual(await fixtureSnapshot(h), repairedBefore)
+  return { corrupted: corrupted.stdout.trim(), repaired: repaired.stdout.trim() }
+}
+
+test('CLI accounts reports checkpoint corruption without changing recovery data', async () => {
+  await checkpointAccountsFixture()
+})
+
 test('Undo validates every supplied approval before changing records or receipts', async () => {
   for (const scenario of ['stale receipt', 'invalid', 'empty', 'wrong operation', 'consumed', 'stopped scheduler', 'pending recovery']) {
     const h = await taskFamilyFixture(), { from, to } = await h.selection()
@@ -5946,6 +5984,7 @@ test('process registry identifies a new worker without argv ids and rejects stal
 
 test('Swift preserves command, progress, metadata, and completion states', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
+  const checkpointAccounts = await checkpointAccountsFixture()
   const h = await taskFamilyFixture(true, 1)
   await interruptTaskFamily(h, 'move', 'target')
   const recoveryAccounts = await cli(h.root, ['accounts', '--json'])
@@ -5959,7 +5998,7 @@ test('Swift preserves command, progress, metadata, and completion states', async
     }
 }
 ` + source.slice(end)
-  source = source.replace('guard !running, !sweeping, !snapshot else { return }', 'guard !running, !sweeping else { return }')
+  source = source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
   source += String.raw`
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 extension Model {
@@ -6122,6 +6161,59 @@ struct StateChecks {
                 return row
             }), encoding: .utf8)!
         }
+        let corruptedAccounts = String(data: Data(base64Encoded: "CORRUPTED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
+        let repairedAccounts = String(data: Data(base64Encoded: "REPAIRED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
+        let discoveredAccounts = try! JSONDecoder().decode([Account].self, from: Data(corruptedAccounts.utf8))
+        for populated in [false, true] {
+            requests = []
+            let inventory = Model(demo: populated ? Demo.accounts : [])
+            if populated {
+                inventory.note = "An earlier result"
+                inventory.lines = [("metadata", "An earlier detail")]
+                inventory.completion = ("An earlier result", "History verified")
+                inventory.symbol = "info.circle"
+                inventory.badge = "100%"
+                inventory.restartAvailable = true
+            }
+            let previousNote = inventory.note, previousLines = inventory.lines
+            let previousSymbol = inventory.symbol, previousBadge = inventory.badge
+            for _ in 0..<2 {
+                let index = requests.count
+                inventory.refresh()
+                precondition(requests[index].0 == ["accounts", "--json"])
+                requests[index].1(corruptedAccounts)
+                requests[index].2(0, "")
+                precondition(inventory.accounts.map(\.id) == discoveredAccounts.map(\.id))
+                precondition(inventory.accounts.map(\.stats) == discoveredAccounts.map(\.stats))
+                precondition(inventory.displaySummary == "The move receipt needs repair")
+                precondition(inventory.visibleCompletion == nil)
+                precondition(!inventory.canMutate && !inventory.ready && !inventory.pendingReady && !inventory.canKeepLocal)
+                precondition(inventory.recoveryProblem?.receipt == discoveredAccounts[0].recoveryProblem?.receipt)
+                precondition(inventory.detailLines.contains { $0.0 == "recovery" && $0.1 == "Invalid append checkpoint" })
+                precondition(inventory.detailLines.contains { $0.0 == "receipt" && $0.1 == inventory.recoveryProblem?.receipt })
+                precondition(inventory.detailLines.count == previousLines.count + 2)
+                inventory.move()
+                inventory.finishPending()
+                inventory.keepLocal()
+                inventory.undo()
+                inventory.restartDesktop()
+                inventory.checkSweep()
+                precondition(requests.count == index + 1 && !inventory.running && !inventory.sweeping)
+            }
+            let index = requests.count
+            inventory.refresh()
+            requests[index].1(repairedAccounts)
+            requests[index].2(0, "")
+            precondition(inventory.recoveryProblem == nil && inventory.canMutate)
+            precondition(inventory.pendingReady && !inventory.ready && !inventory.canKeepLocal)
+            precondition(inventory.note == previousNote && inventory.lines.elementsEqual(previousLines, by: ==))
+            precondition(inventory.symbol == previousSymbol && inventory.badge == previousBadge)
+            precondition(inventory.restartAvailable == populated)
+            precondition(inventory.detailLines.elementsEqual(previousLines, by: ==))
+            precondition(inventory.displaySummary == (populated ? previousNote : "Finish the interrupted move"))
+            inventory.finishPending()
+            precondition(requests.last!.0 == ["finish", "--json"] && inventory.running)
+        }
         requests = []
         let taskRecovery = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(base64Encoded: "TASK_RECOVERY_ACCOUNTS")!))
         precondition(taskRecovery.pendingReady && !taskRecovery.ready && !taskRecovery.canKeepLocal)
@@ -6234,6 +6326,8 @@ struct StateChecks {
 }
 `
   source = source.replace('TASK_RECOVERY_ACCOUNTS', Buffer.from(recoveryAccounts.stdout.trim()).toString('base64'))
+  source = source.replace('CORRUPTED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.corrupted).toString('base64'))
+  source = source.replace('REPAIRED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.repaired).toString('base64'))
   const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
   await writeFile(file, source)
   await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })

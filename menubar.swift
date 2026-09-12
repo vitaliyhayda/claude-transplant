@@ -20,6 +20,7 @@ struct Account: Decodable, Identifiable {
     var receiptMoved: Int? = nil
     var receiptDestination: String? = nil
     var receipt: String? = nil
+    var recoveryProblem: RecoveryProblem? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
@@ -34,6 +35,11 @@ struct Config: Decodable {
 struct Failure: Decodable {
     let id: String?
     let title: String?
+    let error: String
+}
+
+struct RecoveryProblem: Decodable {
+    let receipt: String
     let error: String
 }
 
@@ -292,10 +298,12 @@ final class Model: ObservableObject {
     var identityLabel: String? { accounts.contains { $0.active == true } ? nil : accounts.first?.identityState == "logged-out" ? "signed out" : "unknown" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
-    var canKeepLocal: Bool { !running && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
-    var pendingReady: Bool { !running && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.active == true ? "finish" : "sign-in")) } && (config != nil || demo) }
+    var recoveryProblem: RecoveryProblem? { accounts.compactMap(\.recoveryProblem).first }
+    var canMutate: Bool { !running && recoveryProblem == nil }
+    var canKeepLocal: Bool { canMutate && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
+    var pendingReady: Bool { canMutate && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.active == true ? "finish" : "sign-in")) } && (config != nil || demo) }
     var pendingButtonTitle: String { pendingAccounts.contains { $0.pendingAction == "restart" } ? "Stop and restart" : pendingAccounts.contains { $0.pending == "undo" } ? "Finish Undo" : "Finish move" }
-    var ready: Bool { !running && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
+    var ready: Bool { canMutate && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty else { return "" }
         if pendingAccounts.contains(where: { $0.pending == "recovery" }) { return "Finish the interrupted move" }
@@ -311,15 +319,16 @@ final class Model: ObservableObject {
         return parts.isEmpty ? "Remaining sessions are ready to move" : parts.joined(separator: ", ")
     }
     var detailLines: [(String, String)] {
-        if !lines.isEmpty { return lines }
-        return pendingAccounts.flatMap { account in
+        let recovery = recoveryProblem.map { [("recovery", $0.error.sentence), ("receipt", $0.receipt)] } ?? []
+        if !lines.isEmpty { return recovery + lines }
+        return recovery + pendingAccounts.flatMap { account in
             (account.pendingWaiting ?? []).map { ("open", $0.title) } +
             (account.pendingFailures ?? []).map { ("issue", identity($0.title, $0.id) + " | " + $0.error) }
         }
     }
-    var displaySummary: String { running ? progressLabel : note.isEmpty ? pendingPrompt : note }
+    var displaySummary: String { recoveryProblem != nil ? "The move receipt needs repair" : running ? progressLabel : note.isEmpty ? pendingPrompt : note }
     var visibleCompletion: (summary: String, detail: String)? {
-        !running && completion?.summary == note ? completion : nil
+        canMutate && completion?.summary == note ? completion : nil
     }
 
     func canSource(_ account: Account) -> Bool { account.id != to }
@@ -406,7 +415,7 @@ final class Model: ObservableObject {
     }
 
     func undo() {
-        guard !running else { return }
+        guard canMutate else { return }
         start(["undo", "--json"])
     }
 
@@ -521,7 +530,7 @@ final class Model: ObservableObject {
     }
 
     func restartDesktop() {
-        guard !running else { return }
+        guard canMutate else { return }
         start(["restart", "--json"])
     }
 
@@ -587,7 +596,7 @@ final class Model: ObservableObject {
     }
 
     private func sweep() {
-        guard !running, !sweeping, !snapshot else { return }
+        guard canMutate, !sweeping, !snapshot else { return }
         sweeping = true
         var result: Event?
         run(["sweep", "--json"], line: { line in
@@ -961,7 +970,7 @@ struct Panel: View {
                 Spacer()
                 Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            accountBoard.disabled(model.running || !model.pendingAccounts.isEmpty)
+            accountBoard.disabled(!model.canMutate || !model.pendingAccounts.isEmpty)
             if !model.displaySummary.isEmpty { Divider() }
             if model.running {
                 Bar(value: model.moveProgress.value)
@@ -988,6 +997,7 @@ struct Panel: View {
             }
             if model.restartAvailable {
                 Button(action: { model.restartDesktop() }) { Text("Restart Claude Desktop to see them").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
+                    .disabled(!model.canMutate)
             }
             HStack(spacing: 10) {
                 if model.pendingAccounts.isEmpty {
@@ -996,7 +1006,7 @@ struct Panel: View {
                     if model.pendingReady { Pill(title: model.pendingButtonTitle, prominent: true, enabled: true) { model.finishPending() } }
                     if model.canKeepLocal { Pill(title: "Keep completed", prominent: false, enabled: model.canKeepLocal) { model.keepLocal() } }
                 }
-                Pill(title: "Undo last", prominent: false, enabled: !model.running) { model.undo() }
+                Pill(title: "Undo last", prominent: false, enabled: model.canMutate) { model.undo() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
@@ -1210,7 +1220,7 @@ struct TransplantApp: App {
         MenuBarExtra {
             Panel().environmentObject(model).environment(\.controlActiveState, .key).environment(\.colorScheme, .dark)
         } label: {
-            MenuLabel(symbol: model.symbol, badge: model.badge)
+            MenuLabel(symbol: model.recoveryProblem == nil ? model.symbol : "exclamationmark.triangle", badge: model.recoveryProblem == nil ? model.badge : "")
                 .help(model.running ? "Estimated completion" : "Claude Transplant")
         }
         .menuBarExtraStyle(.window)
