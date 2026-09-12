@@ -71,7 +71,19 @@ const waitingSessions = (receipt) => [...new Map([
 ].map(row => [row.localId ?? remoteId(row.id) ?? row.id, row])).values()]
 const legacyLocalFailures = (receipt) => receipt.localCancelledAt ? [] : (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
 const needsRecovery = (receipt) => Boolean(receipt.pending || receipt.retiring || receipt.finalizing || receipt.undoing || receipt.remotePending || receipt.remoteUndoing?.length)
-const recoveryFamilies = (receipt) => (receipt.taskTransfers ?? []).slice(receipt.undoing ? 0 : receipt.appendCheckpoint?.taskTransfers ?? 0)
+const recoveryFamilies = (receipt) => {
+  const transfers = receipt.taskTransfers ?? [], checkpoint = receipt.appendCheckpoint
+  if (!checkpoint) return transfers
+  if (['sessions', 'superseded'].some(key => !Number.isSafeInteger(checkpoint[key]) || checkpoint[key] < 0 || checkpoint[key] > (receipt[key]?.length ?? 0)) || !Array.isArray(checkpoint.held)) throw new Error('invalid append checkpoint')
+  if (receipt.undoing) return transfers
+  const offset = checkpoint.taskTransfers === undefined && !transfers.length ? 0 : checkpoint.taskTransfers
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > transfers.length) throw new Error('invalid append checkpoint')
+  const committed = (receipt.sessions ?? []).slice(0, checkpoint.sessions).filter(row => row.taskFamily).map(row => [row.taskFamily, row.targetRecordId])
+  const expected = transfers.slice(0, offset).flatMap(family => family.recordIds.map(id => [family.key, id]))
+  const retired = new Set((receipt.superseded ?? []).slice(0, checkpoint.superseded).filter(row => row.source).flatMap(row => row.moved.map(([file]) => file)))
+  if (stable(committed.sort()) !== stable(expected.sort()) || transfers.some((family, index) => family.files.some(file => retired.has(file) !== (index < offset)))) throw new Error('invalid append checkpoint')
+  return transfers.slice(offset)
+}
 const inspector = (paths, options) => options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
 const receiptOkay = (receipt) => receipt.verification?.ok !== false && !receipt.failed?.length
 const finishOkay = (receipt) => receipt.verification?.ok !== false && !receipt.verification?.problems?.length &&
@@ -2131,11 +2143,9 @@ async function reconcileFiles(paths, options = {}) {
   }
   const { receipt } = p
   const inspect = inspector(paths, options)
-  const checkpoint = receipt.appendCheckpoint
   const taskTransfers = recoveryFamilies(receipt)
   const taskProblems = await taskTransferProblems(taskTransfers, paths, inspect, true, options.check)
   if (taskProblems.length && !(receipt.undoing && receipt.remoteUndoing?.length && taskProblems.every(problem => problem === SCHEDULER_OWNS) && !options.check)) return { title: 'scheduled task recovery blocked', error: taskProblems.join(', '), problems: taskProblems }
-  if (checkpoint && (!Number.isSafeInteger(checkpoint.sessions) || checkpoint.sessions < 0 || checkpoint.sessions > (receipt.sessions?.length ?? 0) || !Number.isSafeInteger(checkpoint.superseded) || checkpoint.superseded < 0 || checkpoint.superseded > (receipt.superseded?.length ?? 0) || !Array.isArray(checkpoint.held))) return { title: 'recovery blocked', error: 'invalid append checkpoint' }
   receipt.failed ??= []
   receipt.superseded ??= []
   if (receipt.undoing) {

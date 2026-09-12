@@ -463,7 +463,7 @@ test('held continuation shares one receipt and Undo restores both phases', async
   assert.deepEqual(await readdir(h.dir('T')), [])
 })
 
-test('a failed held continuation preserves the earlier completed phase', async () => {
+test('a failed held continuation preserves the earlier completed phase with a legacy checkpoint', async () => {
   const h = await home()
   const cold = id(300)
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -473,6 +473,11 @@ test('a failed held continuation preserves the earlier completed phase', async (
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
   await assert.rejects(finishHeld(h.paths, { processes: [], report: (stage, text) => { if (stage === 'retire' && text === 'checking') throw new Error('interrupted append') } }), /interrupted append/)
+  const interrupted = JSON.parse(await readFile(first.file))
+  assert.equal(interrupted.appendCheckpoint.taskTransfers, 0)
+  delete interrupted.appendCheckpoint.taskTransfers
+  delete interrupted.taskTransfers
+  await writeFile(first.file, JSON.stringify(interrupted))
   const recovered = await undo(h.paths)
   assert.ok(recovered.reconciled)
   const receipt = JSON.parse(await readFile(first.file))
@@ -3478,6 +3483,22 @@ async function fixtureSnapshot(h, directories = [h.paths.records, h.paths.pool, 
   return files
 }
 
+async function taskCheckpointFixture() {
+  const h = await home(), sessions = [SOURCE, id(791)]
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  const tasks = sessions.map((sid, index) => ({ id: `task_${index + 1}`, notifySessionId: `local_${sid}`, enabled: true, fireAt: 123456 + index }))
+  const sourceRegistry = { scheduledTasks: tasks,
+    recordedSkips: Object.fromEntries(tasks.map(task => [task.id, [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }]])),
+    runRetries: Object.fromEntries(tasks.map(task => [task.id, { slot: '2026-09-02T00:00:00Z', attempts: 2, notBefore: '2026-09-02T00:05:00Z' }])) }
+  for (const [index, sid] of sessions.entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const originalRecords = await Promise.all(sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`))))
+  await writeFile(sourceFile, JSON.stringify(sourceRegistry))
+  return { ...h, sessions, tasks, sourceFile, targetFile, sourceRegistry, originalRecords }
+}
+
 test('Undo validates every supplied approval before changing records or receipts', async () => {
   for (const scenario of ['stale receipt', 'invalid', 'empty', 'wrong operation', 'consumed', 'stopped scheduler', 'pending recovery']) {
     const h = await taskFamilyFixture(), { from, to } = await h.selection()
@@ -3598,6 +3619,106 @@ test('task recovery scopes validation, restart and accounts to the unfinished fa
     assert.match(refused.restoreProblems.join(' '), /registrations changed/)
     assert.deepEqual(await fixtureSnapshot(h), before)
   }
+})
+
+test('task checkpoint integrity refuses corruption before recovery writes or restart', async t => {
+  const checkpoints = [
+    ['inconsistent zero', { taskTransfers: 0 }],
+    ['missing offset', { taskTransfers: undefined }],
+    ['null offset', { taskTransfers: null }],
+    ['negative offset', { taskTransfers: -1 }],
+    ['fractional offset', { taskTransfers: 0.5 }],
+    ['out-of-range offset', { taskTransfers: 3 }],
+    ['uncommitted family offset', { taskTransfers: 2 }],
+    ['missing committed records', { sessions: 0 }],
+    ['missing committed retirement', { superseded: 0 }],
+    ['valid checkpoint', {}]
+  ]
+  for (const mode of ['stopped Desktop', 'approved restart']) for (const [scenario, patch] of checkpoints) await t.test(`${scenario}, ${mode}`, async () => {
+    const h = await taskCheckpointFixture(), { sessions, tasks, sourceFile, targetFile, sourceRegistry, originalRecords } = h
+    await interruptTaskFamily({ ...h, interruptAfter: 2 }, 'move', 'source')
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+    const interrupted = JSON.parse(await readFile(file)), checkpoint = interrupted.appendCheckpoint
+    assert.equal(interrupted.finalizing, true)
+    assert.deepEqual([checkpoint.sessions, checkpoint.superseded, checkpoint.taskTransfers], [1, 1, 1])
+    assert.equal(interrupted.taskTransfers.length, 2)
+    const targetBefore = await readFile(targetFile), firstRecord = await readFile(path.join(h.dir('T'), `local_${sessions[0]}.json`))
+    assert.deepEqual(JSON.parse(targetBefore).scheduledTasks, [tasks[0]])
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)).scheduledTasks, [])
+    let rows = mode === 'approved restart' ? [desktopFixture()[0]] : []
+    const calls = [], io = { inspect: () => rows, command: async name => {
+      calls.push(name)
+      rows = name.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]
+      return { status: 0 }
+    } }
+    const planned = mode === 'approved restart' ? await finishWorkflow(h.paths, { io }) : null
+    if (planned) assert.equal(planned.plan.kind, 'recover')
+    const options = { io, processes: [], ...(planned ? { approve: planned.plan.token } : {}) }
+    const planFile = path.join(h.paths.state, 'restart-plan.json'), planBefore = await readFile(planFile).catch(() => null)
+    if (scenario !== 'valid checkpoint') {
+      await writeFile(file, JSON.stringify({ ...interrupted, appendCheckpoint: { ...checkpoint, ...patch } }))
+      const before = await fixtureSnapshot(h), writes = []
+      const originals = new Map(['writeFile', 'appendFile', 'open', 'rename', 'link', 'unlink', 'rm'].map(key => [key, fs[key]]))
+      for (const [key, original] of originals) fs[key] = async (...args) => { writes.push(key); return original(...args) }
+      syncBuiltinESMExports()
+      try {
+        await assert.rejects(finishWorkflow(h.paths, options), /invalid append checkpoint/)
+        await assert.rejects(planned
+          ? executeMove(null, null, h.paths, { ...options, recover: true, receiptFile: file })
+          : finishPending(h.paths, options), /invalid append checkpoint/)
+      } finally {
+        for (const [key, original] of originals) fs[key] = original
+        syncBuiltinESMExports()
+      }
+      assert.deepEqual(writes, [])
+      assert.deepEqual(calls, [])
+      assert.deepEqual(await fixtureSnapshot(h), before)
+      assert.deepEqual(await readFile(planFile).catch(() => null), planBefore)
+      const retained = JSON.parse(await readFile(file))
+      assert.equal(retained.finalizing, true)
+      assert.equal(retained.taskTransfers.length, 2)
+      retained.appendCheckpoint = checkpoint
+      await writeFile(file, JSON.stringify(retained))
+    }
+    const recovered = await finishWorkflow(h.paths, options)
+    assert.equal(recovered.recoveryRequired, true)
+    assert.deepEqual(calls, planned ? ['/usr/bin/osascript', '/usr/bin/open'] : [])
+    if (planned) assert.equal(recovered.restarted, true)
+    const receipt = JSON.parse(await readFile(file))
+    assert.equal(receipt.finalizing, false)
+    assert.equal(receipt.appendCheckpoint, undefined)
+    assert.deepEqual(receipt.sessions.map(row => row.id), [sessions[0]])
+    assert.equal(receipt.superseded.length, 1)
+    assert.equal(receipt.taskTransfers.length, 1)
+    assert.deepEqual(await readFile(targetFile), targetBefore)
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)), { scheduledTasks: [tasks[1]],
+      recordedSkips: { task_2: sourceRegistry.recordedSkips.task_2 }, runRetries: { task_2: sourceRegistry.runRetries.task_2 } })
+    assert.deepEqual(await readFile(path.join(h.dir('T'), `local_${sessions[0]}.json`)), firstRecord)
+    assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${sessions[1]}.json`)), originalRecords[1])
+    assert.equal(await stat(path.join(h.dir('P'), `local_${sessions[0]}.json`)).catch(() => null), null)
+    assert.equal(await stat(path.join(h.dir('T'), `local_${sessions[1]}.json`)).catch(() => null), null)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)), sourceRegistry)
+    assert.deepEqual(await Promise.all(sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), originalRecords)
+    assert.equal(await stat(targetFile).catch(() => null), null)
+  })
+})
+
+test('task checkpoint integrity keeps interrupted Undo scoped to the whole receipt', async () => {
+  const h = await taskCheckpointFixture(), all = await accounts(h.paths, [])
+  const moved = await executeMove([all.find(row => row.account === h.acct.P)], all.find(row => row.account === h.acct.T), h.paths, { processes: [] })
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.taskTransfers.length, 2)
+  await interruptTaskFamily(h, 'undo', 'target')
+  const receipt = JSON.parse(await readFile(moved.file))
+  assert.ok(receipt.undoing)
+  receipt.appendCheckpoint = { sessions: 1, superseded: 1, taskTransfers: 1, held: [] }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  assert.ok((await finishWorkflow(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(await Promise.all(h.sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), h.originalRecords)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { scheduledTasks: [], recordedSkips: {}, runRetries: {} })
+  assert.deepEqual(await readdir(h.dir('T')), ['scheduled-tasks.json'])
 })
 
 test('a known account without a Desktop directory receives and undoes a task family', async () => {
@@ -3965,13 +4086,17 @@ async function interruptTaskFamily(h, operation, stage) {
   const hook = stage === 'record' ? 'link' : 'rename'
   const destination = stage === 'record' ? path.join(h.dir('T'), `local_${h.notificationId ?? SOURCE}.json`) : stage === 'source' ? h.sourceFile : h.targetFile
   const script = `
+    import childProcess from 'node:child_process'
     import fs from 'node:fs/promises'
     import { syncBuiltinESMExports } from 'node:module'
     import { accounts, executeMove, layout, undo } from './transplant.js'
+    childProcess.spawnSync = (${fixtureCommand.toString()})(childProcess.spawnSync)
+    childProcess.spawn = (${fixtureCommand.toString()})(childProcess.spawn)
     const original = fs.${hook}
+    let mutations = 0
     fs.${hook} = async (...args) => {
       const result = await original(...args)
-      if (args[1] === ${JSON.stringify(destination)}) process.exit(23)
+      if (args[1] === ${JSON.stringify(destination)} && ++mutations === ${JSON.stringify(h.interruptAfter ?? 1)}) process.exit(23)
       return result
     }
     syncBuiltinESMExports()
@@ -3981,8 +4106,8 @@ async function interruptTaskFamily(h, operation, stage) {
     else await executeMove(${JSON.stringify(h.sourceAccounts ?? [h.acct.P])}.map(account => all.find(row => row.account === account)), all.find(row => row.account === ${JSON.stringify(h.acct.T)}), paths, { processes: [] })
   `
   const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root } })
-    .then(() => 0, error => error.code)
-  assert.equal(result, 23)
+    .then(() => ({ code: 0 }), error => error)
+  assert.equal(result.code, 23, result.stderr)
 }
 
 test('task registry and record interruptions recover in the existing receipt', async () => {
