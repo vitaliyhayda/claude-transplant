@@ -87,7 +87,7 @@ const recoveryFamilies = (receipt) => {
 const inspector = (paths, options) => options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
 const receiptOkay = (receipt) => receipt.verification?.ok !== false && !receipt.failed?.length
 const finishOkay = (receipt) => receipt.verification?.ok !== false && !receipt.verification?.problems?.length &&
-  !(receipt.failed ?? []).some(row => row.cloudAccount) && !receipt.cloudError
+  !(receipt.failed ?? []).some(row => row.cloudAccount) && !(receipt.cloudError && openCloudChecks(receipt).length)
 const problemText = (problem) => `${problem.title ?? problem.id} | ${problem.check} verification failed`
 const cancelCloudChecks = (receipt) => {
   for (const check of openCloudChecks(receipt)) {

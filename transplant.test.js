@@ -1983,16 +1983,30 @@ test('a zero-record source creates no speculative cloud check', async () => {
 
 test('completed local movement suppresses speculative pending', async () => {
   const h = await home()
+  const cloudError = 'authentication unavailable'
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
   await h.record('P', SOURCE, rehomeRecord())
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const result = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudError })
+  assert.deepEqual(inv.cloudCheckAccounts, [])
+  const result = await move(inv, to, h.paths)
 
+  assert.equal(result.ok, true)
   assert.equal(result.complete, true)
   assert.equal(result.pendingCloud, 0)
   assert.deepEqual(result.receipt.cloudChecks, [])
+  assert.equal(result.receipt.sessions[0].strategy, 'rehome')
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+  assert.equal(result.receipt.cloudError, cloudError)
+  const idle = await finishPending(h.paths), swept = await sweep(h.paths)
+  assert.deepEqual([idle, swept].map(({ ok, complete }) => ({ ok, complete })), [
+    { ok: true, complete: true }, { ok: true, complete: true }
+  ])
+  assert.equal(idle.nothing, true)
+  assert.equal(JSON.parse(await readFile(result.file)).cloudError, cloudError)
 })
 
 test('a late move failure restores the source cloud check', async () => {
@@ -2002,12 +2016,16 @@ test('a late move failure restores the source cloud check', async () => {
   const all = await accounts(h.paths)
   const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
   const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
-  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true })
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudError: 'authentication unavailable' })
   await appendFile(path.join(h.project, `${SOURCE}.jsonl`), `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
   const result = await move(inv, to, h.paths)
 
   assert.equal(result.ok, false)
   assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+  assert.equal(result.receipt.cloudError, 'authentication unavailable')
+  assert.deepEqual(result.receipt.verification, { ok: true, problems: [] })
+  assert.equal((await verifyPlaced(h.paths)).ok, false)
   assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
 })
 
