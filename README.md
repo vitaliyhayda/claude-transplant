@@ -36,7 +36,7 @@ Switch accounts in Claude Desktop and the Code sidebar goes empty. The session h
 - Sessions owned by a running Desktop worker are held until you approve a restart, or skipped with Move only the rest.
 - `--cloud` reconciles Remote Control for the signed-in source. No model runs, no artifact is recreated.
 - `undo` reverses the whole move.
-- macOS today, PRs for Windows and Linux welcome. Unofficial, not affiliated with Anthropic.
+- macOS and Windows today, PRs for Linux welcome. Unofficial, not affiliated with Anthropic.
 
 Where it fits next to the other tools people find for this problem:
 
@@ -50,7 +50,7 @@ Where it fits next to the other tools people find for this problem:
 
 ## Install
 
-Node 22 or newer. The menubar also needs the Xcode command line tools: `xcode-select --install`
+Node 22 or newer. The menubar is macOS only and also needs the Xcode command line tools: `xcode-select --install`. Windows needs nothing beyond Node.
 
 ```
 npx claude-transplant menubar   # install the menubar app
@@ -152,7 +152,7 @@ Team owners get usage analytics only. Enterprise compliance tooling can retrieve
 
 ### Does it work on Windows or Linux?
 
-Not yet. Desktop uses the same per-account folder layout there, under its app data directory, so the CLI needs only the platform paths and process checks, and the menubar stays macOS. PRs welcome, and claude-code-session-restorer covers Windows rebuilds meanwhile.
+Windows yes, Linux not yet. The Windows CLI reads the same per-account folder layout under the Store package's `LocalCache\Roaming\Claude` or, for a direct install, `AppData\Roaming\Claude`. Two things stay macOS only there: the menubar app, and `--cloud`, because reading the Desktop login means DPAPI and that path is unverified. Linux PRs welcome.
 
 Shorter answers:
 
@@ -259,12 +259,18 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
+| Read the active account from Desktop's log on Windows | Desktop 2.2553.1 writes no `LocalSessionManager` line at all, mine stop at 2026-08-21, so the identity stays `unknown` there and only the active marker in `accounts` is missing |
+| Fall back to `.claude.json` for the active account when the log is silent | It contradicts the rule that thin evidence stays unknown, an account switch Desktop has not logged would be reported as current |
+| Quit Desktop on Windows the way `osascript` does on macOS | Nothing scripts a tray app, `taskkill` without `/F` asks the window to close and the move stops cleanly when Desktop stays up |
+| Junction every account folder onto one shared folder | Desktop reads through the junction and silently never writes, so every session started afterwards ends up with no record at all |
+| Keep the `lockf` kernel lock | It is macOS only, an exclusive lock file with a holder liveness check replaces it on both platforms |
 
 </details>
 
 ## Limits
 
-- macOS 13 or newer with Claude Desktop. Sign Desktop into the target account to see moved history.
+- macOS 13 or newer, or Windows 10 or newer, with Claude Desktop. Sign Desktop into the target account to see moved history.
+- On Windows the menubar and `--cloud` are unavailable, and `accounts` cannot mark which account is active because Desktop logs no identity line. Pass `--from` and `--to` by email, org name, or uuid prefix.
 - Remote Control ownership does not transfer. Re-enable it per session under the destination account.
 - Artifact ownership, versions, comments, and share links stay with the original account.
 - Embedded base64, text, and HTTP(S) images and documents can be rescued. Account-owned file ids and unknown shapes are refused.
@@ -272,11 +278,12 @@ Active identity comes from the newest complete initialization entry in Claude De
 - File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 - Moving history out of a Team organization is your organization's decision.
 
-| claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
+| claude-transplant | OS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
-| 4.0.6 | 27.0 | 1.52386.3 | 2.1.266 | 2026-09-12 |
+| 4.0.6 | Windows 11 26200 | 2.2553.1 | 2.1.275 | 2026-09-20 |
+| 4.0.6 | macOS 27.0 | 1.52386.3 | 2.1.266 | 2026-09-12 |
 | 4.0.5 | 27.0 | 1.49585.0 | 2.1.260 | 2026-09-08 |
 | 4.0.4 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-08 |
 | 4.0.3 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-07 |
 
-Receipts, quarantine, drift evidence, cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
+Receipts, quarantine, drift evidence, cache, and the menubar app live in `~/Library/Application Support/claude-transplant`, and on Windows in `%LOCALAPPDATA%\claude-transplant`. Delete `quarantine` once its receipts are no longer wanted. An exclusive lock file prevents overlapping runs. MIT.
