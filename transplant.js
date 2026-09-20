@@ -19,9 +19,16 @@ const WORKER_OWNS = 'running worker owns the session'
 const SCHEDULER_OWNS = 'Desktop scheduler requires an approved restart'
 const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
-const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
-const RESTART_BUDGET = 30_000
-const REOPEN_RESERVE = 8_000
+const WINDOWS_DESKTOP = /\\(?:WindowsApps\\Claude_[^\\]+\\app|AnthropicClaude(?:\\app-[^\\]+)?)\\Claude\.exe$/i
+const desktopExecutable = (file) => typeof file === 'string' && (file.endsWith('/Claude.app/Contents/MacOS/Claude') || WINDOWS_DESKTOP.test(file))
+const desktopProcess = (row, app) => row.main !== false && (desktopExecutable(row.executable) || row.executable === path.join(app, 'Contents/MacOS/Claude'))
+const registeredHere = (domain, platform = process.platform) => typeof domain === 'string' && domain.split(':')[0] === platform
+const sameStart = (item, row) => typeof row.fileTime === 'string'
+  ? item.procStart === row.fileTime
+  : Number.isFinite(Date.parse(row.started)) && Date.parse(`${item.procStart} UTC`) === Date.parse(row.started)
+export const RESTART_BUDGET = process.platform === 'win32' ? 60_000 : 30_000
+export const REOPEN_RESERVE = process.platform === 'win32' ? 16_000 : 8_000
+const INSPECTION_PAUSE = process.platform === 'win32' ? 1000 : 100
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
 const CACHE_VERSION = 8
@@ -117,9 +124,25 @@ export function parseProcesses(processes, commands, app = '/Applications/Claude.
       worker: path.basename(executable).toLowerCase() === 'claude' || executable.endsWith('/Claude.app/Contents/Helpers/disclaimer') || executable === path.join(app, 'Contents/Helpers/disclaimer'),
       ids: identities.get(`${match[1]}/${match[3]}`) ?? [] }
   })
+  return linkProcesses(rows, app, registrations, 'darwin')
+}
+
+export function parseWindowsProcesses(processes, app = '', registrations = []) {
+  const rows = processes.split('\n').filter((line) => line.trim()).map((line) => {
+    const [pid, ppid, started, fileTime, executable = '', command = ''] = line.trim().split('\t')
+    if (!/^\d+$/.test(pid) || !/^\d+$/.test(ppid) || !/^\d+$/.test(fileTime ?? '')) throw new Error('cannot parse worker process identity')
+    const main = !command.includes('--type=')
+    return { pid: Number(pid), ppid: Number(ppid), started, fileTime, executable, main,
+      worker: main && path.basename(executable, path.extname(executable)).toLowerCase() === 'claude',
+      ids: (command.match(UUIDS) ?? []).map((id) => id.toLowerCase()) }
+  })
+  return linkProcesses(rows, app, registrations, 'win32')
+}
+
+function linkProcesses(rows, app, registrations, platform) {
   for (const row of rows) {
-    const registered = registrations.find(item => item.pid === row.pid && item.pidDomain === 'darwin' &&
-      Number.isFinite(Date.parse(row.started)) && Date.parse(`${item.procStart} UTC`) === Date.parse(row.started) && UUID.test(item.sessionId ?? ''))
+    const registered = registrations.find(item => item.pid === row.pid && registeredHere(item.pidDomain, platform) &&
+      sameStart(item, row) && UUID.test(item.sessionId ?? ''))
     if (registered && row.worker) {
       row.ids = [...new Set([...row.ids, registered.sessionId.toLowerCase()])]
       row.cwd = typeof registered.cwd === 'string' ? registered.cwd : null
@@ -133,29 +156,38 @@ export function parseProcesses(processes, commands, app = '/Applications/Claude.
     row.desktopPid = null
     while (parent && !visited.has(parent.pid)) {
       visited.add(parent.pid)
-      if (desktopExecutable(parent.executable) || parent.executable === path.join(app, 'Contents/MacOS/Claude')) { row.desktopPid = parent.pid; break }
+      if (desktopProcess(parent, app)) { row.desktopPid = parent.pid; break }
       parent = byPid.get(parent.ppid)
     }
   }
   return rows
 }
 
-const processTable = (app) => {
-  const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000, env: { ...process.env, LC_ALL: 'C' } }
-  const processes = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
-  const commands = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
-  if ([processes, commands].some((result) => result.error || result.status !== 0)) throw new Error('cannot inspect running workers')
+const sessionRegistrations = () => {
   const directory = path.join(os.homedir(), '.claude/sessions')
-  let registrations = []
   try {
-    registrations = readdirSync(directory).filter(name => /^\d+\.json$/.test(name)).flatMap(name => {
+    return readdirSync(directory).filter(name => /^\d+\.json$/.test(name)).flatMap(name => {
       try {
         const row = JSON.parse(readFileSync(path.join(directory, name), 'utf8'))
         return row.pid === Number(name.slice(0, -5)) ? [row] : []
       } catch { return [] }
     })
-  } catch {}
-  return parseProcesses(processes.stdout, commands.stdout, app, registrations)
+  } catch { return [] }
+}
+
+const WINDOWS_PROCESSES = "Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine | Where-Object { $_.CreationDate } | ForEach-Object { '{0}\t{1}\t{2}\t{3}\t{4}\t{5}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToUniversalTime().ToString('o'), $_.CreationDate.ToFileTimeUtc(), $_.ExecutablePath, ($_.CommandLine -replace '[\t\r\n]', ' ') }"
+
+const processTable = (app) => {
+  const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000, env: { ...process.env, LC_ALL: 'C' } }
+  if (process.platform === 'win32') {
+    const listed = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROCESSES], { ...options, timeout: 20_000 })
+    if (listed.error || listed.status !== 0) throw new Error('cannot inspect running workers')
+    return parseWindowsProcesses(listed.stdout, app, sessionRegistrations())
+  }
+  const processes = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
+  const commands = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
+  if ([processes, commands].some((result) => result.error || result.status !== 0)) throw new Error('cannot inspect running workers')
+  return parseProcesses(processes.stdout, commands.stdout, app, sessionRegistrations())
 }
 const workers = (rows = processTable()) => Object.assign(new Set(rows.filter((row) => row.worker && row.pid !== row.desktopPid).flatMap((row) => row.ids)), { rows })
 const ownsWorker = (live, id, recordId) => Boolean(live?.has(id?.toLowerCase()) || live?.has(recordId?.replace(/^local_/, '').toLowerCase()))
@@ -193,7 +225,7 @@ const canRestartWaiting = (receipt, table) => waitingSessions(receipt).some(row 
 })
 
 export async function restartPlan(inv, paths, table = processTable(paths.claudeApp)) {
-  const apps = table.filter((row) => desktopExecutable(row.executable) || row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+  const apps = table.filter((row) => desktopProcess(row, paths.claudeApp))
   if (apps.length !== 1) return null
   const desktop = apps[0]
   const all = await accounts(paths)
@@ -266,7 +298,18 @@ const waitFor = async (predicate, deadline, now = () => performance.now(), wait 
     await wait(Math.min(250, deadline - now()))
   } while (true)
 }
-const appProcess = (paths, table = processTable(paths.claudeApp)) => table.find((row) => row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+const appProcess = (paths, table = processTable(paths.claudeApp)) => table.find((row) => desktopProcess(row, paths.claudeApp))
+const quitDesktop = (paths, pid) => process.platform === 'win32'
+  ? ['taskkill.exe', ['/PID', String(pid)]]
+  : ['/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`]]
+const openDesktop = (paths) => process.platform === 'win32'
+  ? ['cmd.exe', ['/c', 'start', '', paths.claudeApp]]
+  : ['/usr/bin/open', ['-g', '-a', paths.claudeApp]]
+const quitDialog = process.platform === 'win32'
+  ? 'Claude Desktop did not confirm shutdown. Quit it from the tray icon yourself. Held records were not moved.'
+  : 'Claude Desktop did not confirm shutdown. Answer any native quit dialog yourself. Held records were not moved.'
+const desktopPossible = (io) => Boolean(io.inspect) || process.platform === 'win32' ||
+  spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
 const command = (file, args, timeout) => new Promise((resolve) => {
   if (timeout <= 0) return resolve({ status: null, timedOut: true })
   const child = spawn(file, args, { stdio: 'ignore' })
@@ -296,9 +339,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const check = (force = false) => {
     if (now() >= mutationDeadline) throw new Error('Restart mutation deadline reached')
     if (!force && now() < nextInspection) return
-    const possible = io.inspect || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
+    const possible = desktopPossible(io)
     if (possible && appProcess(paths, inspect())) throw new Error('Claude Desktop reopened before the held move finished. Retry the move.')
-    nextInspection = now() + 100
+    nextInspection = now() + INSPECTION_PAUSE
     if (now() >= mutationDeadline) throw new Error('Restart mutation deadline reached')
   }
   await mkdir(paths.state, { recursive: true, mode: 0o700 })
@@ -310,11 +353,11 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) throw new Error('Open Claude sessions changed. Review the restart plan again.')
     if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw new Error('An external worker now owns a held session. No restart was started.')
     report('desktop', 'Closing Claude Desktop', { live: true })
-    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, mutationDeadline - now()))
+    const quit = await run(...quitDesktop(paths, desktop.pid), Math.max(0, mutationDeadline - now()))
     const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), mutationDeadline, now, wait)
     if (!gone || quit.status !== 0) {
       state.outcome = quit.timedOut ? 'quit-timeout' : 'quit-not-confirmed'
-      state.error = 'Claude Desktop did not confirm shutdown. Answer any native quit dialog yourself. Held records were not moved.'
+      state.error = quitDialog
     } else {
       state.exitedAt = new Date().toISOString()
       state.outcome = 'moving'
@@ -333,7 +376,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'reopening'
       const remaining = deadline - now()
       if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
-      const opening = run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining))
+      const opening = run(...openDesktop(paths), Math.max(1000, remaining))
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
       const opened = await opening
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, deadline, now, wait)
@@ -355,7 +398,29 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   return { result, restart: state, error: failure?.message ?? state.error, ok: state.outcome === 'reopened' && !state.error && result?.ok !== false }
 }
 
-export function layout(home = os.homedir()) {
+const windowsPackage = (home) => {
+  try { return readdirSync(path.join(home, 'AppData/Local/Packages')).find((name) => name.startsWith('Claude_')) ?? null } catch { return null }
+}
+
+export function layout(home = os.homedir(), platform = process.platform) {
+  if (platform === 'win32') {
+    const store = windowsPackage(home)
+    const support = store ? path.join(home, 'AppData/Local/Packages', store, 'LocalCache/Roaming/Claude') : path.join(home, 'AppData/Roaming/Claude')
+    return {
+      home,
+      records: path.join(support, 'claude-code-sessions'),
+      agentSessions: path.join(support, 'local-agent-mode-sessions'),
+      desktop: path.join(support, 'config.json'),
+      logs: path.join(support, 'logs'),
+      cookies: path.join(support, 'Network/Cookies'),
+      claudeApp: store ? `shell:AppsFolder\\${store}!Claude` : path.join(home, 'AppData/Local/AnthropicClaude/claude.exe'),
+      pool: path.join(home, '.claude/projects'),
+      login: path.join(home, '.claude.json'),
+      backups: path.join(home, '.claude/backups'),
+      switchAccounts: path.join(home, '.claude-switch/accounts'),
+      state: path.join(home, 'AppData/Local/claude-transplant')
+    }
+  }
   const support = path.join(home, 'Library/Application Support')
   return {
     home,
@@ -506,23 +571,38 @@ async function quarantine(items, dest) {
   }
 }
 
+const holderRuns = (holder) => {
+  if (!Number.isInteger(holder?.pid) || holder.pid <= 0) return false
+  if (holder.pid === process.pid) return true
+  try {
+    process.kill(holder.pid, 0)
+    return true
+  } catch (error) { return error.code === 'EPERM' }
+}
+
+export async function claimLock(lockFile) {
+  for (const retry of [false, true]) {
+    try {
+      const handle = await open(lockFile, 'wx', 0o600)
+      await handle.writeFile(jsonText({ pid: process.pid, at: new Date().toISOString() }))
+      return handle
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      if (retry || holderRuns(await readJson(lockFile).catch(() => null))) throw new Error('another run holds the lock')
+      await unlink(lockFile).catch(() => {})
+    }
+  }
+}
+
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
-  const guard = spawn('/usr/bin/lockf', ['-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
-  await new Promise((resolve, reject) => {
-    let ready = false
-    guard.stdout.once('data', () => { ready = true; resolve() })
-    guard.once('error', reject)
-    guard.once('exit', (code) => {
-      if (!ready) reject(new Error(code === 75 ? 'another run holds the lock' : `lockf failed, exit ${code ?? 'unknown'}`))
-    })
-  })
+  const handle = await claimLock(lockFile)
   try {
     return await work()
   } finally {
-    guard.stdin.end()
-    if (guard.exitCode === null) await new Promise((resolve) => guard.once('exit', resolve))
+    await handle.close()
+    await unlink(lockFile).catch(() => {})
   }
 }
 
@@ -658,11 +738,9 @@ export async function signedIn(paths, table = null) {
   const unknown = (state = 'unknown', time = null) => ({ account: null, org: null, state, source: time === null ? 'unknown' : 'log', at: time === null ? null : new Date(time).toISOString() })
   try {
     if (table === null) {
-      const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], { encoding: 'utf8', timeout: 2000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } })
-      if (result.error || result.status !== 0) return unknown()
-      table = parseProcesses(result.stdout, '', paths.claudeApp)
+      try { table = processTable(paths.claudeApp) } catch { return unknown() }
     }
-    const apps = table.filter((row) => desktopExecutable(row.executable) || row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+    const apps = table.filter((row) => desktopProcess(row, paths.claudeApp))
     if (apps.length !== 1) return unknown()
     const started = Date.parse(apps[0].started)
     if (!Number.isFinite(started) || started > Date.now()) return unknown()
@@ -710,6 +788,7 @@ async function binaryMatch(file, pattern) {
 }
 
 async function desktopUserAgent(paths) {
+  if (process.platform === 'win32') throw new Error('cloud work reads the Desktop login, which this port supports on macOS only')
   const appInfo = path.join(paths.claudeApp, 'Contents/Info.plist')
   const framework = path.join(paths.claudeApp, 'Contents/Frameworks/Electron Framework.framework/Versions/A')
   const claude = plistValue(appInfo, 'CFBundleShortVersionString')
@@ -730,6 +809,7 @@ function decryptCookie(host, encrypted, key, version) {
 }
 
 function desktopCookies(paths) {
+  if (process.platform === 'win32') throw new Error('cloud work reads the Desktop login, which this port supports on macOS only')
   const options = { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 }
   const versionResult = spawnSync('/usr/bin/sqlite3', ['-readonly', paths.cookies, "SELECT value FROM meta WHERE key='version';"], options)
   const rowsResult = spawnSync('/usr/bin/sqlite3', ['-readonly', '-separator', '\t', paths.cookies, "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"], options)
@@ -2123,7 +2203,7 @@ async function reconcile(paths, options = {}) {
       const running = () => { try { return Boolean(appProcess(paths, inspect())) } catch { return false } }
       if (!running()) {
         const deadline = now() + REOPEN_RESERVE
-        const opened = await (io.command ?? command)('/usr/bin/open', ['-g', '-a', paths.claudeApp], REOPEN_RESERVE)
+        const opened = await (io.command ?? command)(...openDesktop(paths), REOPEN_RESERVE)
         restart.outcome = opened.status === 0 && await waitFor(running, deadline, now, io.wait) ? 'interrupted-reopened' : 'reopen-failed'
       } else restart.outcome = 'interrupted-app-running'
       restart.recoveredAt = new Date().toISOString()
@@ -3834,6 +3914,7 @@ const compileMenubar = (source, binary) => {
 }
 
 async function menubar(paths, remove, snapshot) {
+  if (process.platform !== 'darwin') throw new Error('the menubar app is macOS only, use the CLI')
   const app = path.join(paths.state, 'Claude Transplant.app')
   const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
   const agent = path.join(paths.home, 'Library/LaunchAgents', `${LABEL}.plist`)

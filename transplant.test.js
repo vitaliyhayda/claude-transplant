@@ -8,14 +8,19 @@ import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { REOPEN_RESERVE, RESTART_BUDGET, accounts, claimLock, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, parseWindowsProcesses, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
+const WINDOWS = process.platform === 'win32'
+const QUIT = WINDOWS ? 'taskkill.exe' : '/usr/bin/osascript'
+const OPEN = WINDOWS ? 'cmd.exe' : '/usr/bin/open'
+const darwinOnly = { skip: process.platform === 'darwin' ? false : 'macOS only' }
 const fixtureCommand = run => (file, ...args) => {
   if (file === '/usr/bin/security') return { status: 1, stdout: '', stderr: 'fixture login unavailable' }
-  if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl'].includes(file)) throw new Error('fixture native command requires a mock')
+  if (file === 'powershell.exe') return { status: 0, stdout: `${process.pid}\t1\t${new Date().toISOString()}\t0\t${process.execPath}\tnode\n`, stderr: '' }
+  if ((process.platform === 'win32' ? ['taskkill.exe', 'cmd.exe'] : ['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl']).includes(file)) throw new Error('fixture native command requires a mock')
   return run(file, ...args)
 }
 childProcess.spawnSync = fixtureCommand(childProcess.spawnSync)
@@ -76,9 +81,9 @@ const cli = (home, args) => promisify(execFile)(process.execPath, ['--input-type
   childProcess.spawn = (${fixtureCommand.toString()})(childProcess.spawn)
   syncBuiltinESMExports()
   process.argv.splice(1, 0, ${JSON.stringify(path.join(here, 'transplant.js'))})
-  await import(${JSON.stringify(path.join(here, 'transplant.js'))})
+  await import(${JSON.stringify(pathToFileURL(path.join(here, 'transplant.js')).href)})
 `, '--', ...args], {
-  env: { ...process.env, HOME: home },
+  env: { ...process.env, HOME: home, USERPROFILE: home },
   cwd: here
 }).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }))
 
@@ -111,7 +116,62 @@ test('process identity separates Desktop descendants, external workers, and reus
   assert.equal(alternate.find((row) => row.pid === 12).desktopPid, 10)
 })
 
-test('process inventory handles more than one megabyte of unrelated argv', async () => {
+const windowsDesktop = 'C:\\Program Files\\WindowsApps\\Claude_2.2553.1.0_x64__pzs8sxrjxfjjc\\app\\Claude.exe'
+const windowsFileTime = '134343983971528154'
+const windowsTable = [
+  `17024\t6852\t2026-09-20T16:16:33.5428000Z\t${windowsFileTime}\t${windowsDesktop}\t"${windowsDesktop}"`,
+  `17048\t17024\t2026-09-20T16:16:33.9212800Z\t134343983979212800\t${windowsDesktop}\t"${windowsDesktop}" --type=renderer`,
+  `31196\t17024\t2026-09-20T16:19:59.9830000Z\t134343985999830000\tC:\\Users\\fixture\\AppData\\Roaming\\Claude\\claude-code\\2.1.275\\claude.exe\tclaude.exe --resume ${SOURCE}`
+].join('\n')
+
+test('Windows processes separate the Desktop app, its helpers, and Code workers', () => {
+  const rows = parseWindowsProcesses(windowsTable)
+  assert.equal(rows.find((row) => row.pid === 17024).desktopPid, 17024)
+  assert.equal(rows.find((row) => row.pid === 17048).worker, false)
+  assert.equal(rows.find((row) => row.pid === 31196).worker, true)
+  assert.equal(rows.find((row) => row.pid === 31196).desktopPid, 17024)
+  assert.deepEqual(rows.find((row) => row.pid === 31196).ids, [SOURCE])
+  assert.throws(() => parseWindowsProcesses('unparseable'), /process identity/)
+})
+
+test('Windows session registrations bind on the file time and their own pid domain', () => {
+  const registration = { pid: 31196, sessionId: id(7), cwd: 'C:\\work', name: 'named', procStart: '134343985999830000', pidDomain: 'win32:fixture' }
+  const bound = parseWindowsProcesses(windowsTable, '', [registration]).find((row) => row.pid === 31196)
+  assert.deepEqual(bound.ids, [SOURCE, id(7)])
+  assert.equal(bound.cwd, 'C:\\work')
+  assert.equal(bound.sessionName, 'named')
+  const foreign = parseWindowsProcesses(windowsTable, '', [{ ...registration, pidDomain: 'darwin' }]).find((row) => row.pid === 31196)
+  assert.deepEqual(foreign.ids, [SOURCE])
+  const restarted = parseWindowsProcesses(windowsTable, '', [{ ...registration, procStart: windowsFileTime }]).find((row) => row.pid === 31196)
+  assert.deepEqual(restarted.ids, [SOURCE])
+})
+
+test('the Windows layout follows the Store package when it is installed', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-windows-'))
+  const direct = layout(root, 'win32')
+  assert.equal(direct.records, path.join(root, 'AppData/Roaming/Claude/claude-code-sessions'))
+  assert.equal(direct.claudeApp, path.join(root, 'AppData/Local/AnthropicClaude/claude.exe'))
+  await mkdir(path.join(root, 'AppData/Local/Packages/Claude_pzs8sxrjxfjjc'), { recursive: true })
+  const store = layout(root, 'win32')
+  assert.equal(store.records, path.join(root, 'AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code-sessions'))
+  assert.equal(store.logs, path.join(root, 'AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/logs'))
+  assert.equal(store.claudeApp, 'shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude')
+  assert.equal(store.pool, path.join(root, '.claude/projects'))
+})
+
+test('the state lock refuses a live holder and takes over a dead one', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-lock-'))
+  const file = path.join(root, 'lock')
+  const held = await claimLock(file)
+  await assert.rejects(claimLock(file), /another run holds the lock/)
+  await held.close()
+  await writeFile(file, JSON.stringify({ pid: 2 ** 22 - 1, at: new Date().toISOString() }))
+  const taken = await claimLock(file)
+  assert.equal(JSON.parse(await readFile(file, 'utf8')).pid, process.pid)
+  await taken.close()
+})
+
+test('process inventory handles more than one megabyte of unrelated argv', darwinOnly, async () => {
   const h = await home()
   const children = Array.from({ length: 9 }, () => spawn('/usr/bin/python3', ['-c', 'import time; time.sleep(30)', 'x'.repeat(120 * 1024)], { stdio: 'ignore' }))
   try {
@@ -250,7 +310,7 @@ test('restart waits for children, moves only after exit, and reopens on move fai
     now: () => time, budget: 1000, reserve: 200, inspect: () => rows,
     wait: async (ms) => { time += ms; rows = [] },
     command: async (file) => {
-      if (file.endsWith('osascript')) { calls.push('quit'); rows = rows.slice(1); return { status: 0 } }
+      if (file === QUIT) { calls.push('quit'); rows = rows.slice(1); return { status: 0 } }
       calls.push('open'); rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]; return { status: 0 }
     }
   })
@@ -268,7 +328,7 @@ test('a native quit veto leaves held work untouched and does not reopen the runn
   let time = 0, moved = false, opened = false
   const result = await withDesktopRestart(plan, h.paths, async () => { moved = true }, () => {}, {
     now: () => time, budget: 1000, reserve: 200, inspect: () => rows, wait: async (ms) => { time += ms },
-    command: async (file) => { if (file.endsWith('/open')) opened = true; return { status: 1 } }
+    command: async (file) => { if (file === OPEN) opened = true; return { status: 1 } }
   })
   assert.equal(moved, false)
   assert.equal(opened, false)
@@ -285,11 +345,11 @@ test('post-quit deadline exhaustion still sends a bounded reopen request', async
     inspect: () => rows, now: () => time, budget: 1000, reserve: 200,
     command: async (file, args, timeout) => {
       calls.push({ file, timeout })
-      rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+      rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
       return { status: 0 }
     }
   })
-  assert.equal(calls.at(-1).file, '/usr/bin/open')
+  assert.equal(calls.at(-1).file, OPEN)
   assert.ok(calls.at(-1).timeout > 0)
   assert.equal(result.ok, false)
   assert.match(result.error, /exceeded its deadline/)
@@ -304,10 +364,10 @@ test('a journal failure after quit cannot prevent the reopen request', async () 
     await writeFile(h.paths.state, 'state path is unavailable')
   }, () => {}, { inspect: () => rows, command: async (file) => {
     calls.push(file)
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } })
-  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(calls, [QUIT, OPEN])
   assert.equal(result.restart.outcome, 'reopened')
   assert.equal(result.ok, false)
   assert.match(result.restart.error, /journal could not be saved/)
@@ -319,15 +379,15 @@ test('a failed progress callback cannot prevent the mandatory reopen', async () 
   const plan = await restartPlan(null, h.paths, rows), calls = []
   const result = await withDesktopRestart(plan, h.paths, async () => ({ ok: true }), stage => {
     if (stage === 'reopen') {
-      reportedAfterOpen = calls.includes('/usr/bin/open')
+      reportedAfterOpen = calls.includes(OPEN)
       throw new Error('progress output unavailable')
     }
   }, { inspect: () => rows, command: async file => {
     calls.push(file)
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } })
-  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(calls, [QUIT, OPEN])
   assert.equal(reportedAfterOpen, true)
   assert.equal(result.restart.outcome, 'reopened')
   assert.equal(result.ok, true)
@@ -368,7 +428,7 @@ test('recovery reopens an interrupted approved restart without requesting anothe
   const result = await sweep(h.paths, { io: {
     inspect: () => rows, command: async (file) => { calls.push(file); rows = desktopFixture(); return { status: 0 } }
   } })
-  assert.deepEqual(calls, ['/usr/bin/open'])
+  assert.deepEqual(calls, [OPEN])
   assert.equal(result.recovered.title, 'Interrupted restart')
   assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart.json'))).outcome, 'interrupted-reopened')
 })
@@ -381,7 +441,7 @@ test('an approved plan moves only after shutdown and keeps cloud calls outside i
   let rows = desktopFixture(), time = 0, calls = []
   const io = { inspect: () => rows, now: () => time, budget: 1000, reserve: 200, wait: async (ms) => { time += ms }, command: async (file) => {
     calls.push(file)
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } }
   const planned = await executeMove([from], to, h.paths, { io, cloudRequested: true, cloud: cloudFixture(h) })
@@ -390,11 +450,11 @@ test('an approved plan moves only after shutdown and keeps cloud calls outside i
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
   assert.equal(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
   const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, cloudRequested: true, report: (stage) => {
-    if (stage === 'scan') assert.ok(calls.includes('/usr/bin/osascript'))
+    if (stage === 'scan') assert.ok(calls.includes(QUIT))
   } })
   assert.equal(result.restarted, true)
   assert.equal(result.receipt.sessions.length, 1)
-  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(calls, [QUIT, OPEN])
   assert.equal(result.receipt.cloudChecks[0].status, 'pending')
   assert.equal(result.receipt.startedAt, planned.plan.requestedAt)
   assert.equal(result.receipt.restart.outcome, 'reopened')
@@ -426,7 +486,7 @@ test('failed source authentication stays pending after an approved restart', asy
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   let rows = desktopFixture()
   const io = { inspect: () => rows, command: async (file) => {
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } }
   const planned = await executeMove([from], to, h.paths, { io, cloudRequested: true, cloudError: 'authentication unavailable' })
@@ -641,7 +701,13 @@ test('automatic retries never request a restart and leave held workers alone', a
 })
 
 async function hold(file) {
-  const guard = spawn('/usr/bin/lockf', ['-k', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const guard = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { claimLock } from ${JSON.stringify(pathToFileURL(path.join(here, 'transplant.js')).href)}
+    await claimLock(${JSON.stringify(file)})
+    process.stdout.write('ready')
+    process.stdin.on('end', () => process.exit(0))
+    process.stdin.resume()
+  `], { stdio: ['pipe', 'pipe', 'pipe'] })
   await once(guard.stdout, 'data')
   return guard
 }
@@ -1391,7 +1457,7 @@ test('duplicate source records for one transcript move once and retire every own
   assert.deepEqual(await readdir(h.dir('Z')), [`local_${id(926)}.json`])
 })
 
-test('a Desktop record changing inside the final guard stays visible and undoable', async () => {
+test('a Desktop record changing inside the final guard stays visible and undoable', darwinOnly, async () => {
   const h = await home()
   const session = id(936)
   const record = path.join(h.dir('P'), `local_${session}.json`)
@@ -1822,7 +1888,7 @@ test('accounts labels a login held in a claude-acc account directory', async () 
   assert.equal(row.label, 'switched@example.com \u00b7 Switched Team')
 })
 
-test('menubar snapshot renders live accounts without installing', async () => {
+test('menubar snapshot renders live accounts without installing', darwinOnly, async () => {
   const h = await home()
   const output = path.join(h.root, 'snapshot', 'panel.png')
   const result = await cli(h.root, ['menubar', '--snapshot', output])
@@ -3493,8 +3559,8 @@ function taskHarness(rows = [desktopFixture()[0]], reopened = [{ ...desktopFixtu
   mock.io = { inspect: () => mock.rows, now: () => mock.time, command: async file => {
     mock.calls.push(file)
     mock.time += 100
-    if (file.endsWith('osascript')) await mock.beforeQuit?.()
-    mock.rows = file.endsWith('osascript') ? [] : reopened
+    if (file === QUIT) await mock.beforeQuit?.()
+    mock.rows = file === QUIT ? [] : reopened
     return { status: 0 }
   } }
   return mock
@@ -3595,7 +3661,7 @@ test('Undo validates every supplied approval before changing records or receipts
     assert.equal(refused.ok, false, scenario)
     assert.match(refused.reason, /approval|receipt changed|Open Claude sessions changed/, scenario)
     assert.deepEqual(await fixtureSnapshot(h), before, scenario)
-    assert.equal(calls.some(file => file.endsWith('osascript')), false, scenario)
+    assert.equal(calls.some(file => file === QUIT), false, scenario)
   }
 })
 
@@ -3733,7 +3799,8 @@ test('task checkpoint integrity refuses corruption before recovery writes or res
       await writeFile(file, JSON.stringify({ ...interrupted, appendCheckpoint: { ...checkpoint, ...patch } }))
       const before = await fixtureSnapshot(h), writes = []
       const originals = new Map(['writeFile', 'appendFile', 'open', 'rename', 'link', 'unlink', 'rm'].map(key => [key, fs[key]]))
-      for (const [key, original] of originals) fs[key] = async (...args) => { writes.push(key); return original(...args) }
+      const lockFile = path.join(h.paths.state, 'lock')
+      for (const [key, original] of originals) fs[key] = async (...args) => { if (String(args[0]) !== lockFile) writes.push(key); return original(...args) }
       syncBuiltinESMExports()
       try {
         await assert.rejects(finishWorkflow(h.paths, options), /invalid append checkpoint/)
@@ -3756,7 +3823,7 @@ test('task checkpoint integrity refuses corruption before recovery writes or res
     }
     const recovered = await finishWorkflow(h.paths, options)
     assert.equal(recovered.recoveryRequired, true)
-    assert.deepEqual(calls, planned ? ['/usr/bin/osascript', '/usr/bin/open'] : [])
+    assert.deepEqual(calls, planned ? [QUIT, OPEN] : [])
     if (planned) assert.equal(recovered.restarted, true)
     const receipt = JSON.parse(await readFile(file))
     assert.equal(receipt.finalizing, false)
@@ -4122,7 +4189,7 @@ test('resumed mixed ordinary and task work counts every newly placed record', as
 async function interruptTaskFamily(h, operation, stage) {
   const hook = stage === 'record' ? 'link' : 'rename'
   const destination = stage === 'record' ? path.join(h.dir('T'), `local_${h.notificationId ?? SOURCE}.json`) : stage === 'source' ? h.sourceFile : h.targetFile
-  const matches = stage === 'receipt' ? `args[1].startsWith(paths.state + '/') && JSON.parse(await fs.readFile(args[1], 'utf8')).taskTransfers?.length` : `args[1] === ${JSON.stringify(destination)}`
+  const matches = stage === 'receipt' ? `args[1].startsWith(paths.state + ${JSON.stringify(path.sep)}) && JSON.parse(await fs.readFile(args[1], 'utf8')).taskTransfers?.length` : `args[1] === ${JSON.stringify(destination)}`
   const script = `
     import childProcess from 'node:child_process'
     import fs from 'node:fs/promises'
@@ -4143,7 +4210,7 @@ async function interruptTaskFamily(h, operation, stage) {
     if (${JSON.stringify(operation)} === 'undo') await undo(paths, { processes: [] })
     else await executeMove(${JSON.stringify(h.sourceAccounts ?? [h.acct.P])}.map(account => all.find(row => row.account === account)), all.find(row => row.account === ${JSON.stringify(h.acct.T)}), paths, { processes: [] })
   `
-  const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root } })
+  const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root, USERPROFILE: h.root } })
     .then(() => ({ code: 0 }), error => error)
   assert.equal(result.code, 23, result.stderr)
 }
@@ -4220,7 +4287,7 @@ test('CLI accounts exposes task recovery through Finish without selecting histor
   const recovered = await finishWorkflow(h.paths, { io, approve: plan.plan.token })
   assert.equal(recovered.restarted, true)
   assert.equal(recovered.recoveryRequired, true)
-  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(calls, [QUIT, OPEN])
   assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
   assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
   const again = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].filter(row => row.pending)
@@ -4325,8 +4392,8 @@ test('task moves, Undo and recovery use the approved restart and preserve final 
     assert.deepEqual(calls, [])
     const result = await run({ io, approve: plan.plan.token })
     assert.equal(result.restarted, true, JSON.stringify({ operation, reason: result.reason, outcome: result.restartOutcome?.outcome }))
-    assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
-    assert.ok(mock.time < 30000)
+    assert.deepEqual(calls, [QUIT, OPEN])
+    assert.ok(mock.time < RESTART_BUDGET)
     if (operation === 'move') {
       assert.equal(result.ok, true)
       assert.deepEqual(JSON.parse(await readFile(h.targetFile)).scheduledTasks.slice(1), h.sourceRegistry.scheduledTasks)
@@ -4364,7 +4431,7 @@ test('task restart deadline preserves held families after completed ordinary wor
     const result = await original(...args)
     if (path.dirname(args[1]) === h.paths.state && /^\d.*\.json$/.test(path.basename(args[1]))) {
       const receipt = JSON.parse(await readFile(args[1]))
-      if (receipt.finalizing === false && receipt.sessions.length === 1) mock.time = 23000
+      if (receipt.finalizing === false && receipt.sessions.length === 1) mock.time = RESTART_BUDGET - REOPEN_RESERVE + 1000
     }
     return result
   }
@@ -5220,7 +5287,7 @@ test('destination parents survive forks added after inventory or during final pr
   }
 })
 
-test('new or changed parent references during retirement roll back the journal', async () => {
+test('new or changed parent references during retirement roll back the journal', darwinOnly, async () => {
   for (const change of ['new', 'changed']) for (const location of ['P', 'T']) {
     const h = await home(), richer = id(776), child = id(777), base = branchEntries(2, SOURCE, 1)
     await h.write(SOURCE, base)
@@ -5607,7 +5674,7 @@ test('restart reuses preparation across cloud and local phases and reparses only
   let rows = desktopFixture(), scanned
   const cloud = cloudFixture(h)
   const io = { inspect: () => rows, command: async (file) => {
-    if (file.endsWith('osascript')) {
+    if (file === QUIT) {
       await appendFile(path.join(h.project, `${SOURCE}.jsonl`), JSON.stringify(entry('assistant', 2, 1, SOURCE)) + '\n')
       rows = []
     } else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
@@ -5648,7 +5715,7 @@ test('a thousand source records finish one restart with bounded polling and a li
   const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
   let rows = desktopFixture(id(10000)), inspections = 0, journalBytes = 0, checkpointBytes = 0
   const io = { inspect: () => { inspections++; return rows }, command: async file => {
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } }
   const planned = await executeMove([from], to, h.paths, { io })
@@ -5688,7 +5755,7 @@ test('a thousand records in one task family finish the real restart budget with 
   let rows = [desktopFixture()[0]], recordReads = 0, namespaceReads = 0
   const calls = [], io = { inspect: () => rows, command: async file => {
     calls.push(file)
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]
+    rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]
     return { status: 0 }
   } }
   const planned = await executeMove([from], to, h.paths, { io })
@@ -5712,7 +5779,7 @@ test('a thousand records in one task family finish the real restart budget with 
     moved: result.receipt?.sessions.length ?? 0, ok: result.ok, reason: result.reason ?? null }))
   assert.equal(result.ok, true, result.reason)
   assert.equal(result.restarted, true)
-  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(calls, [QUIT, OPEN])
   assert.equal(result.receipt.sessions.length, amount)
   assert.equal(result.receipt.superseded.length, amount)
   assert.equal(result.receipt.taskTransfers.length, 1)
@@ -5768,7 +5835,7 @@ test('a restart timeout before finalization never reports placed records as comp
   const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
   let rows = desktopFixture(), time = 0
   const io = { now: () => time, budget: 1000, reserve: 200, inspect: () => rows, command: async file => {
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    rows = file === QUIT ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } }
   const planned = await executeMove([from], to, h.paths, { io }), reported = []
@@ -5792,7 +5859,7 @@ test('a forced boundary detects reopening before retirement even inside the poll
   const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
   let rows = desktopFixture(), opens = 0
   const io = { now: () => 0, inspect: () => rows, command: async file => {
-    if (!file.endsWith('osascript')) opens++
+    if (!file === QUIT) opens++
     rows = []
     return { status: 0 }
   } }
@@ -5917,7 +5984,7 @@ test('Finish pending offers a receipt-bound restart for a connected mirror and c
   const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
   const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
   const io = { inspect: () => rows, command: async file => {
-    if (file.endsWith('osascript')) { quits++; rows = []; connected = false }
+    if (file === QUIT) { quits++; rows = []; connected = false }
     else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } }
@@ -5954,7 +6021,7 @@ test('mixed cloud Finish keeps its first pass preparatory until the restart deci
   connected.cse_ready = false
   let rows = desktopFixture(other)
   const io = { inspect: () => rows, command: async file => {
-    if (file.endsWith('osascript')) { rows = []; connected.cse_open = false }
+    if (file === QUIT) { rows = []; connected.cse_open = false }
     else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
   } }
@@ -5999,7 +6066,7 @@ test('process registry identifies a new worker without argv ids and rejects stal
   assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
 })
 
-test('Swift preserves command, progress, metadata, and completion states', async () => {
+test('Swift preserves command, progress, metadata, and completion states', darwinOnly, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
   const checkpointAccounts = await checkpointAccountsFixture()
   const h = await taskFamilyFixture(true, 1)
