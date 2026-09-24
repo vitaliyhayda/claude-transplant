@@ -1681,10 +1681,14 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
   if (currentRecord) {
     try {
       const record = JSON.parse(currentRecord)
-      if (allowRecordDrift && row.recordSnapshot) recordChanged = !validDesktopRecord({ file: row.record, record }) ||
-        ['sessionId', 'cliSessionId', 'cwd', 'originCwd'].some(key => record[key] !== row.recordSnapshot[key]) ||
-        record.cliSessionId !== row.targetId || record.sessionId !== row.targetRecordId
-      else recordChanged = !row.recordSemantic || recordSemantic(record) !== row.recordSemantic
+      if (allowRecordDrift && row.recordSnapshot) {
+        const rewound = row.strategy === 'rehome' && record.cliSessionId !== row.targetId && UUID.test(record.cliSessionId ?? '') &&
+          Array.isArray(record.priorCliSessionIds) && record.priorCliSessionIds.includes(row.targetId) &&
+          (await stat(path.join(path.dirname(row.targetTranscript), `${record.cliSessionId}.jsonl`)).catch(() => null))?.isFile()
+        recordChanged = !validDesktopRecord({ file: row.record, record }) ||
+          ['sessionId', 'cwd', 'originCwd'].some(key => record[key] !== row.recordSnapshot[key]) ||
+          row.recordSnapshot.cliSessionId !== row.targetId || (!rewound && record.cliSessionId !== row.targetId) || record.sessionId !== row.targetRecordId
+      } else recordChanged = !row.recordSemantic || recordSemantic(record) !== row.recordSemantic
     } catch { recordChanged = true }
   }
   if (recordChanged) changes.push('desktop record')

@@ -66,7 +66,7 @@ The CLI touches the network and Keychain only when you pass `--cloud`. The menub
 
 - Two columns: FROM on the left, TO on the right. Uncheck accounts to leave behind.
 - When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Otherwise pick TO yourself.
-- Open local sessions offer Stop and restart. Finish move continues the same receipt. Keep completed cancels remaining work without reversing completed moves.
+- Open local sessions offer Stop and restart. Finish move continues the same receipt. Keep completed cancels remaining work without reversing completed moves, including sessions rewound in Desktop when their original history remains available.
 - Held local work retries when its workers stop. Pending cloud sources retry when that account signs in.
 - Move always runs with `--cloud`, so the source's Remote Control mirrors are reconciled in the same run.
 - Starts at login, shows progress in the icon, notifies when done.
@@ -274,6 +274,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.0.7 | 27.0 | 2.7032.0 | 2.1.280 | 2026-09-23 |
 | 4.0.6 | 27.0 | 1.52386.3 | 2.1.266 | 2026-09-12 |
 | 4.0.5 | 27.0 | 1.49585.0 | 2.1.260 | 2026-09-08 |
 | 4.0.4 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-08 |

@@ -2114,6 +2114,44 @@ test('Keep local tolerates independent Desktop metadata and destination bridges'
   }
 })
 
+test('Keep local recognizes recorded rewinds without changing histories or relaxing Undo', async () => {
+  for (const scenario of ['rewind', 'repeated rewind', 'unrelated id', 'malformed lineage', 'invalid id', 'missing current history', 'missing old history', 'changed folder', 'changed record']) {
+    const h = await home(), current = id(796), earlier = id(795)
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('T', SOURCE, rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.T), to = all.find(row => row.account === h.acct.Z)
+    const moved = await moveWithPending(h, [from], to), row = moved.receipt.sessions[0]
+    await h.write(current, [entry('user', 2, null, current)])
+    const record = { ...JSON.parse(await readFile(row.record)), cliSessionId: current, priorCliSessionIds: [SOURCE] }
+    if (scenario === 'repeated rewind') {
+      await h.write(earlier, [entry('user', 3, null, earlier)])
+      record.priorCliSessionIds.push(earlier)
+    }
+    if (scenario === 'unrelated id') record.priorCliSessionIds = [earlier]
+    if (scenario === 'malformed lineage') record.priorCliSessionIds = SOURCE
+    if (scenario === 'invalid id') record.cliSessionId = '../invalid'
+    if (scenario === 'missing current history') await unlink(path.join(h.project, `${current}.jsonl`))
+    if (scenario === 'missing old history') await unlink(row.targetTranscript)
+    if (scenario === 'changed folder') record.cwd = '/tmp/different'
+    if (scenario === 'changed record') record.sessionId = `local_${current}`
+    await writeFile(row.record, JSON.stringify(record))
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), receiptBefore = await readFile(moved.file)
+    const kept = await keepLocal(h.paths)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before, scenario)
+    if (['rewind', 'repeated rewind'].includes(scenario)) {
+      assert.equal(kept.ok, true, scenario)
+      assert.equal(kept.cancelled, 1)
+      assert.equal(kept.receipt.cloudChecks[0].status, 'cancelled')
+      assert.equal(kept.receipt.sessions[0].targetId, SOURCE)
+      assert.ok((await undo(h.paths)).changed.some(value => /desktop record/.test(value)))
+      assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+    } else {
+      assert.ok(kept.refused?.length, scenario)
+      assert.deepEqual(await readFile(moved.file), receiptBefore, scenario)
+    }
+  }
+})
+
 test('Finish cloud success retains historical local refusals as information', async () => {
   for (const failure of ['none', 'verification', 'verification without details', 'cloud']) {
     const h = await home()
