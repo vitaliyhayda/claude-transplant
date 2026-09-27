@@ -2009,6 +2009,126 @@ test('completed local movement suppresses speculative pending', async () => {
   assert.equal(JSON.parse(await readFile(result.file)).cloudError, cloudError)
 })
 
+test('known source mirrors stay queued after local retirement and only finish under their source login', async () => {
+  for (const source of ['record', 'transcript', 'local-only']) {
+    const h = await home(), entries = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, [...entries, ...(source === 'transcript' ? [{ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_known' }] : [])])
+    await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds: source === 'transcript' ? [] : ['session_known'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.T), to = all.find(a => a.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: source !== 'local-only', cloud: source === 'local-only' ? null : cloudFixture(h, { account: to.account, org: to.org, list: async () => assert.fail('destination login must not list the source') }) })
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.deepEqual(await readdir(h.dir('T')), [])
+    if (source === 'local-only') { assert.equal(moved.pendingCloud, 0); continue }
+    assert.equal(moved.pendingCloud, 1)
+    assert.equal(moved.complete, false)
+    assert.deepEqual(moved.receipt.cloudChecks[0].sessionIds, ['session_known'])
+    const placed = moved.receipt.sessions[0].record
+    await writeFile(placed, JSON.stringify({ ...JSON.parse(await readFile(placed)), isArchived: true }))
+    const snapshot = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const pending = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].find(a => a.account === from.account)
+    assert.equal(pending.pendingAction, 'sign-in')
+    let reads = 0, status = 'active'
+    const cloud = cloudFixture(h, { account: from.account, org: from.org,
+      list: async () => { reads++; return ['cse_known', 'cse_unrelated'].map(id => remoteSession({ id, title: 'Remote title', status })) },
+      eventRows: async id => { assert.equal(id, 'cse_known'); return remoteRows(entries) },
+      session: async id => { assert.equal(id, 'cse_known'); return remoteState(status) },
+      archive: async id => { assert.equal(id, 'cse_known'); status = 'archived' }
+    })
+    const waiting = await sweep(h.paths, { active: to, processes: [], cloud })
+    assert.equal(waiting.pending, true)
+    assert.equal(reads, 0)
+    const finished = await sweep(h.paths, { active: from, processes: [], cloud })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.result.complete, true)
+    assert.equal(finished.result.file, moved.file)
+    assert.equal(finished.result.cloudArchived, 1)
+    assert.equal(status, 'archived')
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), snapshot)
+  }
+})
+
+test('task and restarted moves retain known mirror cleanup and Keep completed can cancel it', async () => {
+  for (const restart of [false, true]) {
+    const h = await taskFamilyFixture(), { io } = taskHarness()
+    await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_task_mirror'] }))
+    const { from, to } = await h.selection(), cloud = cloudFixture(h, { account: to.account, org: to.org, list: async () => assert.fail('wrong source login') })
+    const options = { cloudRequested: true, cloud, ...(restart ? { io } : { processes: [] }) }
+    let moved = await executeMove([from], to, h.paths, options)
+    if (restart) {
+      assert.deepEqual(moved.plan.deferredCloudSources, [])
+      moved = await executeMove([from], to, h.paths, { ...options, approve: moved.plan.token })
+      assert.equal(moved.restarted, true)
+    }
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 4)
+    assert.equal(moved.pendingCloud, 1)
+    assert.deepEqual(moved.receipt.cloudChecks[0].sessionIds, ['session_task_mirror'])
+    assert.equal(moved.complete, false)
+    const kept = await keepLocal(h.paths)
+    assert.equal(kept.cancelled, 1)
+    assert.equal(kept.complete, true)
+    assert.equal((await sweep(h.paths, { active: from, processes: [], cloud })).complete, true)
+  }
+})
+
+test('deferred mirror links follow a recorded rewind and preserve its remote-only branch before archival', async () => {
+  const h = await home(), current = id(797), oldEntries = branchEntries(2, SOURCE, 1)
+  await h.write(SOURCE, oldEntries)
+  await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_rewound'] }))
+  const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.T), to = all.find(a => a.account === h.acct.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  const row = moved.receipt.sessions[0], original = await readFile(row.targetTranscript)
+  await h.write(current, branchEntries(1, current, 51))
+  await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), cliSessionId: current, priorCliSessionIds: [SOURCE], bridgeSessionIds: [], title: 'Renamed after rewind' }))
+  const record = await readFile(row.record), transcript = await readFile(path.join(h.project, `${current}.jsonl`))
+  let status = 'active'
+  const cloud = cloudFixture(h, { account: from.account, org: from.org,
+    list: async () => [remoteSession({ id: 'cse_rewound', title: 'Remote title', status })], eventRows: async () => remoteRows([...oldEntries, entry('assistant', 4, 2, SOURCE)]),
+    session: async () => remoteState(status), archive: async () => { status = 'archived' }
+  })
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.rescued, 1)
+  assert.equal(finished.cloudArchived, 1)
+  assert.equal(finished.complete, true)
+  assert.equal(status, 'archived')
+  assert.deepEqual(await readFile(row.record), record)
+  assert.deepEqual(await readFile(row.targetTranscript), original)
+  assert.deepEqual(await readFile(path.join(h.project, `${current}.jsonl`)), transcript)
+})
+
+test('recorded retained histories allow mirror cleanup without cloning task-owned rewinds', async () => {
+  for (const scenario of ['retained', 'changed', 'missing', 'unrecorded', 'malformed']) {
+    const h = await home(), current = id(798), entries = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, entries)
+    await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_retained'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.T), to = all.find(a => a.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+    const row = moved.receipt.sessions[0]
+    await h.write(current, branchEntries(1, current, 51))
+    await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), cliSessionId: current, bridgeSessionIds: [], priorCliSessionIds: scenario === 'unrecorded' ? [] : scenario === 'malformed' ? SOURCE : [SOURCE] }))
+    await writeFile(to.taskFile, JSON.stringify({ scheduledTasks: [{ id: 'retained-task', enabled: true, notifySessionId: row.targetRecordId }] }))
+    if (scenario === 'missing') await unlink(row.targetTranscript)
+    const record = await readFile(row.record), tasks = await readFile(to.taskFile)
+    let status = 'active', reads = 0
+    const cloud = cloudFixture(h, { account: from.account, org: from.org,
+      list: async () => [remoteSession({ id: 'cse_retained', title: 'Older remote title', status })],
+      eventRows: async () => { if (++reads === 3 && scenario === 'changed') await appendFile(row.targetTranscript, '{}\n'); return remoteRows(entries) },
+      session: async () => remoteState(status), archive: async () => { status = 'archived' }
+    })
+    const result = await finishPending(h.paths, { cloud })
+    assert.equal(result.ok, scenario === 'retained', scenario)
+    assert.equal(result.complete, scenario === 'retained', scenario)
+    assert.equal(result.rescued, 0)
+    assert.equal(status, scenario === 'retained' ? 'archived' : 'active')
+    if (scenario === 'changed') assert.match(result.failed[0].error, /Retained local history changed/)
+    assert.deepEqual(await readFile(row.record), record)
+    assert.deepEqual(await readFile(to.taskFile), tasks)
+    assert.deepEqual((await readdir(h.dir('Z'))).sort(), [path.basename(row.record), 'scheduled-tasks.json'].sort())
+  }
+})
+
 test('a late move failure restores the source cloud check', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -6216,6 +6336,37 @@ struct StateChecks {
                 return row
             }), encoding: .utf8)!
         }
+        requests = []
+        let picker = Model(demo: Demo.accounts)
+        picker.selectTarget(Demo.accounts[2].id)
+        picker.toggle(Demo.accounts[0].id)
+        for id in Array(picker.from) { picker.toggle(id) }
+        precondition(picker.from.isEmpty)
+        picker.selectTarget(Demo.accounts[2].id)
+        precondition(picker.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[2].id]))
+        picker.toggle(Demo.accounts[0].id)
+        picker.selectTarget(Demo.accounts[3].id)
+        precondition(!picker.from.contains(Demo.accounts[0].id))
+        picker.reset()
+        precondition(picker.from.isEmpty && picker.to == nil && !picker.ready && picker.note.isEmpty)
+        precondition(requests.count == 1 && requests[0].0 == ["accounts", "--json"])
+        requests[0].1(accountResponse(false))
+        requests[0].2(0, "")
+        precondition(picker.from.isEmpty && picker.to == nil)
+        picker.toggle(Demo.accounts[0].id)
+        precondition(picker.from == [Demo.accounts[0].id] && picker.to == nil)
+        picker.selectTarget(Demo.accounts[2].id)
+        precondition(picker.from == [Demo.accounts[0].id] && picker.ready)
+        picker.reset()
+        picker.selectTarget(Demo.accounts[3].id)
+        precondition(picker.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[3].id]))
+        picker.begin()
+        picker.reset()
+        precondition(picker.running && picker.to == Demo.accounts[3].id)
+        let pendingPicker = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        let pendingSelection = pendingPicker.to
+        pendingPicker.reset()
+        precondition(pendingPicker.to == pendingSelection && !pendingPicker.pendingAccounts.isEmpty)
         let corruptedAccounts = String(data: Data(base64Encoded: "CORRUPTED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
         let repairedAccounts = String(data: Data(base64Encoded: "REPAIRED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
         let discoveredAccounts = try! JSONDecoder().decode([Account].self, from: Data(corruptedAccounts.utf8))

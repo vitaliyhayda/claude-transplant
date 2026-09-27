@@ -64,7 +64,7 @@ The CLI touches the network and Keychain only when you pass `--cloud`. The menub
 
 ## Menubar
 
-- Two columns: FROM on the left, TO on the right. Uncheck accounts to leave behind.
+- Two columns: FROM on the left, TO on the right. Uncheck accounts to leave behind. With FROM empty, choosing TO selects all other sources. Reset clears both columns for a new move.
 - When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Otherwise pick TO yourself.
 - Open local sessions offer Stop and restart. Finish move continues the same receipt. Keep completed cancels remaining work without reversing completed moves, including sessions rewound in Desktop when their original history remains available.
 - Held local work retries when its workers stop. Pending cloud sources retry when that account signs in.
@@ -198,7 +198,7 @@ Remote Control (`--cloud`):
 - Reads the active selected source through Claude Desktop's authenticated `claude.ai` session. Cookies are decrypted in memory via Keychain, sent only to `claude.ai`, never stored.
 - After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. Otherwise a same-title target must share eight consecutive exact remote messages to anchor a separate companion whose supported payloads are copied exactly into a new local transcript.
 - The source mirror is archived only after the remote worker is disconnected and unchanged and the local target verifies.
-- Inaccessible sources become pending only when unreadable or unarchived local records remain. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
+- Known source mirrors stay pending after local records move, until that source is signed in. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
 
 Safety:
 

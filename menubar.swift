@@ -343,7 +343,7 @@ final class Model: ObservableObject {
 
     func selectTarget(_ id: String) {
         guard !running else { return }
-        if selectionComplete { excluded = [] }
+        if from.isEmpty { excluded = [] }
         clearResult()
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
             lanes[vacated] = id
@@ -354,8 +354,22 @@ final class Model: ObservableObject {
         settle()
     }
 
+    func reset() {
+        guard !running, pendingAccounts.isEmpty else { return }
+        clearResult()
+        from = []
+        to = nil
+        excluded = []
+        lanes = [:]
+        targetChosen = true
+        selectionComplete = true
+        symbol = "arrow.left.arrow.right"
+        badge = ""
+        refresh()
+    }
+
     private func settle() {
-        if !accounts.contains(where: { $0.id == to }) {
+        if let selected = to, !accounts.contains(where: { $0.id == selected }) {
             to = nil
             targetChosen = false
         }
@@ -968,7 +982,8 @@ struct Panel: View {
                 Text("Claude Transplant").font(.system(.title3, design: .rounded, weight: .semibold))
                 if let label = model.identityLabel { Tag(text: label, color: .gray) }
                 Spacer()
-                Button(action: { model.refresh() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                Button(action: { model.reset() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    .accessibilityLabel("Reset").help("Clear account selections").disabled(model.running || !model.pendingAccounts.isEmpty)
             }
             accountBoard.disabled(!model.canMutate || !model.pendingAccounts.isEmpty)
             if !model.displaySummary.isEmpty { Divider() }
