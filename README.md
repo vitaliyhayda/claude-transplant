@@ -274,7 +274,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
-| 4.0.8 | 27.0 | 2.9939.2 | 2.1.281 | 2026-09-26 |
+| 4.1.0 | 27.0 | 2.9939.2 | 2.1.281 | 2026-09-26 |
 | 4.0.7 | 27.0 | 2.7032.0 | 2.1.280 | 2026-09-23 |
 | 4.0.6 | 27.0 | 1.52386.3 | 2.1.266 | 2026-09-12 |
 | 4.0.5 | 27.0 | 1.49585.0 | 2.1.260 | 2026-09-08 |
