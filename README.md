@@ -107,7 +107,7 @@ To    ↑↓ move · enter confirm
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
 | `--move-only` | move eligible records, leave Desktop-owned records held |
 | `--restart-approved <token>` | approve the exact restart plan printed for the requested operation |
-| `--cloud` | reconcile the active source, queue inaccessible sources that still have unreadable or unarchived local records |
+| `--cloud` | reconcile the active source, queue inaccessible sources with unreadable or unarchived local records or known source mirrors |
 | `--json` | one event per line |
 | `--version` | print the version |
 
@@ -224,7 +224,7 @@ Safety:
 - cloud mirrors: active or paused Remote Control rows under the signed-in source
 - cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads
 - cloud blocked: no unambiguous local anchor, unsupported payload, connected worker, changed history, or account mismatch
-- cloud checks pending: inaccessible sources that still have unreadable or unarchived local records
+- cloud checks pending: inaccessible sources with unreadable or unarchived local records or known source mirrors
 - newer cloud sessions: rows created after Move, left for the next move
 
 Accounts are labeled from `~/.claude.json`, its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` config directories, and Desktop's agent-mode records. Personal-plan organizations show as Personal. Accounts with no known email show a uuid prefix, session count, last activity, and most common project folder.

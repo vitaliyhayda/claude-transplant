@@ -2048,6 +2048,74 @@ test('known source mirrors stay queued after local retirement and only finish un
   }
 })
 
+test('held continuations merge new mirror scopes without reopening unchanged or cancelled checks', async () => {
+  for (const [status, scoped, added] of [
+    ['pending', true, true], ['complete', true, true], ['pending', false, true], ['complete', false, true],
+    ['complete', true, false], ['cancelled', true, true]
+  ]) {
+    const h = await home(), cold = id(809), coldEntries = branchEntries(2, cold, 501), heldEntries = branchEntries(2, SOURCE, 511)
+    await h.write(cold, coldEntries)
+    await h.write(SOURCE, heldEntries)
+    await h.record('P', cold, rehomeRecord({ bridgeSessionIds: ['session_cold'] }))
+    await h.record('P', SOURCE, rehomeRecord({ isArchived: true, bridgeSessionIds: [added ? 'session_held' : 'session_cold'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.T)
+    const moved = await executeMove([from], to, h.paths, { cloudRequested: true, moveOnly: true, processes: desktopFixture() })
+    assert.equal(moved.receipt.held.length, 1)
+    const check = moved.receipt.cloudChecks[0]
+    assert.deepEqual(check.sessionIds, ['session_cold'])
+    check.status = status
+    if (!scoped) delete check.sessionIds
+    await writeFile(moved.file, JSON.stringify(moved.receipt))
+    const resumed = await finishHeld(h.paths, { processes: [] })
+    assert.equal(resumed.receipt.sessions.length, 2)
+    const pending = status === 'pending' || status === 'complete' && added
+    assert.equal(resumed.receipt.cloudChecks[0].status, pending ? 'pending' : status)
+    assert.deepEqual(resumed.receipt.cloudChecks[0].sessionIds, scoped ? ['session_cold', ...(added && status !== 'cancelled' ? ['session_held'] : [])] : undefined)
+    if (!pending) { assert.equal(resumed.pendingCloud, 0); continue }
+    const states = { cse_cold: status === 'complete' ? 'archived' : 'active', cse_held: 'active' }
+    const cloud = cloudFixture(h, {
+      list: async () => [...Object.entries(states).map(([id, status]) => remoteSession({ id, status })), ...(scoped ? [remoteSession({ id: 'cse_unrelated' })] : [])],
+      eventRows: async id => { assert.ok(Object.hasOwn(states, id)); return remoteRows(id === 'cse_cold' ? coldEntries : heldEntries) },
+      session: async id => { assert.ok(Object.hasOwn(states, id)); return remoteState(states[id]) },
+      archive: async id => { assert.ok(Object.hasOwn(states, id)); states[id] = 'archived' }
+    })
+    const finished = await finishPending(h.paths, { cloud })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.complete, true)
+    assert.deepEqual(Object.values(states), ['archived', 'archived'])
+  }
+})
+
+test('round trips keep transcript mirrors with their explicit account and organization across cache generations', async () => {
+  for (const sameLogin of [false, true]) for (const cache of ['cold', 'warm', 'legacy']) {
+    const h = await home(), entries = branchEntries(2, SOURCE, 1)
+    if (sameLogin) { h.acct.T = h.acct.P; await mkdir(h.dir('T'), { recursive: true }) }
+    await h.write(SOURCE, [...entries, { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_prior_owner', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }])
+    await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior_owner'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.P && a.org === h.org.P), to = all.find(a => a.account === h.acct.T && a.org === h.org.T)
+    let status = 'active'
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_prior_owner', title: 'Old source', status })],
+      session: async () => remoteState(status), eventRows: async () => remoteRows(entries), archive: async () => { status = 'archived' }
+    })
+    const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloud, writeCache: cache !== 'cold' }), to, h.paths)
+    assert.equal(first.pendingCloud, 0)
+    assert.equal(status, 'archived')
+    if (cache === 'legacy') {
+      const file = path.join(h.paths.state, 'cache.json'), stored = JSON.parse(await readFile(file))
+      for (const row of Object.values(stored.histories)) delete row.value.result.bridgeOwners
+      await writeFile(file, JSON.stringify(stored))
+    }
+    const current = await accounts(h.paths), source = current.find(a => a.account === to.account && a.org === to.org), target = current.find(a => a.account === from.account && a.org === from.org)
+    const inv = await inventory([source], target, h.paths, () => {}, { cloudRequested: true, cloud })
+    assert.ok(inv.cacheStats[cache === 'warm' ? 'historyHits' : 'historyMisses'] > 0)
+    const second = await move(inv, target, h.paths)
+    assert.equal(second.ok, true)
+    assert.equal(second.pendingCloud, 0)
+    assert.deepEqual(second.receipt.cloudLinks, [])
+  }
+})
+
 test('task and restarted moves retain known mirror cleanup and Keep completed can cancel it', async () => {
   for (const restart of [false, true]) {
     const h = await taskFamilyFixture(), { io } = taskHarness()
@@ -2099,12 +2167,12 @@ test('deferred mirror links follow a recorded rewind and preserve its remote-onl
 })
 
 test('recorded retained histories allow mirror cleanup without cloning task-owned rewinds', async () => {
-  for (const scenario of ['retained', 'changed', 'missing', 'unrecorded', 'malformed']) {
+  for (const scenario of ['retained', 'changed', 'uncached-analysis', 'cached-analysis', 'missing', 'unrecorded', 'malformed']) {
     const h = await home(), current = id(798), entries = branchEntries(2, SOURCE, 1)
     await h.write(SOURCE, entries)
     await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_retained'] }))
     const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.T), to = all.find(a => a.account === h.acct.Z)
-    const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, writeCache: scenario === 'cached-analysis' }), to, h.paths)
     const row = moved.receipt.sessions[0]
     await h.write(current, branchEntries(1, current, 51))
     await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), cliSessionId: current, bridgeSessionIds: [], priorCliSessionIds: scenario === 'unrecorded' ? [] : scenario === 'malformed' ? SOURCE : [SOURCE] }))
@@ -2117,7 +2185,29 @@ test('recorded retained histories allow mirror cleanup without cloning task-owne
       eventRows: async () => { if (++reads === 3 && scenario === 'changed') await appendFile(row.targetTranscript, '{}\n'); return remoteRows(entries) },
       session: async () => remoteState(status), archive: async () => { status = 'archived' }
     })
-    const result = await finishPending(h.paths, { cloud })
+    const originalRead = fs.readFile, originalStat = fs.stat
+    let changedDuringAnalysis = false, transcriptReads = 0
+    fs.readFile = async (file, ...args) => {
+      const bytes = await originalRead(file, ...args)
+      if (file === row.targetTranscript && ++transcriptReads === 2 && scenario === 'uncached-analysis') {
+        await h.write(SOURCE, [entry('user', 777, null, SOURCE)])
+        changedDuringAnalysis = true
+      }
+      return bytes
+    }
+    fs.stat = async (file, ...args) => {
+      const detail = await originalStat(file, ...args)
+      if (file === row.targetTranscript && scenario === 'cached-analysis' && !changedDuringAnalysis) {
+        await h.write(SOURCE, [entry('user', 777, null, SOURCE)])
+        changedDuringAnalysis = true
+      }
+      return detail
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await finishPending(h.paths, { cloud }) }
+    finally { fs.readFile = originalRead; fs.stat = originalStat; syncBuiltinESMExports() }
+    assert.equal(changedDuringAnalysis, scenario.endsWith('-analysis'))
     assert.equal(result.ok, scenario === 'retained', scenario)
     assert.equal(result.complete, scenario === 'retained', scenario)
     assert.equal(result.rescued, 0)
