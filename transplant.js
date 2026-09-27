@@ -24,7 +24,7 @@ const RESTART_BUDGET = 30_000
 const REOPEN_RESERVE = 8_000
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 8
+const CACHE_VERSION = 9
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
@@ -953,8 +953,8 @@ const recordSemantic = (record) => sha(stable(without(record, RECORD_RUNTIME_KEY
 
 const semanticShape = (entry) => stable(without(entry, RUNTIME_KEYS))
 
-const OUTPUT_KEYS = ['stdout', 'stderr', 'fileContent']
-const toolOutput = (entry) => ({ stdout: entry.toolUseResult?.stdout, stderr: entry.toolUseResult?.stderr, fileContent: entry.toolUseResult?.file?.content })
+const OUTPUT_KEYS = ['stdout', 'stderr', 'fileContent', 'fileBase64']
+const toolOutput = (entry) => ({ stdout: entry.toolUseResult?.stdout, stderr: entry.toolUseResult?.stderr, fileContent: entry.toolUseResult?.file?.content, fileBase64: entry.toolUseResult?.file?.base64 })
 
 const stripToolOutput = (entry) => {
   const result = entry.toolUseResult
@@ -962,11 +962,16 @@ const stripToolOutput = (entry) => {
     delete result.stdout
     delete result.stderr
     if (typeof result.file?.content === 'string') delete result.file.content
+    if (typeof result.file?.base64 === 'string') delete result.file.base64
   }
   return entry
 }
 
-const replayShape = (entry) => stable(stripToolOutput(without(entry, RUNTIME_KEYS)))
+const replayShape = (entry) => {
+  const copy = stripToolOutput(without(entry, RUNTIME_KEYS))
+  if (copy.type === 'attachment' && copy.attachment?.type === 'edited_text_file') delete copy.attachment.displayPath
+  return stable(copy)
+}
 const richness = (entry) => Object.values(toolOutput(entry)).reduce((n, value) => n + (typeof value === 'string' ? Buffer.byteLength(value) : 0), 0)
 
 function survivor(rows, ids) {

@@ -695,51 +695,123 @@ test('normalize collapses replays and reports conflicts', () => {
 
 test('file-read replays keep the full payload and refuse incompatible copies', () => {
   const parent = entry('assistant', 1, null, SOURCE)
-  const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'text', file: { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 } } })
-  const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, content: '' } } }
-  for (const rows of [[parent, full, replay], [parent, replay, full]]) {
-    const result = normalize(rows)
+  for (const [type, key, file, snapshot] of [
+    ['text', 'content', { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 }, '1eb370dc75ffeb3c25ea8cbd9b5cf2c10916baa3441492ac4749a156a23d8c91'],
+    ['image', 'base64', { base64: Buffer.alloc(96 * 1024, 0xab).toString('base64'), dimensions: { width: 256, height: 128 }, originalSize: 96 * 1024, type: 'image/png' }, 'ce9edbd7fdd2d1531c89919b8cd343335e3f784f633e92f07f386cf86c8b5e8a']
+  ]) {
+    const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type, file } })
+    assert.equal(semantic([parent, full], SOURCE), snapshot)
+    for (const omitted of [false, true]) {
+      const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...file, [key]: '' } } }
+      if (omitted) delete replay.toolUseResult.file[key]
+      for (const rows of [[parent, full, replay], [parent, replay, full]]) {
+        const before = structuredClone(rows), result = normalize(rows)
+        assert.equal(result.conflicts, 0)
+        assert.equal(result.replays, 1)
+        assert.deepEqual(result.entries, [parent, full])
+        assert.equal(result.entries[1], full)
+        assert.equal(semantic(rows, SOURCE), snapshot)
+        assert.deepEqual(rows, before)
+        if (key === 'base64') assert.deepEqual(Buffer.from(result.entries[1].toolUseResult.file.base64, 'base64'), Buffer.alloc(96 * 1024, 0xab))
+      }
+    }
+    const incompatible = [
+      ...[Buffer.from('different payload').toString('base64'), null, 42, { text: 'unexpected shape' }].map(value => ({ ...file, [key]: value })),
+      ...(type === 'text' ? [{ filePath: '/tmp/other.txt' }, { numLines: 2 }] : [{ dimensions: { width: 512, height: 128 } }, { originalSize: 1 }, { type: 'image/jpeg' }]).map(changed => ({ ...file, [key]: '', ...changed })),
+      ...Object.keys(file).filter(field => field !== key).map(field => ({ ...file, [key]: '', [field]: null })),
+      { ...file, [key]: '', extra: true },
+      { [key]: '' },
+      undefined
+    ]
+    for (const changedFile of incompatible) {
+      const changed = { ...full, toolUseResult: { ...full.toolUseResult, file: changedFile } }
+      for (const rows of [[parent, full, changed], [parent, changed, full]]) {
+        const result = normalize(rows)
+        assert.equal(result.conflicts, 1)
+        assert.equal(result.replays, 0)
+        assert.deepEqual(result.entries, rows)
+      }
+    }
+    const fileOnly = { ...full, toolUseResult: { ...full.toolUseResult, stdout: '', stderr: '' } }
+    const outputOnly = { ...full, toolUseResult: { ...full.toolUseResult, stdout: 'command output', stderr: 'command error', file: { ...file, [key]: '' } } }
+    const complete = { ...full, toolUseResult: { ...outputOnly.toolUseResult, file } }
+    for (const copies of [[fileOnly, outputOnly], [outputOnly, fileOnly]]) {
+      assert.equal(normalize([parent, ...copies]).conflicts, 1)
+      for (const rows of [[parent, ...copies, complete], [parent, complete, ...copies]]) {
+        const result = normalize(rows)
+        assert.equal(result.conflicts, 0)
+        assert.deepEqual(result.entries, [parent, complete])
+        assert.equal(result.entries[1], complete)
+      }
+    }
+  }
+})
+
+test('edited-text attachment replays ignore only their display path', () => {
+  const parent = entry('assistant', 1, null, SOURCE)
+  const original = entry('attachment', 2, 1, SOURCE, { attachment: { type: 'edited_text_file', filename: '/tmp/fixture.txt', snippet: 'synthetic file edit' } })
+  const replay = { ...original, attachment: { ...original.attachment, displayPath: 'fixture.txt' } }
+  assert.equal(semantic([parent, original], SOURCE), '3a7e37a2ae90a9f7fbf77ef203cf3ec5ba6427da4fe10508d8774052f1cba8fa')
+  assert.equal(semantic([parent, replay], SOURCE), 'c53ead433799ea63ec5dfda594a9bb3f6ce9fb74699f9913238f080ab637236c')
+  for (const rows of [[parent, original, replay], [parent, replay, original]]) {
+    const before = structuredClone(rows), result = normalize(rows)
     assert.equal(result.conflicts, 0)
     assert.equal(result.replays, 1)
-    assert.deepEqual(result.entries, [parent, full])
-    assert.equal(semantic(rows, SOURCE), semantic([parent, full], SOURCE))
+    assert.deepEqual(result.entries, [parent, rows[1]])
+    assert.equal(result.entries[1], rows[1])
+    assert.deepEqual(rows, before)
   }
-  for (const content of ['different file body', null, { text: 'unexpected shape' }]) {
-    const changed = { ...replay, toolUseResult: { ...replay.toolUseResult, file: { ...replay.toolUseResult.file, content } } }
-    assert.equal(normalize([parent, full, changed]).conflicts, 1)
+  for (const attachment of [
+    { ...replay.attachment, filename: '/tmp/other.txt' },
+    { ...replay.attachment, snippet: 'different edit' },
+    { ...replay.attachment, type: 'other' },
+    { ...replay.attachment, extra: true }
+  ]) {
+    const changed = { ...replay, attachment }
+    for (const rows of [[parent, original, changed], [parent, changed, original]]) assert.equal(normalize(rows).conflicts, 1)
   }
-  const otherFile = { ...replay, toolUseResult: { ...replay.toolUseResult, file: { ...replay.toolUseResult.file, filePath: '/tmp/other.txt' } } }
-  assert.equal(normalize([parent, full, otherFile]).conflicts, 1)
+  assert.equal(normalize([parent, original, { ...replay, displayPath: 'top-level.txt' }]).conflicts, 1)
+  for (const [type, kind] of [['attachment', 'other'], ['user', 'edited_text_file'], ['system', 'edited_text_file'], ['progress', 'edited_text_file']]) {
+    const other = { ...original, type, attachment: { ...original.attachment, type: kind } }
+    const otherReplay = { ...other, attachment: { ...other.attachment, displayPath: 'fixture.txt' } }
+    for (const rows of [[parent, other, otherReplay], [parent, otherReplay, other]]) assert.equal(normalize(rows).conflicts, 1)
+  }
 })
 
 test('a transcript with a compact file-read replay rehomes intact and is not retired into a poorer fork', async () => {
-  const h = await home()
-  const parent = entry('assistant', 1, null, SOURCE)
-  const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'text', file: { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 } } })
-  const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, content: '' } } }
-  await h.write(SOURCE, [parent, full, replay])
-  await h.record('P', SOURCE, rehomeRecord({ title: 'Replayed file read' }))
-  await h.write(id(991), fork([parent, replay], SOURCE, id(991), 'Poorer fork'))
-  await h.record('T', id(991), rehomeRecord({ title: 'Poorer fork' }))
-  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
-  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
-  const before = await readFile(transcript), beforeStat = await stat(transcript)
-  const inv = await inventory([from], to, h.paths)
-  assert.equal(inv.blocked.length, 0)
-  assert.equal(inv.there.length, 0)
-  assert.equal(inv.move.length, 1)
-  const moved = await move(inv, to, h.paths)
-  assert.equal(moved.ok, true)
-  assert.equal(moved.receipt.sessions[0].strategy, 'rehome')
-  assert.deepEqual(await readFile(transcript), before)
-  assert.equal((await stat(transcript)).ino, beforeStat.ino)
-  assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.P).sessions.length, 0)
+  for (const [type, key, file] of [
+    ['text', 'content', { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 }],
+    ['image', 'base64', { base64: Buffer.alloc(96 * 1024, 0xab).toString('base64'), dimensions: { width: 256, height: 128 }, originalSize: 96 * 1024, type: 'image/png' }]
+  ]) {
+    const h = await home()
+    const parent = entry('assistant', 1, null, SOURCE)
+    const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type, file } })
+    const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...file, [key]: '' } } }
+    await h.write(SOURCE, [parent, full, replay])
+    await h.record('P', SOURCE, rehomeRecord({ title: 'Replayed file read' }))
+    await h.write(id(991), fork([parent, replay], SOURCE, id(991), 'Poorer fork'))
+    await h.record('T', id(991), rehomeRecord({ title: 'Poorer fork' }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+    const before = await readFile(transcript), beforeStat = await stat(transcript)
+    const inv = await inventory([from], to, h.paths)
+    assert.equal(inv.blocked.length, 0)
+    assert.equal(inv.there.length, 0)
+    assert.equal(inv.move.length, 1)
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions[0].strategy, 'rehome')
+    assert.deepEqual(await readFile(transcript), before)
+    assert.equal((await stat(transcript)).ino, beforeStat.ino)
+    assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.P).sessions.length, 0)
+  }
 })
 
 test('semantic change detection keeps richer output and parse state', () => {
   const a = entry('user', 1, null, id(0))
   const plain = entry('user', 2, 1, id(0), { toolUseResult: { stdout: '', stderr: '' } })
   const rich = { ...plain, toolUseResult: { stdout: 'finished', stderr: '' } }
+  assert.equal(semantic([a, plain, rich], id(0)), '79163d4f82bf5ea15a60aa7fd8993e49fb2788ca942eca14951f5796bc5a113c')
   assert.notEqual(semantic([a, plain], id(0)), semantic([a, rich], id(0)))
   assert.notEqual(semantic([a, rich], id(0)), semantic([a, rich], id(0), 1))
   const before = [a, rich, { type: 'relocated', sessionId: id(0), relocatedCwd: '/before' }]
@@ -5656,20 +5728,50 @@ test('rehome retirement allows shared growth without duplicate records', async (
   assert.ok((await readFile(transcript, 'utf8')).includes('message 2'))
 })
 
-test('a corrupt planning cache is ignored', async () => {
-  const h = await home()
-  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
-  await mkdir(teamDir, { recursive: true })
-  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
-  await h.record('P', SOURCE, rehomeRecord())
-  await mkdir(h.paths.state, { recursive: true })
-  await writeFile(path.join(h.paths.state, 'cache.json'), '{broken')
-  const all = await accounts(h.paths)
-  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
-  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
-  const inv = await inventory([from], to, h.paths)
-  assert.equal(inv.move.length, 1)
-  assert.ok(inv.cacheStats.historyMisses > 0)
+test('corrupt and legacy planning caches refresh replay analysis', async () => {
+  for (const state of ['corrupt', 'legacy']) {
+    const h = await home()
+    const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+    await mkdir(teamDir, { recursive: true })
+    const parent = entry('assistant', 1, null, SOURCE)
+    const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'image', file: { base64: Buffer.from('synthetic image bytes').toString('base64'), dimensions: { width: 1, height: 1 }, originalSize: 21, type: 'image/png' } } })
+    const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, base64: '' } } }
+    const edits = [3, 4, 5, 6].flatMap(k => {
+      const original = entry('attachment', k, 2, SOURCE, { attachment: { type: 'edited_text_file', filename: `/tmp/fixture-${k}.txt`, snippet: `synthetic edit ${k}` } })
+      return [original, { ...original, attachment: { ...original.attachment, displayPath: `fixture-${k}.txt` } }]
+    })
+    const entries = [parent, full, replay, ...edits]
+    assert.equal(normalize(entries).replays, 5)
+    await h.write(SOURCE, entries)
+    await h.record('P', SOURCE, rehomeRecord())
+    const transcript = path.join(h.project, `${SOURCE}.jsonl`), before = await readFile(transcript)
+    const all = await accounts(h.paths)
+    const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+    const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+    await inventory([from], to, h.paths, () => {}, { writeCache: true, processes: [] })
+    const file = path.join(h.paths.state, 'cache.json'), stored = JSON.parse(await readFile(file))
+    stored.version = 8
+    for (const row of Object.values(stored.histories)) {
+      row.value.result.conflicts = 10
+      row.value.result.comparable = false
+    }
+    await writeFile(file, state === 'corrupt' ? '{broken' : JSON.stringify(stored))
+    const inv = await inventory([from], to, h.paths, () => {}, { writeCache: true, processes: [] })
+    assert.equal(inv.blocked.length, 0)
+    assert.equal(inv.move.length, 1)
+    assert.equal(inv.cacheStats.historyHits, 0)
+    assert.ok(inv.cacheStats.historyMisses > 0)
+    const refreshed = JSON.parse(await readFile(file))
+    assert.equal(refreshed.version, 9)
+    assert.equal(refreshed.semanticVersion, 3)
+    assert.ok(Object.values(refreshed.histories).every(row => row.value.result.conflicts === 0 && row.value.result.comparable))
+    const warm = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.equal(warm.blocked.length, 0)
+    assert.equal(warm.move.length, 1)
+    assert.ok(warm.cacheStats.historyHits > 0)
+    assert.equal(warm.cacheStats.historyMisses, 0)
+    assert.deepEqual(await readFile(transcript), before)
+  }
 })
 
 test('an interrupted rehome removes only its unchanged target record', async () => {
