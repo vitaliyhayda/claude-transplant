@@ -1756,7 +1756,8 @@ async function projectLocalFailures(receipt, paths, project = true) {
       candidates ??= (await Promise.all(receipt.fromAccounts.map(async account => {
         try {
           if (!UUID.test(account.account) || !UUID.test(account.org)) return null
-          return await Promise.all((await recordFiles(path.join(paths.records, account.account, account.org))).map(async file => {
+          const files = await recordFiles(path.join(paths.records, account.account, account.org)).catch(error => { if (error.code === 'ENOENT') return []; throw error })
+          return await Promise.all(files.map(async file => {
             const raw = await readFile(file), record = JSON.parse(raw)
             return { ...desktopSession(file, record), account, observedRecordSha: sha(raw) }
           }))
@@ -1781,10 +1782,9 @@ async function projectLocalFailures(receipt, paths, project = true) {
         const transcript = locate(pool, source.id, record.cwd)
         if (!transcript) continue
         const before = await fingerprint(transcript), data = await load(transcript)
-        if (data.invalid) continue
         const bridges = data.entries.filter(entry => entry.type === 'bridge-session')
         const recordIds = (record.bridgeSessionIds ?? []).map(remoteId).filter(Boolean)
-        const owned = [...new Set([...recordIds, ...bridges.filter(entry => entry.ownerAccountUuid === source.account && entry.ownerOrganizationUuid === source.org)
+        const owned = [...new Set([...recordIds, ...bridges.filter(entry => !data.invalid && entry.ownerAccountUuid === source.account && entry.ownerOrganizationUuid === source.org)
           .map(entry => remoteId(entry.bridgeSessionId ?? entry.bridge_session_id)).filter(Boolean)])]
           .filter(id => bridges.filter(entry => remoteId(entry.bridgeSessionId ?? entry.bridge_session_id) === id).every(entry =>
             (!entry.ownerAccountUuid || entry.ownerAccountUuid === source.account) && (!entry.ownerOrganizationUuid || entry.ownerOrganizationUuid === source.org)))
@@ -3538,7 +3538,7 @@ export function resumeLast(paths, options = {}) {
     }
     let changed = converted.size > 0
     for (const check of receipt.cloudChecks ?? []) {
-      if (check.status === 'complete' || check.status === 'cancelled' && !options.includeCancelled) continue
+      if (['complete', 'blocked-local'].includes(check.status) || check.status === 'cancelled' && !options.includeCancelled) continue
       const busy = (check.failures ?? []).filter(row => /not proven disconnected and idle/.test(row.error))
       if (!busy.length && check.status !== 'cancelled') continue
       if (check.status === 'cancelled') {
@@ -3547,7 +3547,7 @@ export function resumeLast(paths, options = {}) {
       }
       check.waiting = []
       check.status = 'pending'
-      receipt.failed = receipt.failed.filter(row => !(cloudTagged(row, check) && busy.some(item => item.id === row.id)))
+      receipt.failed = receipt.failed.filter(row => row.blockedByLocal?.length || !(cloudTagged(row, check) && busy.some(item => item.id === row.id)))
       delete check.cancelledAt
       delete check.failures
       changed = true

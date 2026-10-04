@@ -68,7 +68,7 @@ The CLI touches the network and Keychain only when you pass `--cloud`. The menub
 - When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Otherwise pick TO yourself.
 - Open local sessions offer Stop and restart. Finish move continues the same receipt. Keep completed cancels remaining work without reversing completed moves, including sessions rewound in Desktop when their original history remains available.
 - Held local work retries when its workers stop. Pending cloud sources retry when that account signs in.
-- The headline counts every identified record left behind, grouped in Details by history check, waiting on parent, task collision, or other. A source mirror blocked by an unchanged local refusal stays in the receipt for a future Move and does not offer Finish on its own.
+- The headline counts identified records refused by the move, grouped in Details by history check, waiting on parent, task collision, or other. A source mirror blocked by an unchanged local refusal stays in the receipt for a future Move and does not offer Finish on its own.
 - Move always runs with `--cloud`, so the source's Remote Control mirrors are reconciled in the same run.
 - Starts at login, shows progress in the icon, notifies when done.
 - Bundles its own CLI, so rerun `menubar` after upgrading.

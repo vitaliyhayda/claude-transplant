@@ -4397,29 +4397,86 @@ test('mixed cloud checks finish independent work while blocked mirrors survive K
   }
 })
 
+test('Finish preserves locally blocked legacy busy mirrors while retrying independent work', async () => {
+  for (const mixed of [false, true]) {
+    const h = await refusalFixture(mixed), receipt = JSON.parse(await readFile(h.result.file))
+    const mirror = receipt.failed.find(row => row.id === 'cse_investor')
+    mirror.error = 'Remote Control history unreadable: Remote Control session is not proven disconnected and idle'
+    receipt.cloudChecks[0].failures.find(row => row.id === mirror.id).error = mirror.error
+    await writeFile(h.result.file, JSON.stringify(receipt))
+    let listed = 0, queried = 0, archived = 0
+    const cloud = { ...h.cloud,
+      list: async () => { listed++; return [remoteSession({ id: mirror.id, title: 'Same title' })] },
+      eventRows: async () => { queried++; return [] },
+      session: async () => { queried++; return remoteState('active') },
+      archive: async () => { archived++ }
+    }
+    const result = await finishWorkflow(h.paths, { processes: [], cloud })
+    assert.equal(result.complete, true)
+    assert.equal(listed, mixed ? 1 : 0)
+    assert.equal(queried, 0)
+    assert.equal(archived, 0)
+    assert.deepEqual(result.receipt.failed.filter(row => row.cloudAccount), [mirror])
+    assert.equal(result.receipt.cloudChecks[0].status, 'blocked-local')
+    assert.equal(result.summary.notMoved.length, 10)
+  }
+})
+
+test('malformed history keeps its verified record bridge dependency and remains refused', async () => {
+  const h = await refusalFixture(), transcript = path.join(h.project, `${h.investor}.jsonl`)
+  await appendFile(transcript, '{broken\n')
+  const before = await readFile(transcript), source = await readFile(h.investorFile)
+  const result = await verifyPlaced(h.paths)
+  assert.equal(result.ok, true)
+  const receipt = JSON.parse(await readFile(h.result.file))
+  assert.deepEqual(receipt.failed.find(row => row.id === 'cse_investor').blockedByLocal, [`${h.acct.P}/${h.org.P}/${h.recordId}`])
+  assert.equal(receipt.cloudChecks[0].status, 'blocked-local')
+  assert.ok(result.summary.notMoved.some(row => row.sessionId === h.recordId))
+  const { from, to } = await h.selection()
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  assert.ok(inv.blocked.some(row => row.id === h.investor && /unparseable lines/.test(row.error)))
+  assert.ok(!inv.move.some(row => row.id === h.investor))
+  assert.deepEqual(await readFile(transcript), before)
+  assert.deepEqual(await readFile(h.investorFile), source)
+  assert.equal(await stat(path.join(h.dir('T'), `${h.recordId}.json`)).catch(() => null), null)
+})
+
 test('4.1.0 refusal projection requires unique current identity and bridge ownership with a fresh consistency check', async () => {
-  for (const scenario of ['unchanged', 'ambiguous', 'unreadable', 'foreign bridge', 'changed while reading']) {
+  for (const scenario of ['unchanged', 'missing directory', 'ambiguous', 'unreadable', 'unreadable directory', 'vanished record', 'foreign bridge', 'malformed foreign bridge', 'malformed transcript bridge', 'changed while reading']) {
     const h = await refusalFixture(), receipt = JSON.parse(await readFile(h.result.file))
     for (const failure of receipt.failed) { delete failure.sources; delete failure.blockedByLocal }
     receipt.cloudChecks[0].status = 'failed'
     receipt.fromAccounts.push({ account: h.acct.Q, org: h.org.Q, label: 'Other source' })
+    if (scenario === 'missing directory') await fs.rm(h.dir('Q'), { recursive: true })
     if (scenario === 'ambiguous') await h.record('Q', h.investor, rehomeRecord({ bridgeSessionIds: ['session_investor'] }))
     if (scenario === 'unreadable') await writeFile(path.join(h.dir('P'), `local_${id(799)}.json`), '{broken')
-    if (scenario === 'foreign bridge') await appendFile(path.join(h.project, `${h.investor}.jsonl`), JSON.stringify({ type: 'bridge-session', bridgeSessionId: 'session_investor', ownerAccountUuid: h.acct.Q, ownerOrganizationUuid: h.org.Q }) + '\n')
+    if (scenario === 'vanished record') await h.record('Q', id(799))
+    if (scenario.includes('foreign bridge')) await appendFile(path.join(h.project, `${h.investor}.jsonl`), JSON.stringify({ type: 'bridge-session', bridgeSessionId: 'session_investor', ownerAccountUuid: h.acct.Q, ownerOrganizationUuid: h.org.Q }) + '\n')
+    if (scenario === 'malformed transcript bridge') {
+      await writeFile(h.investorFile, JSON.stringify({ ...JSON.parse(await readFile(h.investorFile)), bridgeSessionIds: [] }))
+      await appendFile(path.join(h.project, `${h.investor}.jsonl`), JSON.stringify({ type: 'bridge-session', bridgeSessionId: 'session_investor', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }) + '\n')
+    }
+    if (scenario.startsWith('malformed')) await appendFile(path.join(h.project, `${h.investor}.jsonl`), '{broken\n')
     await writeFile(h.result.file, JSON.stringify(receipt))
-    const original = fs.readFile
+    const original = fs.readFile, originalReaddir = fs.readdir
     let reads = 0
     fs.readFile = async (...args) => {
+      if (scenario === 'vanished record' && args[0] === path.join(h.dir('Q'), `local_${id(799)}.json`)) throw Object.assign(new Error('fixture record vanished'), { code: 'ENOENT' })
       if (scenario === 'changed while reading' && args[0] === h.investorFile && ++reads === 2) await writeFile(h.investorFile, JSON.stringify({ ...JSON.parse(await original(h.investorFile)), title: 'Changed during projection' }))
       return original(...args)
     }
+    fs.readdir = async (...args) => {
+      if (scenario === 'unreadable directory' && args[0] === h.dir('Q')) throw Object.assign(new Error('fixture directory unreadable'), { code: 'EACCES' })
+      return originalReaddir(...args)
+    }
     syncBuiltinESMExports()
     let result
-    try { result = await verifyPlaced(h.paths) } finally { fs.readFile = original; syncBuiltinESMExports() }
-    assert.equal(result.ok, scenario === 'unchanged', scenario)
+    try { result = await verifyPlaced(h.paths) } finally { fs.readFile = original; fs.readdir = originalReaddir; syncBuiltinESMExports() }
+    const projected = ['unchanged', 'missing directory'].includes(scenario)
+    assert.equal(result.ok, projected, scenario)
     const saved = JSON.parse(await readFile(h.result.file)), failure = saved.failed.find(row => row.id === h.investor)
     assert.equal(failure.sources?.[0]?.recordSha, undefined)
-    if (scenario === 'unchanged') {
+    if (projected) {
       assert.ok(failure.sources[0].observedRecordSha)
       assert.equal(failure.sources[0].sessionId, h.recordId)
       assert.equal(saved.cloudChecks[0].status, 'blocked-local')
