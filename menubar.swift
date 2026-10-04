@@ -20,6 +20,7 @@ struct Account: Decodable, Identifiable {
     var receiptMoved: Int? = nil
     var receiptDestination: String? = nil
     var receipt: String? = nil
+    var receiptSummary: ReceiptSummary? = nil
     var recoveryProblem: RecoveryProblem? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
@@ -34,8 +35,22 @@ struct Config: Decodable {
 
 struct Failure: Decodable {
     let id: String?
+    let sessionId: String?
+    let label: String?
     let title: String?
     let error: String
+}
+
+struct ReceiptSummary: Decodable {
+    let moved: Int
+    let notMoved: [Failure]
+    let groups: [FailureGroup]
+    let attention: [Failure]
+}
+
+struct FailureGroup: Decodable {
+    let cause: String
+    let records: [Failure]
 }
 
 struct RecoveryProblem: Decodable {
@@ -76,6 +91,7 @@ struct MetadataChange: Decodable {
 
 struct Event: Decodable {
     let receipt: String?
+    let summary: ReceiptSummary?
     let swept: Bool?
     let error: String?
     let changed: [MetadataChange]?
@@ -121,7 +137,7 @@ struct Event: Decodable {
     let refused: [String]?
     let reason: String?
     let nothing: Bool?
-    var issues: Int { (failed?.count ?? 0) + (problems?.count ?? 0) }
+    var issues: Int { (summary?.attention.count ?? failed?.count ?? 0) + (problems?.count ?? 0) }
 }
 
 extension String {
@@ -297,6 +313,13 @@ final class Model: ObservableObject {
 
     var identityLabel: String? { accounts.contains { $0.active == true } ? nil : accounts.first?.identityState == "logged-out" ? "signed out" : "unknown" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
+    var receiptSummaries: [ReceiptSummary] {
+        var seen = Set<String>()
+        return accounts.compactMap { account in
+            guard let file = account.receipt, seen.insert(file).inserted else { return nil }
+            return account.receiptSummary
+        }
+    }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
     var recoveryProblem: RecoveryProblem? { accounts.compactMap(\.recoveryProblem).first }
     var canMutate: Bool { !running && recoveryProblem == nil }
@@ -305,22 +328,25 @@ final class Model: ObservableObject {
     var pendingButtonTitle: String { pendingAccounts.contains { $0.pendingAction == "restart" } ? "Stop and restart" : pendingAccounts.contains { $0.pending == "undo" } ? "Finish Undo" : "Finish move" }
     var ready: Bool { canMutate && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
     var pendingPrompt: String {
-        guard !pendingAccounts.isEmpty else { return "" }
+        guard !pendingAccounts.isEmpty || receiptSummaries.contains(where: { !$0.notMoved.isEmpty }) else { return "" }
         if pendingAccounts.contains(where: { $0.pending == "recovery" }) { return "Finish the interrupted move" }
-        let moved = pendingAccounts.compactMap(\.receiptMoved).max() ?? 0
+        let moved = receiptSummaries.isEmpty ? pendingAccounts.compactMap(\.receiptMoved).max() ?? 0 : receiptSummaries.reduce(0) { $0 + $1.moved }
+        let notMoved = receiptSummaries.reduce(0) { $0 + $1.notMoved.count }
         let waiting = Set(pendingAccounts.flatMap { $0.pendingWaiting ?? [] }.map(\.id)).count
-        let issues = pendingAccounts.reduce(0) { $0 + ($1.pendingFailures?.count ?? 0) }
+        let issues = receiptSummaries.isEmpty ? pendingAccounts.first?.pendingFailures?.count ?? 0 : receiptSummaries.reduce(0) { $0 + $1.attention.count }
         let signIn = pendingAccounts.filter { $0.pendingAction == "sign-in" }.map(\.label)
         var parts = moved > 0 ? [quantity(moved, "session moved", "sessions moved")] : []
+        if notMoved > 0 { parts.append("\(notMoved) not moved") }
         if waiting > 0 { parts.append("\(waiting) still open") }
         if issues > 0 { parts.append("\(issues) need attention") }
         if !signIn.isEmpty { parts.append("sign into \(signIn.joined(separator: " or ")) to finish") }
-        if waiting == 0 && issues == 0 && signIn.isEmpty { parts.append("remaining sessions are ready to move") }
+        if waiting == 0 && issues == 0 && signIn.isEmpty && !pendingAccounts.isEmpty { parts.append("remaining sessions are ready to move") }
         return parts.isEmpty ? "Remaining sessions are ready to move" : parts.joined(separator: ", ")
     }
     var detailLines: [(String, String)] {
         let recovery = recoveryProblem.map { [("recovery", $0.error.sentence), ("receipt", $0.receipt)] } ?? []
         if !lines.isEmpty { return recovery + lines }
+        if !receiptSummaries.isEmpty { return recovery + receiptSummaries.flatMap(summaryLines) + pendingAccounts.flatMap { ($0.pendingWaiting ?? []).map { ("open", $0.title) } } }
         return recovery + pendingAccounts.flatMap { account in
             (account.pendingWaiting ?? []).map { ("open", $0.title) } +
             (account.pendingFailures ?? []).map { ("issue", identity($0.title, $0.id) + " | " + $0.error) }
@@ -488,13 +514,15 @@ final class Model: ObservableObject {
             recordIssues(event)
             if !waiting.isEmpty { lines.append(("open", waiting.map(\.title).joined(separator: "\n"))) }
             if let reason = event.reason ?? (event.ok == false ? event.note : nil) { lines.append(("reason", reason)) }
-            let moved = event.moved ?? 0
+            let moved = event.summary?.moved ?? event.moved ?? 0
+            let notMoved = event.summary?.notMoved.count ?? 0
             var parts: [String] = []
             if moved > 0 { parts.append(quantity(moved, "session moved", "sessions moved")) }
+            if notMoved > 0 { parts.append("\(notMoved) not moved") }
             if !waiting.isEmpty { parts.append("\(waiting.count) still open") }
             let issues = event.issues
             if issues > 0 { parts.append("\(issues) need attention") }
-            else if event.ok == false { parts.append("remaining work needs attention") }
+            else if event.ok == false && notMoved == 0 { parts.append("remaining work needs attention") }
             if pendingCloud > 0 && waiting.isEmpty && issues == 0 { parts.append("remaining sessions will finish when their account is available") }
             if !(event.pendingUndo ?? []).isEmpty { parts.append("sign into \(event.pendingUndo!.joined(separator: " or ")) to finish Undo") }
             if (event.keptLocal ?? 0) > 0 || (event.heldCancelled ?? 0) > 0 { parts = ["Completed moves kept, remaining work cancelled"] }
@@ -502,7 +530,7 @@ final class Model: ObservableObject {
                 parts = [event.restarted == true ? "Claude Desktop restarted" : event.complete == true ? "Move complete" : "Nothing to move"]
             }
             note = parts.joined(separator: ", ")
-            if event.ok == true, event.complete == true, moved > 0, issues == 0, !pendingResult, event.keptLocal == nil, event.heldCancelled == nil {
+            if event.ok == true, event.complete == true, moved > 0, notMoved == 0, issues == 0, !pendingResult, event.keptLocal == nil, event.heldCancelled == nil {
                 if let destination = operationDestination ?? accounts.first(where: { $0.id == to })?.plan { note += " to " + destination }
                 completion = (note, "History verified")
             }
@@ -521,7 +549,7 @@ final class Model: ObservableObject {
             lines = refused.map { ("kept", $0) }
         } else if event.nothing == true {
             recordIssues(event)
-            let refused = event.failed?.count ?? 0, unverified = event.problems?.count ?? 0
+            let refused = event.summary?.notMoved.count ?? event.failed?.count ?? 0, unverified = event.problems?.count ?? 0
             note = [refused > 0 ? quantity(refused, "session was not moved", "sessions were not moved") : nil,
                     unverified > 0 ? quantity(unverified, "verification problem", "verification problems") : nil].compactMap { $0 }.joined(separator: ", ")
             if note.isEmpty { note = operationArgs.first == "undo" ? "Nothing to undo" : "No remaining work" }
@@ -530,9 +558,17 @@ final class Model: ObservableObject {
     }
 
     private func recordIssues(_ event: Event) {
-        if let notMoved = event.notMoved, !notMoved.isEmpty { lines.append(("not moved", notMoved.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
-        if let failed = event.failed, !failed.isEmpty { lines.append(("issue", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
+        if let summary = event.summary { lines += summaryLines(summary) }
+        else {
+            if let notMoved = event.notMoved, !notMoved.isEmpty { lines.append(("not moved", notMoved.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
+            if let failed = event.failed, !failed.isEmpty { lines.append(("issue", failed.map { identity($0.title, $0.id) + " | " + $0.error }.joined(separator: "\n"))) }
+        }
         for problem in event.problems ?? [] { lines.append(("check", identity(problem.title, problem.id) + " | " + problem.check + " verification failed")) }
+    }
+
+    private func summaryLines(_ summary: ReceiptSummary) -> [(String, String)] {
+        summary.groups.map { ($0.cause, $0.records.map { [ $0.label, identity($0.title, $0.sessionId.map { String($0.dropFirst(6)) } ?? $0.id), $0.error ].compactMap { $0 }.joined(separator: " | ") }.joined(separator: "\n")) } +
+        summary.attention.map { ("issue", identity($0.title, $0.id) + " | " + $0.error) }
     }
 
     private func identity(_ title: String?, _ id: String?) -> String {
@@ -663,6 +699,11 @@ final class Model: ObservableObject {
                 note = "No remaining work"
                 symbol = "arrow.left.arrow.right"
                 settle()
+            }
+            if let summary = result?.summary, !summary.notMoved.isEmpty, (result?.changed ?? []).isEmpty {
+                lines = summaryLines(summary) + lines.filter { ["background", "metadata"].contains($0.0) }
+                note = [quantity(summary.moved, "session moved", "sessions moved"), "\(summary.notMoved.count) not moved",
+                        summary.attention.isEmpty ? nil : "\(summary.attention.count) need attention"].compactMap { $0 }.joined(separator: ", ")
             }
             if note != previousNote, !note.isEmpty { sweepNote = note }
         }
