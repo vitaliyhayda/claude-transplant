@@ -71,7 +71,7 @@ The CLI touches the network and Keychain only when you pass `--cloud`. The menub
 - The headline counts identified records refused by the move, grouped in Details by history check, waiting on parent or task family, task collision, or other. A source mirror blocked by an unchanged local refusal stays in the receipt for a future Move and does not offer Finish on its own.
 - Move always runs with `--cloud`, so the source's Remote Control mirrors are reconciled in the same run.
 - Starts at login, shows progress in the icon, notifies when done.
-- Bundles its own CLI, so rerun `menubar` after upgrading.
+- Bundles its own CLI, so rerun `menubar` after upgrading. The footer shows the installed version.
 - `menubar --snapshot panel.png` renders the live panel, `menubar --remove` uninstalls, `--demo <dir>` renders the animation above.
 
 ## CLI
@@ -279,6 +279,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.1.2 | 27.0 | 2.26454.0 | 2.1.289 | 2026-10-07 |
 | 4.1.1 | 27.0 | 2.19675.0 | 2.1.286 | 2026-10-03 |
 | 4.1.0 | 27.0 | 2.9939.2 | 2.1.281 | 2026-09-26 |
 | 4.0.7 | 27.0 | 2.7032.0 | 2.1.280 | 2026-09-23 |
