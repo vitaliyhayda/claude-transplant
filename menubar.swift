@@ -1066,8 +1066,15 @@ struct Panel: View {
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            if model.skipRestartWarning {
-                Button("Show restart warnings", action: model.restoreRestartWarning).buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+            HStack {
+                if model.skipRestartWarning {
+                    Button("Show restart warnings", action: model.restoreRestartWarning).buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+                    Text("v\(version)").font(.system(size: 10)).foregroundStyle(.secondary)
+                        .accessibilityLabel("Version \(version)")
+                }
             }
         }
         .padding(16)
