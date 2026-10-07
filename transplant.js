@@ -19,12 +19,13 @@ const WORKER_OWNS = 'running worker owns the session'
 const SCHEDULER_OWNS = 'Desktop scheduler requires an approved restart'
 const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
+const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
 const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
 const RESTART_BUDGET = 30_000
 const REOPEN_RESERVE = 8_000
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 10
+const CACHE_VERSION = 11
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
@@ -1025,14 +1026,24 @@ const toolDetails = (value, segments = [], detail = {}) => {
   return detail
 }
 const detailIncluded = (a, b) => Object.entries(a).every(([key, value]) => b[key] === value)
-const omissionShape = (entry) => {
+const replayDetails = (entry) => toolDetails({ toolUseResult: entry.toolUseResult, origin: { producer: entry.origin?.producer } })
+const stripReplayMetadata = (copy) => {
+  if (copy.message && typeof copy.message === 'object' && !Array.isArray(copy.message)) delete copy.message.usage
+  if (copy.origin && typeof copy.origin === 'object' && !Array.isArray(copy.origin)) {
+    delete copy.origin.producer
+    if (!Object.keys(copy.origin).length) delete copy.origin
+  }
+  return copy
+}
+const omissionShape = (entry, metadata = false) => {
   const copy = without(entry, [...RUNTIME_KEYS, 'toolUseResult'])
+  if (metadata) stripReplayMetadata(copy)
   if (copy.type === 'attachment' && copy.attachment?.type === 'edited_text_file') delete copy.attachment.displayPath
   return stable(copy)
 }
-const omissionSurvivor = (rows, ids) => {
-  if (rows.some(row => row.entry.parentUuid && !ids.has(row.entry.parentUuid)) || new Set(rows.map(row => omissionShape(row.entry))).size !== 1) return null
-  const candidates = rows.map(row => ({ ...row, detail: toolDetails(row.entry.toolUseResult), size: Buffer.byteLength(JSON.stringify(row.entry)) }))
+const omissionSurvivor = (rows, ids, metadata = false) => {
+  if (rows.some(row => row.entry.parentUuid && !ids.has(row.entry.parentUuid)) || new Set(rows.map(row => omissionShape(row.entry, metadata))).size !== 1) return null
+  const candidates = rows.map(row => ({ ...row, detail: metadata ? replayDetails(row.entry) : toolDetails(row.entry.toolUseResult), size: Buffer.byteLength(JSON.stringify(row.entry)) }))
   return candidates.toSorted((a, b) => b.size - a.size || a.line - b.line)
     .find(row => candidates.every(other => detailIncluded(other.detail, row.detail)))?.line ?? null
 }
@@ -1046,7 +1057,7 @@ export function normalize(entries, omissions = true) {
   let conflicts = 0
   for (const group of groups.values()) {
     if (group.length < 2) continue
-    const line = survivor(group, ids) ?? (omissions ? omissionSurvivor(group, ids) : null)
+    const line = survivor(group, ids) ?? (omissions ? omissionSurvivor(group, ids) ?? omissionSurvivor(group, ids, true) : null)
     if (line === null) { conflicts++; continue }
     replays++
     for (const r of group) if (r.line !== line) drop.add(r.line)
@@ -1114,8 +1125,8 @@ async function origins(id, ctx, cwd = '') {
 }
 
 const lineageEvent = (entry) => {
-  const c = without(entry, RUNTIME_KEYS)
-  const detail = toolDetails(c.toolUseResult)
+  const c = stripReplayMetadata(without(entry, RUNTIME_KEYS))
+  const detail = replayDetails(entry)
   const ignored = [
     'uuid', 'logicalParentUuid', 'sessionId', 'timestamp',
     'forkedFrom', 'teamName', 'agentName', 'sessionKind', 'sourceToolAssistantUUID', 'neutralizedByFork'
@@ -1420,9 +1431,14 @@ function localPlan(pending, to) {
   const targetIds = new Set(to.sessions.map((session) => session.id).filter(Boolean))
   const targetNames = new Set([...to.sessions.map((session) => path.basename(session.file)), ...to.unreadable.map((file) => path.basename(file))])
   const reasons = new Map(pending.map((source) => [source, rehomeReason(source, to, targetIds, targetNames)]))
-  for (const source of pending) if (source.taskFamily) {
-    const reason = pending.find(row => row.taskFamily === source.taskFamily && reasons.get(row))
-    if (reason) for (const row of pending.filter(row => row.taskFamily === source.taskFamily)) reasons.set(row, reasons.get(reason))
+  for (const family of new Set(pending.map(row => row.taskFamily).filter(Boolean))) {
+    const members = pending.filter(row => row.taskFamily === family)
+    const hardReason = row => reasons.get(row) && ![WORKER_OWNS, SCHEDULER_OWNS].includes(reasons.get(row))
+    const blocker = members.find(hardReason) ?? members.find(row => reasons.get(row))
+    if (blocker) for (const row of members) if (!hardReason(row)) {
+      const reason = reasons.get(blocker)
+      reasons.set(row, hardReason(blocker) ? `${TASK_FAMILY_BLOCKED} ${blocker.title || blocker.record.sessionId}: ${reason}` : reason)
+    }
   }
   const availableParents = new Set(to.sessions.map((session) => session.record.sessionId).filter(Boolean))
   let added = true
@@ -1735,7 +1751,7 @@ const inventoryFailures = (inv) => [
   ...(inv.cloud?.blocked ?? []).map((item) => taggedCloudFailure(inv.cloud, inventoryFailure(item)))
 ]
 const localFailureKey = (row) => `${row.account}/${row.org}/${row.sessionId}`
-const failureCause = (error) => /conflicting duplicate uuids|unparseable lines|history cannot be compared safely/.test(error) ? 'history check' :
+const failureCause = (error) => String(error).startsWith(TASK_FAMILY_BLOCKED) ? 'waiting on task family' : /conflicting duplicate uuids|unparseable lines|history cannot be compared safely/.test(error) ? 'history check' :
   error === PARENT_MISSING ? 'waiting on parent' : /task.*(?:collision|differs|enabled|dependency|unreadable|record exists)/.test(error) ? 'task collision' : 'other'
 export const receiptSummary = (receipt) => {
   const local = (receipt.failed ?? []).filter(row => !row.cloudAccount)

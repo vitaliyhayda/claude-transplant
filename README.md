@@ -68,7 +68,7 @@ The CLI touches the network and Keychain only when you pass `--cloud`. The menub
 - When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Otherwise pick TO yourself.
 - Open local sessions offer Stop and restart. Finish move continues the same receipt. Keep completed cancels remaining work without reversing completed moves, including sessions rewound in Desktop when their original history remains available.
 - Held local work retries when its workers stop. Pending cloud sources retry when that account signs in.
-- The headline counts identified records refused by the move, grouped in Details by history check, waiting on parent, task collision, or other. A source mirror blocked by an unchanged local refusal stays in the receipt for a future Move and does not offer Finish on its own.
+- The headline counts identified records refused by the move, grouped in Details by history check, waiting on parent or task family, task collision, or other. A source mirror blocked by an unchanged local refusal stays in the receipt for a future Move and does not offer Finish on its own.
 - Move always runs with `--cloud`, so the source's Remote Control mirrors are reconciled in the same run.
 - Starts at login, shows progress in the icon, notifies when done.
 - Bundles its own CLI, so rerun `menubar` after upgrading.
@@ -209,7 +209,7 @@ Safety:
 - A disabled destination task twin can be replaced only when its definition matches, its notification record and dependencies are absent, every destination record is readable, and its selected state is absent or equal. The receipt saves the twin and its position for undo and recovery. Later unrelated registry edits survive.
 - Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. Undo, retirement, and source archival also ignore branch and PR bookkeeping.
 - Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
-- Lineage follows `forkedFrom` pointers to their roots. Existing replay choices stay unchanged. Other duplicate message ids count as replays only when one existing copy contains every filled tool-result value, with exact messages and matching fields outside tool results except runtime metadata and an `edited_text_file` attachment's display path. Arrays compare whole. Different filled values and complementary partial copies are refused.
+- Lineage follows `forkedFrom` pointers to their roots. Existing replay choices stay unchanged. Other duplicate message ids count as replays only when one existing copy contains every filled tool-result value and producer marker, with exact message content and matching fields except runtime metadata, token usage, a missing producer marker, and an `edited_text_file` attachment's display path. Arrays compare whole. Different filled values and complementary partial copies are refused.
 - A disposable planning cache lives at `~/Library/Application Support/claude-transplant/cache.json`. Every write decision uses live files. Delete it any time.
 - Retirement filters potential source carriers by strict record, history and sidecar inclusion before live checks, avoiding rereads of unrelated destination histories in each ordinary and task-family pass. Superseded targets, actual carriers and parent references keep their live checks.
 
@@ -258,6 +258,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Delete the source | Removes the rollback |
 | Merge sidecars across versions | Requires writing a new generation |
 | Extend per-field replay omission lists | Claude Code changes which fields it blanks. A complete existing copy must cover every filled tool-result value instead |
+| Treat replay bookkeeping as changed content | Claude Code 2.1.286 replayed identical content with zeroed token usage and missing producer markers, blocking a notification conversation and its task family. Verified with Desktop 2.26454.0 on 2026-10-07 |
 | Move a record while its Desktop worker runs | Desktop rewrites the record from cache, title and turn count roll back |
 | Infer a restart-safe moment from activity logs | Cold records need no restart, held records get an explicit graceful shutdown |
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |

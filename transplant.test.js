@@ -857,11 +857,50 @@ test('generic replay omissions keep an existing complete row and protect filled 
   }
 })
 
+test('replay metadata preserves complete copies, content checks and existing receipt hashes', () => {
+  const parent = entry('user', 1, null, SOURCE)
+  const rich = entry('assistant', 2, 1, SOURCE, { message: { role: 'assistant', content: 'same response', usage: { input_tokens: 2, output_tokens: 42, cache_read_input_tokens: 100 } },
+    origin: { kind: 'local', producer: 'desktop' }, toolUseResult: { originalFile: 'full file' } })
+  const poor = { ...rich, message: { ...rich.message, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 } }, origin: { kind: 'local' }, toolUseResult: { originalFile: '' } }
+  const snapshots = ['9b73e0209da9afbaf4cdc9db54bfe2e80481455c906e278b3a1931e81cc45b33', '13f7544b251996252fcac3d0954cf42e25cecb13c55eafadd51504f2c68f0692']
+  for (const [index, copies] of [[rich, poor], [poor, rich]].entries()) {
+    const rows = [parent, ...copies], before = structuredClone(rows), result = normalize(rows)
+    assert.equal(result.conflicts, 0)
+    assert.equal(result.entries[1], rich)
+    assert.equal(semantic(rows, SOURCE), snapshots[index])
+    assert.deepEqual(rows, before)
+  }
+  for (const origin of [{ kind: 'local' }, { kind: 'local', producer: null }, { kind: 'local', producer: '' }]) {
+    const replay = { ...rich, origin }
+    for (const copies of [[rich, replay], [replay, rich]]) assert.equal(normalize([parent, ...copies]).entries[1], rich)
+  }
+  for (const origin of [undefined, {}]) {
+    const full = { ...rich, origin: { producer: 'desktop' } }, replay = { ...full, origin }
+    assert.equal(normalize([parent, replay, full]).entries[1], full)
+  }
+  for (const changed of [
+    { ...poor, origin: { kind: 'local', producer: 'other' } },
+    { ...poor, origin: { kind: 'remote' } },
+    { ...poor, message: { ...poor.message, content: 'different response' } },
+    { ...poor, message: { ...poor.message, role: 'user' } },
+    { ...poor, toolUseResult: { originalFile: 'different file' } },
+    { ...poor, parentUuid: id(999) },
+    { ...rich, message: { ...rich.message, futureContent: 'different' } }
+  ]) for (const copies of [[rich, changed], [changed, rich]]) assert.equal(normalize([parent, ...copies]).conflicts, 1)
+  const producerOnly = { ...rich, toolUseResult: poor.toolUseResult }, contentOnly = { ...rich, origin: poor.origin }
+  assert.equal(normalize([parent, producerOnly, contentOnly]).conflicts, 1)
+})
+
 test('originalFile replays rehome and retire intact while lineage covers only poorer histories', async () => {
-  for (const order of [false, true]) for (const richerTarget of [false, true]) {
+  for (const metadata of [false, true]) for (const order of [false, true]) for (const richerTarget of [false, true]) {
     const h = await home(), parent = entry('assistant', 1, null, SOURCE)
     const rich = entry('user', 2, 1, SOURCE, { toolUseResult: { originalFile: 'synthetic complete file', invented: { nested: false } } })
     const poor = { ...rich, toolUseResult: { originalFile: '', invented: {} } }
+    if (metadata) {
+      rich.origin = { producer: 'desktop' }
+      rich.message = { ...rich.message, usage: { output_tokens: 42 } }
+      poor.message = { ...poor.message, usage: { output_tokens: 0 } }
+    }
     const entries = [parent, ...(order ? [poor, rich] : [rich, poor])]
     await h.write(SOURCE, richerTarget ? [parent, poor] : entries)
     await h.record('P', SOURCE, rehomeRecord())
@@ -4673,6 +4712,42 @@ test('task Undo preserves identical pre-existing selected destination state', as
   assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
 })
 
+test('replay metadata moves a notification family and genuine conflicts identify dependent runs', async () => {
+  for (const conflict of [null, 'message', 'producer']) {
+    const h = await taskFamilyFixture(), child = id(705)
+    const original = entry('assistant', 1, null, SOURCE, { origin: { producer: 'desktop' }, message: { role: 'assistant', content: 'same answer', usage: { output_tokens: 42 } } })
+    const replay = { ...original, origin: {}, message: { ...original.message, usage: { output_tokens: 0 } } }
+    if (conflict === 'message') replay.message.content = 'different answer'
+    if (conflict === 'producer') replay.origin.producer = 'other'
+    await h.write(SOURCE, [original, replay])
+    await h.record('P', SOURCE, rehomeRecord({ title: 'Notification conversation' }))
+    await h.write(child, fork([original, replay], SOURCE, child, 'Notification fork'))
+    await h.record('P', child, rehomeRecord({ title: 'Notification fork', forkedFromSessionId: `local_${SOURCE}`, isArchived: true }))
+    const { from, to } = await h.selection(), before = await fixtureSnapshot(h, [h.paths.pool]), processes = conflict ? desktopFixture(SOURCE) : []
+    const inv = await inventory([from], to, h.paths, () => {}, { processes })
+    if (conflict) {
+      assert.deepEqual(inv.move.map(row => row.id), [h.cold])
+      for (const row of inv.blocked) assert.match(row.error, [SOURCE, child].includes(row.id) ? /^1 conflicting duplicate uuids$/ : /^scheduled task family blocked by /)
+      assert.ok(inv.blocked.filter(row => [h.run, h.second].includes(row.id)).every(row => row.conflicts === 0))
+    } else assert.equal(inv.move.filter(row => row.taskFamily).length, 4)
+    const result = await executeMove([from], to, h.paths, { processes, moveOnly: true })
+    assert.equal(result.receipt.sessions.length, conflict ? 1 : 5)
+    assert.equal(result.receipt.held.length, 0)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.pool]), before)
+    if (conflict) {
+      assert.deepEqual(Object.fromEntries(result.summary.groups.map(group => [group.cause, group.records.length])), { 'history check': 2, 'waiting on task family': 2 })
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    } else {
+      assert.equal(result.ok, true)
+      assert.equal(result.receipt.superseded.filter(row => row.source).length, 5)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+      assert.equal(JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`))).forkedFromSessionId, `local_${SOURCE}`)
+      assert.ok((await undo(h.paths, { processes: [] })).dest)
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+  }
+})
+
 test('unsafe task families leave ordinary records movable', async () => {
   for (const reason of ['missing record', 'missing history', 'task collision', 'source collision', 'record collision', 'omitted member']) {
     const h = await taskFamilyFixture(), { from, to } = await h.selection()
@@ -6087,7 +6162,7 @@ test('corrupt and legacy planning caches refresh replay analysis', async () => {
     const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
     await inventory([from], to, h.paths, () => {}, { writeCache: true, processes: [] })
     const file = path.join(h.paths.state, 'cache.json'), stored = JSON.parse(await readFile(file))
-    stored.version = 9
+    stored.version = 10
     for (const row of Object.values(stored.histories)) {
       row.value.result.conflicts = 10
       row.value.result.comparable = false
@@ -6099,7 +6174,7 @@ test('corrupt and legacy planning caches refresh replay analysis', async () => {
     assert.equal(inv.cacheStats.historyHits, 0)
     assert.ok(inv.cacheStats.historyMisses > 0)
     const refreshed = JSON.parse(await readFile(file))
-    assert.equal(refreshed.version, 10)
+    assert.equal(refreshed.version, 11)
     assert.equal(refreshed.semanticVersion, 3)
     assert.ok(Object.values(refreshed.histories).every(row => row.value.result.conflicts === 0 && row.value.result.comparable))
     const warm = await inventory([from], to, h.paths, () => {}, { processes: [] })
