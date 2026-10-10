@@ -191,14 +191,17 @@ Restarts:
 
 - When an operation needs Desktop to close, the engine emits a plan first. The menubar warns which Code workers, windows, Chat, Cowork, and background commands will close.
 - Stop and restart approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or both source and target account/organization pairs to be known inactive. An active or unknown scheduler requires this plan even without a worker. Other cold moves show no dialog.
-- An approved restart sends a graceful quit, waits for Desktop and its descendants to exit, moves the held records, and reopens Desktop. 30 second budget, no force kill, no cloud work in that window. A veto or missed deadline leaves held records untouched.
+- An approved restart sends a graceful quit, waits for Desktop and its descendants to exit, moves the held records, and reopens Desktop. 30 second budget, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
 - Background retries never start a new shutdown.
+- Private, bounded `restart-events.jsonl` logs retain attempt outcomes without prompts or raw errors. Failed work never rewrites its receipt or journal for diagnostics. Completed recovery folds matching outcomes into `restartHistory` once, preserving `receipt.restart`.
 
 Remote Control (`--cloud`):
 
 - Reads the active selected source through Claude Desktop's authenticated `claude.ai` session. Cookies are decrypted in memory via Keychain, sent only to `claude.ai`, never stored.
 - After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. Otherwise a same-title target must share eight consecutive exact remote messages to anchor a separate companion whose supported payloads are copied exactly into a new local transcript.
 - The source mirror is archived only after the remote worker is disconnected and unchanged and the local target verifies.
+- A unique bridge-linked parent can also prove owned subagent messages and absorbed queued prompts, including images. UUID, role, payload, delivery evidence and per-stream order must agree. The receipt records main, subagent and queued event counts. Final archival repeats the proof against fresh files and remote rows.
+- Supplemental reads share 512 MiB per operation, with a 16 MiB relevant-line parse limit. Time hints only prioritize files. Incomplete coverage stays uncertain and cannot authorize rescue. Unchanged automatic limit failures wait for changed inputs or engine code. Existing main-only matching and warm history caches remain usable.
 - Known source mirrors stay pending after local records move, until that source is signed in. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
 
 Safety:
@@ -259,6 +262,9 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Merge sidecars across versions | Requires writing a new generation |
 | Extend per-field replay omission lists | Claude Code changes which fields it blanks. A complete existing copy must cover every filled tool-result value instead |
 | Treat replay bookkeeping as changed content | Claude Code 2.1.286 replayed identical content with zeroed token usage and missing producer markers, blocking a notification conversation and its task family. Verified with Desktop 2.26454.0 on 2026-10-07 |
+| Look for queue removal evidence after normalization | UUID-less queue operations disappear from typed history. Supplemental checks read raw rows and require `absorbed_mid_turn`, `commandUuid` and `deliveryId` |
+| Run the tests with process inspection denied | Focused fixtures can preload an empty `/bin/ps` result and a not-running `/usr/bin/pgrep` result. Tests that enumerate real processes need `ps` access. Use a synthetic HOME. App-control commands and cloud operations are mocked. Set `npm_config_offline=true npm_config_update_notifier=false` to prevent npm's update check |
+| `swiftc -typecheck menubar.swift` | The `@main` app needs library parsing. Use `swiftc -typecheck -parse-as-library menubar.swift` |
 | Move a record while its Desktop worker runs | Desktop rewrites the record from cache, title and turn count roll back |
 | Infer a restart-safe moment from activity logs | Cold records need no restart, held records get an explicit graceful shutdown |
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
@@ -274,6 +280,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 - Artifact ownership, versions, comments, and share links stay with the original account.
 - Embedded base64, text, and HTTP(S) images and documents can be rescued. Account-owned file ids and unknown shapes are refused.
 - Remote Control uses private Claude endpoints and fails closed if their shape or auth changes.
+- Supplemental coverage of retained histories after a CLI identity change remains unsupported.
 - File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 - Moving history out of a Team organization is your organization's decision.
 

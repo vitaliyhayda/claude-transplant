@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
-import { createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
-import { copyFile, link, mkdir, mkdtemp, open, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -26,6 +26,9 @@ const REOPEN_RESERVE = 8_000
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
 const CACHE_VERSION = 11
+const ARTIFACT_BYTES = 512 * 1024 * 1024
+const ARTIFACT_LINE_BYTES = 16 * 1024 * 1024
+const RESTART_LOG_BYTES = 1024 * 1024
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
@@ -51,6 +54,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts
 `
 
 const sha = (data) => createHash('sha256').update(data).digest('hex')
+const ARTIFACT_ENGINE = sha(readFileSync(fileURLToPath(import.meta.url)))
 const sortKeys = (v) => Array.isArray(v) ? v.map(sortKeys) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v
 const stable = (v) => JSON.stringify(sortKeys(v))
 const jsonText = (value, spacing = 2) => `${JSON.stringify(value, null, spacing || undefined)}\n`
@@ -280,6 +284,46 @@ const command = (file, args, timeout) => new Promise((resolve) => {
   child.once('exit', (status) => finish({ status, timedOut: false }))
 })
 
+const restartReceiptId = (paths, file) => typeof file === 'string' && path.dirname(file) === paths.state && /^\d{4}-\d{2}-\d{2}T[\d-]+\.json$/.test(path.basename(file)) ? path.basename(file) : null
+
+async function appendRestartEvent(paths, event) {
+  try {
+    const file = path.join(paths.state, 'restart-events.jsonl')
+    const detail = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+    if (detail && !detail.isFile()) return
+    const text = jsonText(event, 0)
+    if (Buffer.byteLength(text) > 4096) return
+    if (detail && detail.size + Buffer.byteLength(text) > RESTART_LOG_BYTES) {
+      await rm(`${file}.1`, { force: true })
+      await rename(file, `${file}.1`)
+    }
+    const handle = await open(file, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
+    try { await handle.chmod(0o600); await handle.writeFile(text) } finally { await handle.close() }
+  } catch {}
+}
+
+async function foldRestartHistory(paths, file, receipt) {
+  if (needsRecovery(receipt) || receipt.restartHistory !== undefined && (!Array.isArray(receipt.restartHistory) || receipt.restartHistory.some(row => !row || typeof row !== 'object'))) return
+  const receiptId = restartReceiptId(paths, file)
+  if (!receiptId) return
+  const outcomes = new Map((receipt.restartHistory ?? []).map(row => [row.attemptId, row]))
+  for (const name of ['restart-events.jsonl.1', 'restart-events.jsonl']) {
+    let handle
+    try {
+      handle = await open(path.join(paths.state, name), constants.O_RDONLY | constants.O_NOFOLLOW)
+      const detail = await handle.stat()
+      if (!detail.isFile() || detail.size > RESTART_LOG_BYTES) continue
+      const text = await handle.readFile('utf8')
+      for (const line of text.split('\n').slice(0, -1)) {
+        let row
+        try { row = JSON.parse(line) } catch { continue }
+        if (row?.event === 'outcome' && row.receiptId === receiptId && UUID.test(row.attemptId ?? '') && !outcomes.has(row.attemptId)) outcomes.set(row.attemptId, row)
+      }
+    } catch {} finally { await handle?.close().catch(() => {}) }
+  }
+  if (outcomes.size) receipt.restartHistory = [...outcomes.values()]
+}
+
 export async function withDesktopRestart(plan, paths, work, report = () => {}, io = {}) {
   paths = { ...paths, claudeApp: plan.app ?? paths.claudeApp }
   const now = io.now ?? (() => performance.now())
@@ -289,29 +333,36 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const run = io.command ?? command
   const budget = io.budget ?? RESTART_BUDGET
   const reserve = io.reserve ?? REOPEN_RESERVE
-  const deadline = now() + budget
+  const started = now(), deadline = started + budget
   const mutationDeadline = deadline - reserve
   const file = path.join(paths.state, 'restart.json')
-  const state = { at: stamp(), requestedAt: new Date().toISOString(), app: paths.claudeApp, desktop: plan.desktop, held: plan.held,
+  const state = { at: stamp(), attemptId: randomUUID(), requestedAt: new Date().toISOString(), app: paths.claudeApp, desktop: plan.desktop, held: plan.held,
     deadline: new Date(Date.now() + budget).toISOString(), outcome: 'closing' }
+  const origin = plan.receiptFile ?? (plan.selection ? path.join(paths.state, `${state.at}.json`) : null)
+  const kind = plan.kind === 'undo' ? 'undo' : plan.resume || ['finish', 'recover'].includes(plan.kind) ? 'finish' : plan.kind === 'move' ? 'move' : 'restart'
+  const diagnostic = (event, extra = {}) => appendRestartEvent(paths, { event, kind, attemptId: state.attemptId, at: new Date().toISOString(),
+    receiptId: restartReceiptId(paths, origin), planNonce: UUID.test(plan.nonce ?? '') ? plan.nonce : null,
+    selectionId: plan.selection ? sha(stable(plan.selection)) : null, elapsedMs: Math.max(0, Math.round(now() - started)),
+    held: plan.held.length, affected: plan.affected?.length ?? 0, ...extra })
   const save = () => saveJson(file, state)
   let nextInspection = -Infinity
   const check = (force = false) => {
-    if (now() >= mutationDeadline) throw new Error('Restart mutation deadline reached')
+    if (now() >= mutationDeadline) throw Object.assign(new Error('Restart mutation deadline reached'), { code: 'RESTART_DEADLINE' })
     if (!force && now() < nextInspection) return
     const possible = io.inspect || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
-    if (possible && appProcess(paths, inspect())) throw new Error('Claude Desktop reopened before the held move finished. Retry the move.')
+    if (possible && appProcess(paths, inspect())) throw Object.assign(new Error('Claude Desktop reopened before the held move finished. Retry the move.'), { code: 'RESTART_REOPENED' })
     nextInspection = now() + 100
-    if (now() >= mutationDeadline) throw new Error('Restart mutation deadline reached')
+    if (now() >= mutationDeadline) throw Object.assign(new Error('Restart mutation deadline reached'), { code: 'RESTART_DEADLINE' })
   }
   await mkdir(paths.state, { recursive: true, mode: 0o700 })
   await save()
+  await diagnostic('start')
   let result, failure
   try {
     const live = inspect()
     const desktop = appProcess(paths, live)
-    if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) throw new Error('Open Claude sessions changed. Review the restart plan again.')
-    if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw new Error('An external worker now owns a held session. No restart was started.')
+    if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) throw Object.assign(new Error('Open Claude sessions changed. Review the restart plan again.'), { code: 'RESTART_PLAN_CHANGED' })
+    if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw Object.assign(new Error('An external worker now owns a held session. No restart was started.'), { code: 'RESTART_EXTERNAL_WORKER' })
     report('desktop', 'Closing Claude Desktop', { live: true })
     const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, mutationDeadline - now()))
     const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), mutationDeadline, now, wait)
@@ -322,6 +373,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.exitedAt = new Date().toISOString()
       state.outcome = 'moving'
       await save()
+      await diagnostic('exited')
       check(true)
       result = await work({ at: state.at, restart: state, check })
     }
@@ -336,9 +388,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'reopening'
       const remaining = deadline - now()
       if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
-      const opening = run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining))
+      const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining)))()
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
-      const opened = await opening
+      const opened = await opening.catch(() => ({ status: null }))
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, deadline, now, wait)
       state.outcome = opened.status === 0 && present ? 'reopened' : 'reopen-failed'
       if (state.outcome === 'reopened') state.reopenedAt = new Date().toISOString()
@@ -346,13 +398,31 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     }
     try {
       await save()
-      if (result?.file && result.receipt) {
+      if (!failure && result?.file && result.receipt && !needsRecovery(result.receipt)) {
         result.receipt.restart = { ...state }
         await saveJson(result.file, result.receipt)
       }
     } catch (error) {
       state.error = `Restart journal could not be saved: ${error.message}`
       failure ??= error
+    }
+    const codes = new Set(['RESTART_DEADLINE', 'RESTART_REOPENED', 'RESTART_PLAN_CHANGED', 'RESTART_EXTERNAL_WORKER'])
+    const stopCode = failure ? codes.has(failure.code) ? failure.code : 'WORK_FAILED'
+      : state.outcome === 'reopen-failed' ? 'REOPEN_FAILED' : (state.outcomeBeforeReopen ?? state.outcome).startsWith('quit-') ? 'QUIT_UNCONFIRMED'
+        : state.error ? 'RESTART_DEADLINE' : result?.ok === false ? 'WORK_REFUSED' : result ? 'COMPLETE' : 'NO_WORK'
+    await diagnostic('outcome', { receiptId: restartReceiptId(paths, origin ?? result?.file), outcome: state.outcome, stopCode,
+      receiptCounts: result?.receipt ? { sessions: result.receipt.sessions?.length ?? null, failed: result.receipt.failed?.length ?? null, remote: result.receipt.remote?.length ?? null } : null })
+    if (!failure) {
+      try {
+        const receiptFile = result?.file ?? origin
+        if (restartReceiptId(paths, receiptFile)) {
+          const receipt = result?.receipt ?? await readReceipt(receiptFile)
+          if (!needsRecovery(receipt)) {
+            await foldRestartHistory(paths, receiptFile, receipt)
+            await saveJson(receiptFile, receipt)
+          }
+        }
+      } catch {}
     }
   }
   return { result, restart: state, error: failure?.message ?? state.error, ok: state.outcome === 'reopened' && !state.error && result?.ok !== false }
@@ -1197,6 +1267,190 @@ const conversationMatch = (source, target) => {
   return source.length - conversationLcs(source, target) <= tolerance ? 'equivalent' : null
 }
 
+const artifactError = (text, code = 'CLOUD_ARTIFACT_UNCERTAIN') => Object.assign(new Error(`Supplemental cloud coverage is uncertain: ${text}`), { code })
+const artifactBudget = (limit) => ({ limit: Number.isSafeInteger(limit) && limit >= 0 ? Math.min(ARTIFACT_BYTES, limit) : ARTIFACT_BYTES, used: 0, indexes: new Map() })
+const eventDescriptor = (entry) => ({ uuid: entry.uuid, type: entry.type, role: entry.message.role, hash: messageHash(entry.type, entry.message), timestamp: entry.timestamp,
+  ...(entry.agentId !== undefined ? { agentId: entry.agentId } : {}), ...(entry.isSidechain !== undefined ? { isSidechain: entry.isSidechain } : {}) })
+const remoteEvents = (rows) => rows.filter(row => ['user', 'assistant'].includes(row.event_type)).map(row => {
+  const event = eventDescriptor({ ...row.payload, timestamp: row.payload.timestamp ?? row.created_at })
+  for (const key of ['agentId', 'isSidechain']) if (row[key] !== undefined) event[key] = event[key] !== undefined && event[key] !== row[key] ? null : row[key]
+  return event
+})
+const eventAgrees = (a, b) => a.uuid === b.uuid && a.type === b.type && a.role === b.role && a.hash === b.hash
+const agentName = (value) => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value)
+const statIdentity = (detail) => [detail.dev, detail.ino, detail.size, detail.mtimeNs, detail.ctimeNs].join(':')
+
+async function artifactStat(file) {
+  const detail = await lstat(file, { bigint: true })
+  if (!detail.isFile() || await realpath(file) !== file) throw artifactError('artifact is not a regular file within its session root')
+  return { detail, signature: statIdentity(detail) }
+}
+
+async function artifactInputs(row) {
+  if (!UUID.test(row.id) || path.basename(row.transcript) !== `${row.id}.jsonl` || desktopRecordOf(row).cliSessionId !== row.id) throw artifactError('the linked parent identity is not established')
+  const project = await realpath(path.dirname(row.transcript)), transcript = path.join(project, `${row.id}.jsonl`)
+  const { signature } = await artifactStat(transcript), root = path.join(project, row.id), directory = path.join(root, 'subagents')
+  const fingerprints = [[transcript, signature]], files = []
+  for (const dir of [root, directory]) {
+    const detail = await lstat(dir, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+    fingerprints.push([dir, detail ? statIdentity(detail) : null])
+    if (!detail) break
+    if (!detail.isDirectory() || await realpath(dir) !== dir) throw artifactError('subagent root is not a real session directory')
+    if (dir === directory) for (const file of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!/^agent-.+\.jsonl$/.test(file.name)) continue
+      const agent = file.name.slice(6, -6), name = path.join(dir, file.name)
+      if (!file.isFile() || !agentName(agent)) throw artifactError('subagent entry is not a regular owned file')
+      const current = await artifactStat(name)
+      fingerprints.push([name, current.signature])
+      files.push({ file: name, agent, modified: Number(current.detail.mtimeNs / 1000000n) })
+    }
+  }
+  return { transcript, fingerprints, files }
+}
+
+async function artifactIndex(file, kind, budget) {
+  const { detail, signature } = await artifactStat(file)
+  const key = `${file}/${signature}/${kind}`
+  if (budget.indexes.has(key)) return budget.indexes.get(key)
+  const reading = (async () => {
+    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      if (statIdentity(await handle.stat({ bigint: true })) !== signature) throw artifactError('artifact changed before reading')
+      const read = async (length, position) => {
+        if (budget.used + length > budget.limit) throw artifactError('the shared read budget was exhausted', 'CLOUD_ARTIFACT_BUDGET')
+        budget.used += length
+        const buffer = Buffer.alloc(length)
+        const { bytesRead } = await handle.read(buffer, 0, length, position)
+        if (bytesRead !== length) throw artifactError('artifact changed while reading')
+        return buffer
+      }
+      const result = { main: [], events: [], queued: [], removed: [] }
+      if (kind === 'header') {
+        const data = await read(Math.min(Number(detail.size), 4096), 0)
+        const first = data.subarray(0, data.indexOf(10) < 0 ? data.length : data.indexOf(10)).toString('utf8')
+        result.timestamp = milliseconds(first.match(/"timestamp"\s*:\s*"([^"]{1,64})"/)?.[1])
+      } else {
+        let parts = [], length = 0, skip = false, classified = false
+        const relevant = kind === 'agent' ? ['user', 'assistant'] : ['user', 'assistant', 'attachment', 'queue-operation']
+        const consume = () => {
+          if (skip || !length) return
+          const text = Buffer.concat(parts, length).toString('utf8').trim()
+          if (!text) return
+          let row
+          try { row = JSON.parse(text) } catch { throw artifactError('artifact contains an unreadable relevant line') }
+          if (!row || !relevant.includes(row.type)) return
+          if (['user', 'assistant'].includes(row.type) && row.message && typeof row.message === 'object' && !Array.isArray(row.message)) {
+            const event = { ...eventDescriptor(row), sessionId: row.sessionId }
+            if (kind === 'agent') result.events.push(event)
+            else if (!row.isSidechain) result.main.push(event)
+          } else if (row.type === 'attachment' && row.attachment?.type === 'queued_command') {
+            const item = row.attachment, prompt = item.prompt
+            result.queued.push({ uuid: item.source_uuid, delivery: item.delivery_id, type: 'user', role: 'user', sessionId: row.sessionId, isSidechain: row.isSidechain,
+              hash: typeof prompt === 'string' || Array.isArray(prompt) ? messageHash('user', { role: 'user', content: prompt }) : null })
+          } else if (row.type === 'queue-operation' && row.operation === 'remove' && row.reason === 'absorbed_mid_turn') {
+            result.removed.push({ uuid: row.commandUuid, delivery: row.deliveryId, sessionId: row.sessionId })
+          } else if (['user', 'assistant'].includes(row.type)) throw artifactError('artifact message is unreadable')
+        }
+        for (let position = 0; position < Number(detail.size);) {
+          const chunk = await read(Math.min(64 * 1024, Number(detail.size) - position), position)
+          position += chunk.length
+          for (let start = 0; start < chunk.length;) {
+            const newline = chunk.indexOf(10, start), end = newline < 0 ? chunk.length : newline
+            const part = chunk.subarray(start, end)
+            if (!skip) {
+              parts.push(part)
+              length += part.length
+              const type = classified ? null : Buffer.concat(parts, length).subarray(0, 4096).toString('utf8').match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/)?.[1]
+              classified ||= Boolean(type) || length >= 4096
+              if (type && !relevant.includes(type)) { skip = true; parts = [] }
+              else if (length > ARTIFACT_LINE_BYTES) throw artifactError('a relevant line exceeds 16 MiB', 'CLOUD_ARTIFACT_LINE_LIMIT')
+            }
+            if (newline >= 0) { consume(); parts = []; length = 0; skip = false; classified = false }
+            start = newline < 0 ? chunk.length : newline + 1
+          }
+        }
+        consume()
+      }
+      if ((await artifactStat(file)).signature !== signature) throw artifactError('artifact changed while reading')
+      return result
+    } finally { await handle.close() }
+  })()
+  budget.indexes.set(key, reading)
+  try { return await reading } catch (error) { budget.indexes.delete(key); throw error }
+}
+
+async function supplementalCoverage(events, row, budget, inputs = null) {
+  if (!events.length) return null
+  if (events.some(event => !UUID.test(event.uuid ?? '') || event.role !== event.type || event.agentId !== undefined && !agentName(event.agentId) || event.isSidechain !== undefined && typeof event.isSidechain !== 'boolean')) throw artifactError('remote event identity is incomplete')
+  inputs ??= await artifactInputs(row)
+  const local = await artifactIndex(inputs.transcript, 'main', budget)
+  const main = Map.groupBy(local.main, event => event.uuid)
+  const queues = new Map()
+  for (const item of local.queued) {
+    const prior = queues.get(item.uuid)
+    if (!UUID.test(item.uuid ?? '') || typeof item.delivery !== 'string' || !item.delivery || !item.hash || item.sessionId !== row.id || item.isSidechain || prior && (!eventAgrees(prior, item) || prior.delivery !== item.delivery)) throw artifactError('queued prompt identity or replay copies disagree')
+    queues.set(item.uuid, item)
+  }
+  const remainder = [], pending = [], queuedIds = [], counts = { main: 0, subagent: 0, queued: 0 }, consumed = new Set()
+  for (const event of events) {
+    if (main.has(event.uuid)) {
+      const copies = main.get(event.uuid)
+      if (event.isSidechain === true || event.agentId !== undefined || copies.some(copy => !eventAgrees(copy, event)) || consumed.has(event.uuid)) throw artifactError('main event identity or multiplicity disagrees')
+      consumed.add(event.uuid)
+      remainder.push(event.hash)
+      counts.main++
+    } else if (queues.has(event.uuid)) {
+      const item = queues.get(event.uuid)
+      if (!eventAgrees(item, event) || event.isSidechain === true || event.agentId !== undefined || consumed.has(event.uuid) || !local.removed.some(remove => remove.uuid === item.uuid && remove.delivery === item.delivery && remove.sessionId === row.id)) throw artifactError('queued prompt delivery is not proven')
+      consumed.add(event.uuid)
+      queuedIds.push(event.uuid)
+      counts.queued++
+    } else pending.push(event)
+  }
+  if (queuedIds.length && !orderedConversation(queuedIds, [...queues.keys()])) throw artifactError('queued prompt order disagrees')
+  if (remainder.length && !conversationMatch(remainder, row.conversation)) throw artifactError('remaining main history does not match')
+  let files = inputs.files
+  if (pending.length) {
+    const hinted = new Set(pending.flatMap(event => event.agentId === undefined ? [] : [event.agentId]))
+    if (pending.every(event => event.agentId !== undefined)) files = files.filter(file => hinted.has(file.agent))
+    const times = pending.map(event => milliseconds(event.timestamp)).filter(time => time >= 0)
+    const earliest = times.reduce((a, b) => Math.min(a, b), Infinity), latest = times.reduce((a, b) => Math.max(a, b), -Infinity)
+    for (const file of files) {
+      const { timestamp } = await artifactIndex(file.file, 'header', budget)
+      file.priority = hinted.has(file.agent) ? 0 : !times.length || timestamp < 0 || file.modified < timestamp ? 1 : timestamp <= latest && file.modified >= earliest ? 0 : 2
+    }
+    const found = new Map(), owners = new Map()
+    for (const file of files.toSorted((a, b) => a.priority - b.priority || a.file.localeCompare(b.file))) {
+      const localEvents = (await artifactIndex(file.file, 'agent', budget)).events
+      const needed = pending.filter(event => event.agentId === undefined || event.agentId === file.agent)
+      const ids = new Set(needed.map(event => event.uuid))
+      const selected = localEvents.filter(event => ids.has(event.uuid))
+      const byId = Map.groupBy(selected, event => event.uuid)
+      for (const event of selected) {
+        if (event.sessionId !== row.id || event.agentId !== file.agent || event.isSidechain !== true || main.has(event.uuid) || queues.has(event.uuid) || owners.has(event.uuid) && owners.get(event.uuid) !== file.agent) throw artifactError('subagent ownership or stream assignment disagrees')
+        owners.set(event.uuid, file.agent)
+      }
+      for (const copies of byId.values()) if (copies.some(event => !eventAgrees(copies[0], event))) throw artifactError('subagent payload, order or multiplicity disagrees')
+      const stream = needed.filter(event => byId.has(event.uuid))
+      let at = 0
+      for (const event of stream) {
+        if (event.isSidechain === false) throw artifactError('remote sidechain identity disagrees')
+        while (at < selected.length && !eventAgrees(selected[at], event)) at++
+        if (at === selected.length) throw artifactError('subagent payload, order or multiplicity disagrees')
+        at++
+      }
+      for (const event of stream) found.set(event, file.agent)
+      if (found.size === pending.length) { counts.subagent = pending.length; break }
+    }
+  }
+  for (const [file, signature] of inputs.fingerprints) {
+    const current = await lstat(file, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+    if ((current ? statIdentity(current) : null) !== signature || current && await realpath(file) !== file) throw artifactError('session artifacts changed during coverage analysis')
+  }
+  if (counts.subagent !== pending.length) return null
+  return { matchMode: 'artifacts', artifactCounts: counts, artifactSignature: sha(stable(events)) }
+}
+
 async function priorHistory(cache, key) {
   cache.used.histories.add(key)
   const item = cache.data.histories[key]
@@ -1292,7 +1546,7 @@ const validDesktopRecord = (row) => {
   return LOCAL_RECORD.test(record.sessionId ?? '') && typeof file === 'string' && path.basename(file) === `${record.sessionId}.json`
 }
 
-async function cloudInventory(cloud, from, targets, move, cache, report, cutoff = null, liveSources = [], sessionIds = null, excludedIds = new Set()) {
+async function cloudInventory(cloud, from, targets, move, cache, report, cutoff = null, liveSources = [], sessionIds = null, excludedIds = new Set(), options = {}) {
   if (!cloud) return { checked: false, matches: [], blocked: [], waiting: [], later: [], client: null }
   const account = from.find((candidate) => sameAccount(candidate, cloud))
   if (!account) return { checked: false, matches: [], blocked: [], waiting: [], later: [], client: cloud }
@@ -1343,6 +1597,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
     return false
   })
   const matches = []
+  const artifacts = artifactBudget(options.artifactLimit)
   let completed = 0
   if (sessions.length) progress(report, 'cloud scan', completed, sessions.length)
   const analyze = async (session) => {
@@ -1359,13 +1614,18 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       if (linked.length > 1) return { blocked: { id: session.id, title: session.title, account, error: 'multiple local targets carry the Remote Control id' } }
       assertRemoteIdle(detail)
       const signature = sha(stable({ id: session.id, updatedAt: session.updated_at, lastEventAt: detail.last_event_at, status: detail.status }))
-      let remoteConversation = cacheLookup(cache, 'remote', session.id, signature)?.conversation
+      let remote = cacheLookup(cache, 'remote', session.id, signature)
+      let remoteConversation = remote?.conversation
       let rows = null
-      if (!remoteConversation) {
+      const refresh = async () => {
         rows = (await stableRemoteRows(cloud, session.id)).rows
-        remoteConversation = conversationFromRows(rows)
-        cacheStore(cache, 'remote', session.id, signature, { conversation: remoteConversation })
+        const current = conversationFromRows(rows)
+        if (remoteConversation && sha(stable(current)) !== sha(stable(remoteConversation))) throw new Error('Remote Control history changed since cached analysis')
+        remoteConversation = current
+        remote = { conversation: current, events: remoteEvents(rows) }
+        cacheStore(cache, 'remote', session.id, signature, remote)
       }
+      if (!remoteConversation) await refresh()
       const findCovered = (items) => items.flatMap((candidate) => {
         const matchMode = conversationMatch(remoteConversation, candidate.conversation)
         if (matchMode) return [{ ...candidate, matchMode }]
@@ -1378,23 +1638,43 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       const verified = linkedCovered.length === 1 ? linkedCovered : covered
       if (verified.length > 1) return { blocked: { id: session.id, title: session.title, account, error: 'multiple verified local target histories' } }
       if (verified.length === 1) return { match: { session, target: verified[0], conversationSha: sha(stable(remoteConversation)), account } }
+      if (linked.length === 1 && (linked[0].row.artifactBridgeIds ?? remoteIdsOf({ ...linked[0].row, members: [] })).includes(sessionId)) {
+        const selected = linked[0]
+        let retrySignature
+        try {
+          const inputs = await artifactInputs(selected.row)
+          retrySignature = sha(stable({ engine: ARTIFACT_ENGINE, limit: artifacts.limit, remote: signature, id: selected.id, record: selected.row.recordSemantic, files: inputs.fingerprints }))
+          const previous = remote?.artifactFailure
+          if (options.automatic && previous?.signature === retrySignature) throw artifactError('unchanged inputs still exceed the supplemental read limits', previous.code)
+          if (!Array.isArray(remote.events)) await refresh()
+          const proof = await supplementalCoverage(remote.events, selected.row, artifacts, inputs)
+          if (proof) return { match: { session, target: { ...selected, ...proof }, conversationSha: sha(stable(remoteConversation)), account } }
+        } catch (error) {
+          if (['CLOUD_ARTIFACT_BUDGET', 'CLOUD_ARTIFACT_LINE_LIMIT'].includes(error.code) && retrySignature) {
+            remote.artifactFailure = { signature: retrySignature, code: error.code }
+            cacheStore(cache, 'remote', session.id, signature, remote)
+          }
+          const typed = typeof error.code === 'string' && error.code.startsWith('CLOUD_ARTIFACT_')
+          return { blocked: { id: session.id, title: session.title, account, code: typed ? error.code : 'CLOUD_ARTIFACT_UNCERTAIN', error: typed ? error.message : 'Supplemental cloud coverage is uncertain: local artifacts could not be verified' } }
+        }
+      }
       if (remoteConversation.length < 4 && findCovered(candidates.filter((candidate) => !eligible.includes(candidate))).length) return { blocked: { id: session.id, title: session.title, account, error: 'remote history is too short to match a renamed local target' } }
       const anchors = linked.length ? linked : named
       if (anchors.length !== 1) return { blocked: { id: session.id, title: session.title, account, error: anchors.length ? 'multiple divergent local targets' : 'no linked or same-title local target' } }
       const base = anchors[0]
       const minimumAnchor = 8
       if (!linked.length && !conversationAnchored(remoteConversation, base.conversation, minimumAnchor)) return { blocked: { id: session.id, title: session.title, account, error: 'same-title local target does not share a branch segment' } }
+      const record = desktopRecordOf(base.row)
+      const ownership = base.row.taskOwned || record.scheduledTaskId ? ['CLOUD_RESCUE_TASK', 'is scheduled']
+        : record.notifySessionId ? ['CLOUD_RESCUE_NOTIFICATION', 'handles notifications'] : base.row.worker ? ['CLOUD_RESCUE_WORKER', 'is still running'] : null
+      if (ownership) return { blocked: { id: session.id, title: session.title, account, code: ownership[0], error: `The cloud copy was kept because its full history could not be matched and the local conversation ${ownership[1]}.${ownership[0] === 'CLOUD_RESCUE_WORKER' ? ' Try again after it stops.' : ''}` } }
       if (!rows) {
-        rows = (await stableRemoteRows(cloud, session.id)).rows
-        const currentConversation = conversationFromRows(rows)
-        if (sha(stable(currentConversation)) !== sha(stable(remoteConversation))) throw new Error('Remote Control history changed since cached analysis')
+        await refresh()
       }
       rescuePayloads(rows)
-      const record = desktopRecordOf(base.row)
-      if (base.row.taskOwned || base.row.worker || record.scheduledTaskId || record.notifySessionId) return { blocked: { id: session.id, title: session.title, account, error: 'local rescue target owns a task, notification, or running worker' } }
       return { match: { session, target: { kind: 'rescue', base, id: null, title: session.title, matchMode: 'rescue' }, conversationSha: sha(stable(remoteConversation)), account } }
     } catch (error) {
-      return { blocked: { id: session.id, title: session.title, account, error: `Remote Control history unreadable: ${error.message}` } }
+      return { blocked: { id: session.id, title: session.title, account, code: error.code, error: `Remote Control history unreadable: ${error.message}` } }
     } finally {
       progress(report, 'cloud scan', ++completed, sessions.length)
     }
@@ -1407,7 +1687,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       else blocked.push(result.blocked)
     }
   }
-  return { checked: true, matches, blocked, waiting, later, client: cloud, account: cloud.account, org: cloud.org, source: account }
+  return { checked: true, matches, blocked, waiting, later, client: cloud, account: cloud.account, org: cloud.org, source: account, artifacts }
 }
 
 const rehomeReason = (source, to, targetIds, targetNames) => {
@@ -1571,6 +1851,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     }
   }
   for (const target of targets) {
+    target.artifactBridgeIds = [...new Set([...remoteIdsOf(target), ...(options.cloudBridgeIds?.get(target.id) ?? []).map(remoteId).filter(Boolean)])]
     const prior = target.session.record.priorCliSessionIds
     const priorIds = Array.isArray(prior) ? prior.filter(id => UUID.test(id) && options.cloudBridgeIds?.has(id)) : []
     const remembered = [target.id, ...priorIds].flatMap(id => options.cloudBridgeIds?.get(id) ?? [])
@@ -1605,7 +1886,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   const cloudCutoff = options.cloudCutoff ?? (cloudRequested ? requestedAt : null)
   const brokenTasks = [...from, to].find(account => account.taskError)
   if (options.cloud && brokenTasks) throw new Error(brokenTasks.taskError)
-  const cloudPlan = await cloudInventory(options.cloud, from, targets, options.cloudTargetOnly ? [] : move, cache, report, cloudCutoff, found, options.cloudSessionIds, options.cloudExcludedIds)
+  const cloudPlan = await cloudInventory(options.cloud, from, targets, options.cloudTargetOnly ? [] : move, cache, report, cloudCutoff, found, options.cloudSessionIds, options.cloudExcludedIds, options)
   const retiring = new Set([...move, ...there].flatMap((row) => (row.members ?? [row]).map((member) => member.file)))
   const links = sourceCloudLinks([...move, ...there])
   const cloudCheckAccounts = from.flatMap(account => {
@@ -1742,6 +2023,7 @@ const inventoryFailure = (item) => ({
     ? item.members.map((member) => `${member.account.label} | ${member.title || path.basename(member.file)}`).join(' + ')
     : `${item.account.label} | ${item.title || path.basename(item.file)}`,
   error: item.error ?? 'unreadable Desktop record',
+  ...(item.code ? { code: item.code } : {}),
   ...failureIdentity(item)
 })
 const taggedCloudFailure = (cloud, failure) => ({ ...failure, cloudAccount: cloud.account, cloudOrg: cloud.org })
@@ -2445,6 +2727,7 @@ async function reconcileFiles(paths, options = {}) {
       error: kept.length ? `${kept.length} changed copies left in place` : 'interrupted finalization rolled back'
     })
   }
+  await foldRestartHistory(paths, p.file, receipt)
   await saveJson(p.file, receipt)
   await rm(`${p.file}.journal`, { force: true })
   return recovered.length === 1 ? recovered[0] : {
@@ -2867,7 +3150,8 @@ const remoteReceipt = (match) => ({
   conversationSha: match.conversationSha,
   targetId: match.target.id,
   targetKind: match.target.kind,
-  matchMode: match.target.matchMode
+  matchMode: match.target.matchMode,
+  ...(match.target.artifactCounts ? { artifactCounts: match.target.artifactCounts } : {})
 })
 
 async function targetActivation(row, keepArchived = false) {
@@ -2984,7 +3268,7 @@ function finishCloudAttempt(receipt, cloud, later = [], waiting = []) {
   check.waiting = [...new Map([...(check.waiting ?? []), ...waiting].map(row => [row.id, row])).values()]
   check.status = failures.length ? failures.every(row => row.blockedByLocal?.length) && !check.waiting.length ? 'blocked-local' : 'failed' : check.waiting.length ? 'waiting' : 'complete'
   check.checkedAt = new Date().toISOString()
-  if (failures.length) check.failures = failures.map(({ id, title, error }) => ({ id, title, error }))
+  if (failures.length) check.failures = failures.map(({ id, title, error, code }) => ({ id, title, error, ...(code ? { code } : {}) }))
   else delete check.failures
   if (later.length) check.later = later
   else delete check.later
@@ -3053,6 +3337,14 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       if (current.marker !== pending.lastEventAt) throw new Error('Remote Control history changed before archival')
       if (current.stateSha !== pending.stateSha) throw new Error('Remote Control history or input changed before archival')
       if (retained && (!await retainedUnchanged() || !await untouched(row, workers()))) throw new Error('Retained local history changed before Remote Control archival')
+      if (match.target.matchMode === 'artifacts') {
+        const events = remoteEvents(current.rows)
+        if (sha(stable(events)) !== match.target.artifactSignature) throw artifactError('remote event identities changed before archival')
+        const intact = row?.targetId ? !(await targetChanges(row, workers(), true)).length : await untouched(row, workers())
+        if (!intact) throw artifactError('local target changed before archival')
+        const proof = await supplementalCoverage(events, match.target.row, inv.cloud.artifacts)
+        if (!proof || stable(proof.artifactCounts) !== stable(match.target.artifactCounts)) throw artifactError('the selected local artifacts no longer cover the remote history')
+      }
       attempted = true
       await cloud.archive(pending.id)
       const after = await waitRemote(cloud, pending.id, ['archived'])
@@ -3480,7 +3772,7 @@ export function finishPending(paths, options = {}) {
         cloudBridgeIds.set(row.targetId, [...new Set([...(cloudBridgeIds.get(row.targetId) ?? []), ...row.bridgeIds])])
       }
       const cloudExcludedIds = new Set(receipt.failed.filter(row => cloudTagged(row, cloud) && row.blockedByLocal?.length).map(row => remoteId(row.id)))
-      inv = await inventory([cloudSource], to, paths, report, { cloud, cloudRequested: true, cloudTargetOnly: true, cloudCutoff: receipt.startedAt, cloudBridgeIds, cloudSessionIds: check.sessionIds ? new Set(check.sessionIds) : null, cloudExcludedIds, writeCache: true })
+      inv = await inventory([cloudSource], to, paths, report, { cloud, cloudRequested: true, cloudTargetOnly: true, cloudCutoff: receipt.startedAt, cloudBridgeIds, cloudSessionIds: check.sessionIds ? new Set(check.sessionIds) : null, cloudExcludedIds, writeCache: true, automatic: Boolean(options.automatic), artifactLimit: options.artifactLimit })
     } catch (error) {
       addCloudFailure(receipt, cloud, { id: null, title: check.label, error: error.message })
       finishCloudAttempt(receipt, cloud)
