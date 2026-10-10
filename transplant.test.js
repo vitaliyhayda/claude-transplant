@@ -293,6 +293,7 @@ test('post-quit deadline exhaustion still sends a bounded reopen request', async
   assert.ok(calls.at(-1).timeout > 0)
   assert.equal(result.ok, false)
   assert.match(result.error, /exceeded its deadline/)
+  assert.equal(lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8')).at(-1).stopCode, 'RESTART_DEADLINE')
 })
 
 test('a journal failure after quit cannot prevent the reopen request', async () => {
@@ -3282,6 +3283,392 @@ test('attachment prompts and tiny ordering drift prove semantic Remote Control c
   assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
 })
 
+async function artifactFixture({ large = false, wrappers = false } = {}) {
+  const h = await home(), main = branchEntries(365, SOURCE, 1000)
+  const agents = [35, 35, 34].map((amount, index) => branchEntries(amount, SOURCE, 3000 + index * 100).map(row => ({ ...row, agentId: `a${index}`, isSidechain: true })))
+  agents[0][0].message = structuredClone(main[0].message)
+  const prompt = [{ type: 'text', text: 'Synthetic queued image' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj'.repeat(large ? 300_000 : 4) } }]
+  const queued = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', prompt, source_uuid: id(8000), delivery_id: 'fixture-delivery' } }
+  const removal = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', commandUuid: id(8000), deliveryId: 'fixture-delivery', sessionId: SOURCE }
+  const directory = path.join(h.project, SOURCE, 'subagents')
+  await mkdir(directory, { recursive: true })
+  const f = { h, main, agents, queued, removal, directory, status: 'active', calls: 0, reads: 0, extra: [] }
+  f.remote = [...main, ...agents.flat(), entry('user', 8000, null, SOURCE, { message: { role: 'user', content: prompt } })]
+  f.write = async () => {
+    await h.write(SOURCE, [...main, ...f.extra, queued, { ...queued, uuid: id(8101) }, removal])
+    for (const [index, rows] of agents.entries()) await writeFile(path.join(directory, `agent-a${index}.jsonl`), rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  }
+  await f.write()
+  await h.record('Z', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_artifacts'], scheduledTaskId: 'artifact_task' }))
+  f.taskFile = path.join(h.dir('Z'), 'scheduled-tasks.json')
+  await writeFile(f.taskFile, JSON.stringify({ scheduledTasks: [{ id: 'artifact_task', notifySessionId: `local_${SOURCE}`, enabled: false, prompt: 'Synthetic task' }], runRetries: { artifact_task: { attempts: 2 } } }))
+  f.cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_artifacts', title: 'Renamed synthetic mirror', status: f.status, updated_at: f.updated })],
+    eventRows: async () => {
+      f.reads++
+      return remoteRows(f.remote.map(row => {
+        const copy = structuredClone(row)
+        if (!wrappers) { delete copy.agentId; delete copy.isSidechain }
+        return copy
+      }))
+    },
+    session: async () => remoteState(f.status),
+    archive: async () => { f.calls++; f.status = 'archived' },
+    unarchive: async () => { f.status = 'active' }
+  })
+  const all = await accounts(h.paths, [])
+  f.from = all.find(row => row.account === h.acct.P)
+  f.to = all.find(row => row.account === h.acct.Z)
+  f.inventory = (options = {}) => inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [], ...options })
+  return f
+}
+
+test('artifact coverage archives all 470 events without rescue or input changes with optional wrappers present or absent', async () => {
+  for (const wrappers of [false, true]) {
+    const f = await artifactFixture({ large: true, wrappers }), { h } = f
+    f.extra.push({ type: 'progress', data: 'x'.repeat(1_200_000) })
+    await f.write()
+    assert.ok(Buffer.byteLength(JSON.stringify(f.queued)) > 1024 * 1024)
+    const files = [path.join(h.project, `${SOURCE}.jsonl`), f.taskFile, path.join(h.dir('Z'), `local_${SOURCE}.json`), ...[0, 1, 2].map(index => path.join(f.directory, `agent-a${index}.jsonl`))]
+    const before = await Promise.all(files.map(file => readFile(file)))
+    const inv = await f.inventory({ writeCache: true })
+    assert.deepEqual(inv.cloud.blocked, [])
+    assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+    assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 365, subagent: 104, queued: 1 })
+    const used = inv.cloud.artifacts.used
+    const moved = await move(inv, f.to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.equal(f.calls, 1)
+    assert.equal(moved.receipt.sessions.length, 0)
+    assert.equal(moved.receipt.remote[0].matchMode, 'artifacts')
+    assert.deepEqual(moved.receipt.remote[0].artifactCounts, { main: 365, subagent: 104, queued: 1 })
+    assert.equal(inv.cloud.artifacts.used, used)
+    assert.deepEqual(await Promise.all(files.map(file => readFile(file))), before)
+    assert.ok((await undo(h.paths, { cloud: f.cloud, processes: [] })).dest)
+    assert.equal(f.status, 'active')
+  }
+})
+
+test('artifact coverage refuses ownership, identity, order, multiplicity and delivery failures', async () => {
+  for (const change of ['parent', 'agent', 'collision', 'conflicting copy', 'main identity', 'order', 'missing', 'changed', 'duplicate event', 'replay', 'delivery', 'undelivered', 'empty']) {
+    const f = await artifactFixture()
+    if (change === 'parent') f.agents[0][0].sessionId = id(999)
+    if (change === 'agent') f.agents[0][0].agentId = 'another'
+    if (change === 'collision') f.agents[1].push({ ...f.agents[0][0], agentId: 'a1' })
+    if (change === 'conflicting copy') f.agents[0].push({ ...f.agents[0][0], message: { role: 'user', content: 'Conflicting copy' } })
+    if (change === 'main identity') f.remote[0] = { ...f.remote[0], message: f.agents[0][1].message }
+    if (change === 'order') f.agents[0].reverse()
+    if (change === 'missing') f.agents[0].shift()
+    if (change === 'changed') f.agents[0][0] = { ...f.agents[0][0], message: { role: 'user', content: 'Changed synthetic content' } }
+    if (change === 'duplicate event') f.remote.push(f.remote[365])
+    if (change === 'delivery') f.removal.deliveryId = 'another-delivery'
+    if (change === 'undelivered') f.removal.reason = 'cancelled'
+    if (change === 'empty') f.remote = []
+    await f.write()
+    if (change === 'replay') await appendFile(path.join(f.h.project, `${SOURCE}.jsonl`), JSON.stringify({ ...f.queued, attachment: { ...f.queued.attachment, prompt: 'Conflicting replay' } }) + '\n')
+    const inv = await f.inventory()
+    assert.deepEqual(inv.cloud.matches, [], change)
+    assert.ok(['CLOUD_ARTIFACT_UNCERTAIN', 'CLOUD_RESCUE_TASK'].includes(inv.cloud.blocked[0]?.code), `${change}: ${JSON.stringify(inv.cloud.blocked)}`)
+    assert.equal(f.calls, 0)
+  }
+})
+
+test('artifact time hints never prove absence and ordinary queue delivery consumes one event', async () => {
+  const f = await artifactFixture()
+  for (const [index, stream] of f.agents.entries()) for (const event of stream) {
+    if (index === 0) delete event.timestamp
+    else event.timestamp = '2099-01-01T00:00:00.000Z'
+  }
+  f.main.push(f.remote.at(-1))
+  await f.write()
+  const inv = await f.inventory()
+  assert.deepEqual(inv.cloud.blocked, [])
+  assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 366, subagent: 104, queued: 0 })
+  f.remote = f.remote.slice(365, -1)
+  assert.deepEqual((await f.inventory()).cloud.matches[0].target.artifactCounts, { main: 0, subagent: 104, queued: 0 })
+  f.agents[0].push(f.agents[0][0])
+  f.remote.push(f.agents[0][0])
+  await f.write()
+  assert.deepEqual((await f.inventory()).cloud.matches[0].target.artifactCounts, { main: 0, subagent: 105, queued: 0 })
+})
+
+test('artifact queued string prompts retain delivery identity and stream order', async () => {
+  for (const reverse of [false, true]) {
+    const f = await artifactFixture()
+    f.queued.attachment.prompt = 'First queued string'
+    f.remote[f.remote.length - 1] = entry('user', 8000, null, SOURCE, { message: { role: 'user', content: 'First queued string' } })
+    await f.write()
+    await appendFile(path.join(f.h.project, `${SOURCE}.jsonl`), [
+      { ...f.queued, uuid: id(8200), attachment: { ...f.queued.attachment, source_uuid: id(8001), delivery_id: 'second-delivery', prompt: 'Second queued string' } },
+      { ...f.removal, commandUuid: id(8001), deliveryId: 'second-delivery' }
+    ].map(row => JSON.stringify(row)).join('\n') + '\n')
+    f.remote.push(entry('user', 8001, null, SOURCE, { message: { role: 'user', content: 'Second queued string' } }))
+    if (reverse) f.remote.splice(-2, 2, ...f.remote.slice(-2).reverse())
+    const inv = await f.inventory()
+    if (reverse) assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    else assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 365, subagent: 104, queued: 2 })
+  }
+})
+
+test('artifact optional outer wrappers validate hints and reject contradictions', async () => {
+  for (const contradict of [false, true]) {
+    const f = await artifactFixture({ wrappers: true }), original = f.cloud.eventRows
+    f.cloud.eventRows = async id => (await original(id)).map(row => {
+      if (!row.payload.agentId) return row
+      const copy = { ...row, agentId: row.payload.agentId, isSidechain: row.payload.isSidechain }
+      if (contradict) copy.agentId = 'different'
+      else { delete copy.payload.agentId; delete copy.payload.isSidechain }
+      return copy
+    })
+    const inv = await f.inventory()
+    if (contradict) assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    else assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+  }
+})
+
+test('artifact legacy cache upgrades preserve warm history and manifest hits', async () => {
+  const f = await artifactFixture(), file = path.join(f.h.paths.state, 'cache.json'), unrelated = id(9000)
+  await f.h.write(unrelated, branchEntries(12, unrelated, 12000))
+  await f.h.record('Z', unrelated, rehomeRecord())
+  f.to = (await accounts(f.h.paths, [])).find(row => row.account === f.h.acct.Z)
+  await f.inventory({ writeCache: true })
+  const cache = JSON.parse(await readFile(file))
+  assert.equal(Object.keys(cache.histories).length, 2)
+  assert.ok(Object.values(cache.histories).every(item => !Object.hasOwn(item.value.result, 'mainIdentities')))
+  for (const item of Object.values(cache.remote)) delete item.value.events
+  await writeFile(file, JSON.stringify(cache))
+  const original = fs.open, indexed = []
+  fs.open = async (file, ...args) => {
+    if (String(file).endsWith('.jsonl')) indexed.push(String(file))
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  const prior = f.reads
+  let inv
+  try { inv = await f.inventory({ writeCache: true }) }
+  finally { fs.open = original; syncBuiltinESMExports() }
+  assert.equal(inv.cacheStats.historyMisses, 0)
+  assert.equal(inv.cacheStats.historyHits, 2)
+  assert.ok(inv.cacheStats.manifestHits > 0)
+  assert.equal(f.reads, prior + 1)
+  assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+  assert.ok(indexed.some(file => path.basename(file) === `${SOURCE}.jsonl`))
+  assert.ok(indexed.every(file => path.basename(file) === `${SOURCE}.jsonl` || path.basename(path.dirname(path.dirname(file))) === SOURCE))
+  const saved = JSON.parse(await readFile(file))
+  assert.deepEqual(saved.histories, cache.histories)
+  assert.equal(saved.version, 11)
+  assert.equal(saved.semanticVersion, 3)
+  f.remote = f.main
+  f.updated = '2026-09-02T00:00:00.000Z'
+  const mainOnly = await f.inventory({ writeCache: true })
+  assert.equal(mainOnly.cacheStats.historyHits, 2)
+  assert.equal(mainOnly.cacheStats.historyMisses, 0)
+  assert.equal(mainOnly.cloud.matches[0].target.matchMode, 'ordered')
+  assert.equal(mainOnly.cloud.artifacts.used, 0)
+  assert.deepEqual(JSON.parse(await readFile(file)).histories, cache.histories)
+})
+
+test('artifact limits count probes, skip unrelated large lines and suppress unchanged automatic failures', async () => {
+  const f = await artifactFixture()
+  const prefix = Buffer.byteLength(f.main.map(row => JSON.stringify(row)).join('\n') + '\n' + JSON.stringify({ type: 'progress', data: '' }) + '\n')
+  f.extra.push({ type: 'progress', data: 'x'.repeat((65534 - prefix % 65536 + 65536) % 65536) })
+  f.extra.push({ type: 'progress', data: 'x'.repeat(17 * 1024 * 1024) })
+  await f.write()
+  const complete = await f.inventory({ writeCache: true })
+  assert.equal(complete.cloud.matches[0].target.matchMode, 'artifacts')
+  const mainBytes = (await stat(path.join(f.h.project, `${SOURCE}.jsonl`))).size
+  assert.ok(complete.cloud.artifacts.used > mainBytes)
+  const options = { writeCache: true, artifactLimit: mainBytes + 100 }
+  const first = await f.inventory(options)
+  assert.equal(first.cloud.blocked[0].code, 'CLOUD_ARTIFACT_BUDGET')
+  assert.equal(first.cloud.artifacts.used, mainBytes)
+  const second = await f.inventory({ ...options, automatic: true })
+  assert.equal(second.cloud.blocked[0].code, 'CLOUD_ARTIFACT_BUDGET')
+  assert.equal(second.cloud.artifacts.used, 0)
+  assert.equal(second.cacheStats.historyMisses, 0)
+  f.updated = '2026-09-02T00:00:00.000Z'
+  const changed = await f.inventory({ ...options, automatic: true })
+  assert.ok(changed.cloud.artifacts.used > 0)
+  await appendFile(path.join(f.directory, 'agent-a0.jsonl'), '\n')
+  assert.ok((await f.inventory({ ...options, automatic: true })).cloud.artifacts.used > 0)
+})
+
+test('automatic pending cloud retries retain typed artifact limits without rescanning unchanged files', async () => {
+  const f = await artifactFixture(), artifactLimit = (await stat(path.join(f.h.project, `${SOURCE}.jsonl`))).size + 100
+  const moved = await move(await f.inventory({ writeCache: true, artifactLimit }), f.to, f.h.paths)
+  assert.equal(moved.receipt.failed[0].code, 'CLOUD_ARTIFACT_BUDGET')
+  const original = fs.open
+  let reads = 0
+  fs.open = async (file, ...args) => {
+    if (String(file).endsWith('.jsonl')) reads++
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const receipt = JSON.parse(await readFile(moved.file))
+      if (receipt.automaticCloudAttempt) receipt.automaticCloudAttempt.at = 0
+      await writeFile(moved.file, JSON.stringify(receipt))
+      const result = await finishPending(f.h.paths, { cloud: f.cloud, automatic: f.from, artifactLimit })
+      assert.equal(result.failed[0].code, 'CLOUD_ARTIFACT_BUDGET')
+    }
+    assert.equal(reads, 0)
+    await appendFile(path.join(f.directory, 'agent-a0.jsonl'), '\n')
+    const receipt = JSON.parse(await readFile(moved.file))
+    receipt.automaticCloudAttempt.at = 0
+    await writeFile(moved.file, JSON.stringify(receipt))
+    await finishPending(f.h.paths, { cloud: f.cloud, automatic: f.from, artifactLimit })
+    assert.ok(reads > 0)
+  } finally { fs.open = original; syncBuiltinESMExports() }
+})
+
+test('artifact relevant lines over 16 MiB are typed uncertainty and cannot authorize rescue', async () => {
+  const f = await artifactFixture()
+  f.queued.padding = ''
+  const available = 16 * 1024 * 1024 - Buffer.byteLength(JSON.stringify(f.queued)) + f.queued.attachment.prompt[1].source.data.length
+  f.queued.attachment.prompt[1].source.data = 'YWJj'.repeat(Math.floor(available / 4))
+  f.queued.padding = 'x'.repeat(available % 4)
+  assert.equal(Buffer.byteLength(JSON.stringify(f.queued)), 16 * 1024 * 1024)
+  await f.write()
+  assert.equal((await f.inventory()).cloud.matches[0].target.matchMode, 'artifacts')
+  f.queued.padding += 'x'
+  await f.write()
+  const inv = await f.inventory()
+  assert.deepEqual(inv.cloud.matches, [])
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_LINE_LIMIT')
+  assert.ok(inv.cloud.artifacts.used <= 16 * 1024 * 1024 + 256 * 1024)
+})
+
+test('artifact search stops after complete proof but still reads required files outside the time window', async () => {
+  const f = await artifactFixture(), file = path.join(f.directory, 'agent-unrelated.jsonl')
+  await writeFile(file, JSON.stringify(entry('user', 9999, null, SOURCE, { agentId: 'unrelated', isSidechain: true, timestamp: '2000-01-01T00:00:00.000Z', message: { role: 'user', content: 'x'.repeat(17 * 1024 * 1024) } })) + '\n')
+  await fs.utimes(file, new Date('2001-01-01'), new Date('2001-01-01'))
+  const inv = await f.inventory()
+  assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+  assert.ok(inv.cloud.artifacts.used < 1024 * 1024)
+  await unlink(file)
+  const required = path.join(f.directory, 'agent-a0.jsonl')
+  await writeFile(required, f.agents[0].map(row => JSON.stringify({ ...row, timestamp: '2000-01-01T00:00:00.000Z' })).join('\n') + '\n')
+  await fs.utimes(required, new Date('2001-01-01'), new Date('2001-01-01'))
+  assert.equal((await f.inventory()).cloud.matches[0].target.matchMode, 'artifacts')
+})
+
+test('artifact budget reservations are shared across eight concurrent cloud analyses', async () => {
+  const h = await home(), sources = Array.from({ length: 8 }, (_, index) => id(9000 + index)), histories = new Map()
+  for (const [index, sid] of sources.entries()) {
+    const main = branchEntries(4, sid, 10000 + index * 10), agent = entry('assistant', 11000 + index, null, sid, { agentId: 'fixture', isSidechain: true })
+    histories.set(`cse_parallel${index}`, [...main, agent])
+    await h.write(sid, main)
+    await h.record('Z', sid, rehomeRecord({ bridgeSessionIds: [`session_parallel${index}`] }))
+    const directory = path.join(h.project, sid, 'subagents')
+    await mkdir(directory, { recursive: true })
+    await writeFile(path.join(directory, 'agent-fixture.jsonl'), JSON.stringify(agent) + '\n')
+  }
+  const cloud = cloudFixture(h, { list: async () => [...histories.keys()].map(id => remoteSession({ id, title: id })), eventRows: async id => remoteRows(histories.get(id)) })
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud, processes: [], artifactLimit: 4000 })
+  assert.ok(inv.cloud.artifacts.used <= 4000)
+  assert.ok(inv.cloud.artifacts.used > 0)
+  assert.ok(inv.cloud.blocked.some(row => row.code === 'CLOUD_ARTIFACT_BUDGET'))
+  assert.ok(inv.cloud.matches.length < 8)
+  assert.ok(inv.cloud.matches.every(row => row.target.matchMode === 'artifacts'))
+})
+
+test('artifact final proof rejects changed UUIDs, roles and fresh file fingerprints', async () => {
+  for (const change of ['uuid', 'role', 'payload', 'sidecar']) {
+    const f = await artifactFixture(), inv = await f.inventory()
+    assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+    const original = f.cloud.eventRows
+    f.cloud.eventRows = async id => {
+      if (change === 'sidecar') {
+        f.agents[0][0].sessionId = id === 'cse_artifacts' ? SOURCE.slice(0, -1) + '2' : SOURCE
+        await f.write()
+      }
+      const rows = await original(id)
+      if (change === 'uuid') rows[365].payload.uuid = '00000000-0000-4000-8000-000000099999'
+      if (change === 'role') rows[365].payload.message.role = 'assistant'
+      if (change === 'payload') rows[365].payload.message.content = 'Changed after inventory'
+      return rows
+    }
+    const moved = await move(inv, f.to, f.h.paths)
+    assert.equal(f.calls, 0, change)
+    assert.equal(moved.ok, false, change)
+    assert.equal(moved.receipt.remote.length, 0, change)
+    assert.equal(moved.receipt.remotePending, undefined, change)
+  }
+})
+
+test('artifact indexes reparse identical bytes on a new inode before archival', async () => {
+  const f = await artifactFixture(), inv = await f.inventory(), before = inv.cloud.artifacts.used
+  const file = path.join(f.directory, 'agent-a0.jsonl'), raw = await readFile(file)
+  await unlink(file)
+  await writeFile(file, raw)
+  const result = await move(inv, f.to, f.h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(f.calls, 1)
+  assert.ok(inv.cloud.artifacts.used > before)
+})
+
+test('artifact ownership rejects symlink entries introduced after the ordinary sidecar scan', async () => {
+  for (const kind of ['file', 'root', 'subagents']) {
+    const f = await artifactFixture(), original = f.cloud.list, outside = path.join(f.h.root, 'unrelated-artifacts')
+    await mkdir(outside)
+    await writeFile(path.join(outside, 'agent-a0.jsonl'), f.agents[0].map(row => JSON.stringify(row)).join('\n') + '\n')
+    f.cloud.list = async () => {
+      if (kind === 'file') await symlink(path.join(outside, 'agent-a0.jsonl'), path.join(f.directory, 'agent-escape.jsonl'))
+      else {
+        const directory = kind === 'root' ? path.dirname(f.directory) : f.directory
+        await rename(directory, `${directory}.original`)
+        await symlink(outside, directory)
+      }
+      return original()
+    }
+    const inv = await f.inventory()
+    assert.deepEqual(inv.cloud.matches, [], kind)
+    assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN', kind)
+  }
+})
+
+test('artifact coverage also revalidates a rehomed target through normal archival', async () => {
+  const f = await artifactFixture(), { h } = f
+  await unlink(f.taskFile)
+  await unlink(path.join(h.dir('Z'), `local_${SOURCE}.json`))
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_artifacts'] }))
+  const all = await accounts(h.paths, [])
+  f.from = all.find(row => row.account === h.acct.P)
+  f.to = all.find(row => row.account === h.acct.Z)
+  const before = await fixtureSnapshot(h, [h.paths.pool])
+  const moved = await move(await f.inventory(), f.to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.deepEqual(moved.receipt.sessions.map(row => row.strategy), ['rehome'])
+  assert.equal(moved.receipt.remote[0].matchMode, 'artifacts')
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.pool]), before)
+})
+
+test('rescue ownership codes refuse before redundant downloads or unsupported payload processing', async () => {
+  for (const kind of ['task', 'notification', 'worker']) {
+    const h = await home(), main = branchEntries(8, SOURCE, 1)
+    await h.write(SOURCE, main)
+    await h.record('Z', SOURCE, rehomeRecord(kind === 'task' ? { scheduledTaskId: 'fixture-task' } : kind === 'notification' ? { notifySessionId: `local_${id(99)}` } : {}))
+    let reads = 0
+    const cloud = cloudFixture(h, { list: async () => [remoteSession({ id: 'cse_guard', title: 'Session 001' })], eventRows: async () => {
+      reads++
+      return remoteRows([...main, entry('assistant', 99, null, SOURCE, { message: { role: 'assistant', content: [{ type: 'unsupported-fixture' }] } })])
+    } })
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const options = { cloud, writeCache: true, processes: kind === 'worker' ? desktopFixture() : [] }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const inv = await inventory([from], to, h.paths, () => {}, options)
+      assert.deepEqual(inv.cloud.matches, [])
+      assert.equal(inv.cloud.blocked[0].code, `CLOUD_RESCUE_${kind.toUpperCase()}`)
+      assert.match(inv.cloud.blocked[0].error, /^The cloud copy was kept because its full history could not be matched and the local conversation /)
+      assert.match(inv.cloud.blocked[0].error, kind === 'task' ? /is scheduled\.$/ : kind === 'notification' ? /handles notifications\.$/ : /is still running\. Try again after it stops\.$/)
+      assert.equal(inv.cloud.blocked[0].error.includes('Try again'), kind === 'worker')
+    }
+    assert.equal(reads, 1, kind)
+  }
+})
+
 test('a divergent Remote Control history becomes a separate verified local session', async () => {
   const h = await home()
   const sharedLocal = branchEntries(8, SOURCE, 20)
@@ -5114,6 +5501,150 @@ test('task restart deadline preserves held families after completed ordinary wor
   const finished = await finishHeld(h.paths, { processes: [] })
   assert.equal(finished.ok, true)
   assert.equal(finished.receipt.sessions.length, 4)
+})
+
+test('restart diagnostics never rewrite a failed family receipt or journal and fold outcomes once after recovery', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  let snapshot, file
+  const failed = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, progress) => {
+    if (stage !== 'move' || progress?.completed !== 2 || snapshot) return
+    file = path.join(h.paths.state, readdirSync(h.paths.state).find(name => /^\d.*\.json$/.test(name)))
+    snapshot = [readFileSync(file), readFileSync(`${file}.journal`)]
+    mock.time = 23_000
+  } })
+  assert.ok(snapshot)
+  assert.equal(failed.ok, false)
+  assert.match(failed.reason, /mutation deadline/)
+  assert.deepEqual([await readFile(file), await readFile(`${file}.journal`)], snapshot)
+  const log = path.join(h.paths.state, 'restart-events.jsonl'), first = lines(await readFile(log, 'utf8'))
+  assert.deepEqual(first.map(row => row.event), ['start', 'exited', 'outcome'])
+  assert.equal(first.at(-1).stopCode, 'RESTART_DEADLINE')
+  assert.equal(first.at(-1).receiptCounts, null)
+  assert.ok(['moved', 'failed', 'archived'].every(key => !Object.hasOwn(first.at(-1), key)))
+  assert.ok(first.every(row => row.kind === 'move'))
+  assert.equal(first.at(-1).receiptId, path.basename(file))
+  assert.equal(first[0].planNonce, planned.plan.nonce)
+  assert.ok(first.every(row => row.selectionId === first[0].selectionId))
+  assert.ok(!JSON.stringify(first).includes(planned.plan.token))
+  mock.time = 0
+  const recovery = await finishWorkflow(h.paths, { io: mock.io })
+  assert.equal(recovery.plan.receiptFile, file)
+  await finishWorkflow(h.paths, { io: mock.io, approve: recovery.plan.token })
+  const recovered = JSON.parse(await readFile(file))
+  assert.equal(recovered.finalizing, false)
+  assert.equal(recovered.restartHistory.length, 2)
+  assert.equal(recovered.restartHistory[0].stopCode, 'RESTART_DEADLINE')
+  assert.equal(recovered.restartHistory[0].receiptCounts, null)
+  assert.equal(recovered.restartHistory[1].kind, 'finish')
+  const continuation = await finishWorkflow(h.paths, { io: mock.io })
+  const completed = await finishWorkflow(h.paths, { io: mock.io, approve: continuation.plan.token })
+  assert.equal(completed.ok, true)
+  assert.equal(completed.receipt.restartHistory.length, 3)
+  assert.equal(completed.receipt.restartHistory.at(-1).stopCode, 'COMPLETE')
+  assert.equal(completed.receipt.restartHistory.at(-1).kind, 'finish')
+  assert.equal(completed.added, 3)
+  assert.deepEqual(completed.receipt.restartHistory.at(-1).receiptCounts, { sessions: 4, failed: completed.receipt.failed.length, remote: 0 })
+  assert.equal(completed.receipt.restart.outcome, 'reopened')
+  await finishWorkflow(h.paths, { processes: [] })
+  const final = JSON.parse(await readFile(file))
+  assert.equal(new Set(final.restartHistory.map(row => row.attemptId)).size, 3)
+  assert.equal(final.restartHistory.length, 3)
+  assert.equal((await stat(log)).mode & 0o777, 0o600)
+})
+
+test('restart diagnostics preserve an unconfirmed quit after Desktop exits and reopens', async () => {
+  const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+  const command = mock.io.command
+  mock.io.command = async (...args) => {
+    const result = await command(...args)
+    return args[0].endsWith('osascript') ? { status: 1 } : result
+  }
+  let worked = false
+  const result = await withDesktopRestart(plan, h.paths, async () => { worked = true }, () => {}, mock.io)
+  assert.equal(worked, false)
+  assert.equal(result.ok, false)
+  assert.equal(result.result, undefined)
+  assert.equal(result.restart.outcomeBeforeReopen, 'quit-not-confirmed')
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  const events = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8'))
+  assert.deepEqual(events.map(row => row.event), ['start', 'outcome'])
+  assert.equal(events.at(-1).outcome, 'reopened')
+  assert.equal(events.at(-1).stopCode, 'QUIT_UNCONFIRMED')
+  assert.equal(events.at(-1).receiptCounts, null)
+})
+
+test('restart diagnostic retention, no-op outcomes and failures expose no content or raw errors', async () => {
+  const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+  await mkdir(h.paths.state, { recursive: true })
+  const file = path.join(h.paths.state, 'restart-events.jsonl')
+  await writeFile(file, '{}\n'.repeat(Math.floor(1024 * 1024 / 3)), { mode: 0o600 })
+  for (let attempt = 0; attempt < 3; attempt++) {
+    mock.rows = [desktopFixture()[0]]
+    await withDesktopRestart({ ...plan, kind: attempt === 1 ? 'user@example.com' : attempt === 2 ? 'undo' : 'refresh' }, h.paths, async () => {
+      if (attempt === 1) throw new Error('Synthetic private title user@example.com prompt approval-token server-response')
+      return null
+    }, () => {}, mock.io)
+  }
+  for (const name of [file, `${file}.1`]) assert.ok((await stat(name)).size <= 1024 * 1024)
+  const text = await readFile(file, 'utf8'), outcomes = lines(text).filter(row => row.event === 'outcome')
+  assert.deepEqual(outcomes.map(row => row.stopCode), ['NO_WORK', 'WORK_FAILED', 'NO_WORK'])
+  assert.deepEqual(outcomes.map(row => row.kind), ['restart', 'restart', 'undo'])
+  assert.ok(outcomes.every(row => row.receiptCounts === null))
+  assert.ok(!/private|user@|prompt|approval-token|server-response/.test(text))
+})
+
+test('restart diagnostic write failures leave successful moves and task recovery outcomes intact', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  const original = fs.open
+  fs.open = async (file, ...args) => {
+    if (String(file).includes('restart-events.jsonl')) throw new Error('fixture diagnostic storage unavailable')
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  let completed
+  try { completed = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+  finally { fs.open = original; syncBuiltinESMExports() }
+  assert.equal(completed.ok, true)
+  assert.equal(completed.receipt.sessions.length, 4)
+  assert.equal(completed.receipt.restartHistory, undefined)
+  assert.equal(completed.receipt.restart.outcome, 'reopened')
+  assert.equal(await readFile(path.join(h.paths.state, 'restart-events.jsonl')).catch(() => null), null)
+  const broken = await taskFamilyFixture(true, 1)
+  await interruptTaskFamily(broken, 'move', 'target')
+  const recoveryMock = taskHarness(), recovery = await finishWorkflow(broken.paths, { io: recoveryMock.io })
+  fs.open = async (file, ...args) => {
+    if (String(file).includes('restart-events.jsonl')) throw new Error('fixture diagnostic storage unavailable')
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  try { await finishWorkflow(broken.paths, { io: recoveryMock.io, approve: recovery.plan.token }) }
+  finally { fs.open = original; syncBuiltinESMExports() }
+  assert.deepEqual(JSON.parse(await readFile(broken.sourceFile)), broken.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(broken.targetFile)), broken.targetRegistry)
+  assert.equal(JSON.parse(await readFile(recovery.plan.receiptFile)).finalizing, false)
+})
+
+test('restart diagnostic folding preserves corrupt receipts and readable log outcomes', async () => {
+  const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+  await mkdir(h.paths.state, { recursive: true })
+  const file = path.join(h.paths.state, '2026-10-10T12-00-00-000.json'), log = path.join(h.paths.state, 'restart-events.jsonl')
+  await writeFile(file, 'unreadable fixture receipt\n')
+  const raw = await readFile(file)
+  await withDesktopRestart({ ...plan, receiptFile: file }, h.paths, async () => null, () => {}, mock.io)
+  assert.deepEqual(await readFile(file), raw)
+  await appendFile(log, 'null\n{broken\n')
+  mock.rows = [desktopFixture()[0]]
+  const receipt = { sessions: [], failed: [], remote: [], restartHistory: [] }
+  const result = await withDesktopRestart({ ...plan, receiptFile: file }, h.paths, async () => {
+    await writeFile(file, JSON.stringify(receipt))
+    return { file, receipt, ok: true }
+  }, () => {}, mock.io)
+  assert.equal(result.ok, true)
+  assert.equal(receipt.restartHistory.length, 2)
+  assert.equal(receipt.restartHistory.at(-1).stopCode, 'COMPLETE')
 })
 
 test('a failed task-family placement rolls back the family and keeps ordinary moves', async () => {
