@@ -637,13 +637,16 @@ async function quarantine(items, dest) {
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
-  const guard = spawn('/usr/bin/lockf', ['-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const command = await exists('/usr/bin/lockf')
+    ? ['/usr/bin/lockf', '-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
+    : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or exit 73; flock($lock, LOCK_EX | LOCK_NB) or exit($!{EWOULDBLOCK} ? 75 : 73); $| = 1; print "ready"; 1 while <STDIN>;', lockFile]
+  const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
   await new Promise((resolve, reject) => {
     let ready = false
     guard.stdout.once('data', () => { ready = true; resolve() })
     guard.once('error', reject)
     guard.once('exit', (code) => {
-      if (!ready) reject(Object.assign(new Error(code === 75 ? 'another run holds the lock' : `lockf failed, exit ${code ?? 'unknown'}`), { code: code === 75 ? 'LOCK_BUSY' : 'LOCK_FAILED' }))
+      if (!ready) reject(Object.assign(new Error(code === 75 ? 'another run holds the lock' : `lock helper failed, exit ${code ?? 'unknown'}`), { code: code === 75 ? 'LOCK_BUSY' : 'LOCK_FAILED' }))
     })
   })
   try {

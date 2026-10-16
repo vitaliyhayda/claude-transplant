@@ -86,6 +86,11 @@ const cli = (home, args, setup = '') => promisify(execFile)(process.execPath, ['
   env: { ...process.env, HOME: home },
   cwd: here
 }).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }))
+const withoutLockf = `
+  import lockFs from 'node:fs/promises'
+  const lockStat = lockFs.stat
+  lockFs.stat = (file, ...args) => file === '/usr/bin/lockf' ? Promise.reject(Object.assign(new Error('fixture missing lockf'), { code: 'ENOENT' })) : lockStat(file, ...args)
+`
 
 test('process identity separates Desktop descendants, external workers, and reused pids', () => {
   const at = 'Fri Sep  4 18:00:00 2026'
@@ -646,8 +651,11 @@ test('automatic retries never request a restart and leave held workers alone', a
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
 })
 
-async function hold(file) {
-  const guard = spawn('/usr/bin/lockf', ['-k', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
+async function hold(file, native = false) {
+  const command = native
+    ? ['/usr/bin/lockf', '-k', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
+    : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or die $!; flock($lock, LOCK_EX) or die $!; $| = 1; print "ready"; 1 while <STDIN>;', file]
+  const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
   await once(guard.stdout, 'data')
   return guard
 }
@@ -1050,22 +1058,51 @@ test('human CLI reports Finish recovery without an undefined pending count', asy
   assert.doesNotMatch(result.stdout, /undefined cloud checks/)
 })
 
-test('a second move cannot cross the kernel lock', async () => {
-  const h = await home()
-  await h.write(id(999), [entry('user', 999, null, id(999))])
-  await h.record('P', id(999))
-  await mkdir(h.paths.state, { recursive: true })
-  const guard = await hold(path.join(h.paths.state, 'lock'))
-  try {
-    const result = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--json'])
-    assert.equal(result.code, 1)
-    assert.match(result.stderr, /another run holds the lock/)
-    assert.equal((await readdir(h.dir('Z'))).length, 0)
-  } finally {
-    const exited = once(guard, 'exit')
-    guard.stdin.end()
-    await exited
+test('native and fallback helpers share the kernel lock and release it after a move', async () => {
+  const nativeAvailable = await stat('/usr/bin/lockf').then(() => true, () => false)
+  for (const [native, fallback] of nativeAvailable ? [[false, false], [false, true], [true, false], [true, true]] : [[false, true]]) {
+    const h = await home()
+    await h.write(id(999), [entry('user', 999, null, id(999))])
+    await h.record('P', id(999))
+    await mkdir(h.paths.state, { recursive: true })
+    const file = path.join(h.paths.state, 'lock'), setup = fallback ? withoutLockf : ''
+    const guard = await hold(file, native), inode = (await stat(file)).ino
+    const args = ['--from', 'p@example.com', '--to', 'z@example.com', '--json']
+    try {
+      const result = await cli(h.root, args, setup)
+      assert.equal(result.code, 1)
+      assert.equal(lines(result.stdout).at(-1).code, 'LOCK_BUSY')
+      assert.equal((await readdir(h.dir('Z'))).length, 0)
+    } finally {
+      const exited = once(guard, 'exit')
+      guard.stdin.end()
+      await exited
+    }
+    const moved = await cli(h.root, args, setup)
+    assert.equal(moved.code, 0, moved.stderr)
+    assert.equal((await readdir(h.dir('Z'))).length, 1)
+    assert.equal((await stat(file)).ino, inode)
+    const undone = await cli(h.root, ['undo', '--json'], setup)
+    assert.equal(undone.code, 0, undone.stderr)
+    assert.equal((await readdir(h.dir('P'))).length, 1)
   }
+})
+
+test('fallback lock releases after an interrupted move so recovery can run', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const crashed = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--json'], `${withoutLockf}
+    const link = lockFs.link
+    lockFs.link = async (...args) => { await link(...args); process.exit(23) }
+  `)
+  assert.equal(crashed.code, 23)
+  const recovered = await cli(h.root, ['finish', '--json'], withoutLockf)
+  assert.ok(lines(recovered.stdout).at(-1).reconciled, recovered.stderr)
+  assert.equal((await readdir(h.dir('P'))).length, 1)
+  assert.equal(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)).catch(() => null), null)
+  const moved = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--json'], withoutLockf)
+  assert.equal(moved.code, 0, moved.stderr)
 })
 
 test('a non-Claude process mentioning a session id is not a worker', async () => {
