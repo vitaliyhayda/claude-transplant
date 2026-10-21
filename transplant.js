@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
 import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
-import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -512,7 +512,7 @@ async function tree(root) {
     for (const e of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       const p = path.join(dir, e.name)
       if (e.isDirectory()) await walk(p)
-      else if (e.isFile()) out.push(p)
+      else if (e.isFile() || e.isSymbolicLink()) out.push(p)
       else throw new Error(`unsupported entry ${p}`)
     }
   }
@@ -520,30 +520,43 @@ async function tree(root) {
   return out
 }
 
-async function treeFingerprint(root, cache = null) {
+async function treeFingerprint(root) {
   const files = await tree(root)
-  const dependencies = await Promise.all(files.map(async (file) => ({ rel: path.relative(root, file), fingerprint: await fingerprint(file, cache) })))
+  const dependencies = await Promise.all(files.map(async (file) => ({ rel: path.relative(root, file), fingerprint: statIdentity(await lstat(file, { bigint: true })) })))
   return { files, fingerprint: sha(stable(dependencies)) }
 }
 
 async function manifest(root, cache = null) {
-  const before = await treeFingerprint(root, cache)
+  const before = await treeFingerprint(root)
   const { files } = before
   const prior = cache ? cacheLookup(cache, 'manifests', root, before.fingerprint) : null
   if (prior) return manifestOf(prior.rows, before.fingerprint)
   const rows = []
   for (const file of files) {
-    const data = await readFile(file)
-    rows.push({ rel: path.relative(root, file), bytes: data.length, sha: sha(data) })
+    const detail = await lstat(file)
+    if (detail.isSymbolicLink()) {
+      const target = await readlink(file, { encoding: 'buffer' })
+      rows.push({ rel: path.relative(root, file), type: 'symlink', bytes: target.length, sha: sha(target) })
+    } else {
+      const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+      try {
+        const data = await handle.readFile()
+        rows.push({ rel: path.relative(root, file), bytes: data.length, sha: sha(data) })
+      } finally {
+        await handle.close()
+      }
+    }
   }
   if (cache) cacheStore(cache, 'manifests', root, before.fingerprint, { rows })
   else if ((await treeFingerprint(root)).fingerprint !== before.fingerprint) throw new Error('sidecars changed while reading')
   return manifestOf(rows, before.fingerprint)
 }
 
+const sidecarIdentity = (row) => `${row.type ?? 'file'}:${row.sha}`
+
 function manifestOf(rows, fingerprint = null) {
   return {
-    set: new Set(rows.map((row) => `${row.rel}:${row.sha}`)),
+    set: new Set(rows.map((row) => `${row.rel}:${sidecarIdentity(row)}`)),
     rows,
     count: rows.length,
     bytes: rows.reduce((sum, row) => sum + row.bytes, 0),
@@ -1280,8 +1293,8 @@ async function sidecars(transcript, id, cache = null) {
 }
 
 const sidecarsAgree = (a, b) => {
-  const files = new Map(a.rows.map((row) => [row.rel, row.sha]))
-  return b.rows.every((row) => !files.has(row.rel) || files.get(row.rel) === row.sha)
+  const files = new Map(a.rows.map((row) => [row.rel, sidecarIdentity(row)]))
+  return b.rows.every((row) => !files.has(row.rel) || files.get(row.rel) === sidecarIdentity(row))
 }
 
 async function origins(id, ctx, cwd = '') {

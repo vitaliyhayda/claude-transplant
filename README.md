@@ -262,6 +262,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Copy an existing local transcript | The pool is already shared, a duplicate is only disk |
 | Delete the source | Removes the rollback |
 | Merge sidecars across versions | Requires writing a new generation |
+| Reject every sidecar symlink | Workflow snapshots can contain source links. Track each link's own identity and destination text without following it; rejecting the parent also blocks its side chats |
 | Extend per-field replay omission lists | Claude Code changes which fields it blanks. A complete existing copy must cover every filled tool-result value instead |
 | Treat replay bookkeeping as changed content | Claude Code 2.1.286 replayed identical content with zeroed token usage and missing producer markers, blocking a notification conversation and its task family. Verified with Desktop 2.26454.0 on 2026-10-07 |
 | Rely only on cached conversation hashes | They omit subagent files and queued-prompt delivery evidence. Supplemental checks read the linked session's artifacts |
