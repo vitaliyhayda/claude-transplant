@@ -571,6 +571,7 @@ final class Model: ObservableObject {
 
     func panelVisibility(_ visible: Bool) {
         panelOpen = visible
+        if visible, restartAvailable, !running { symbol = "arrow.left.arrow.right" }
         if visible { refresh() }
     }
 
@@ -977,7 +978,9 @@ final class Model: ObservableObject {
             if problem == nil, result?.restart == true, result?.changed?.contains(where: { $0.fields.contains("record unavailable") }) != true {
                 restartAvailable = true
                 note = (result?.moved ?? 0) > 0 ? "Moved \(quantity(result!.moved!, "more session", "more sessions")). Restart Claude to see them." : "The source checks finished. Restart Claude to refresh the sidebar."
+                symbol = "info.circle"
                 if result?.complete == true && !running { selectionComplete = true; from = []; to = nil }
+                notify(note, "")
             }
             if clean, let failedFinish, result?.receipt == failedFinish, result?.complete == true,
                (result?.changed ?? []).isEmpty, pendingAccounts.isEmpty, !restartAvailable {

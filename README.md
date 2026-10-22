@@ -72,6 +72,7 @@ The CLI touches the network and Keychain only when you pass `--cloud`. The menub
 - The headline counts identified records refused by the move, grouped in Details by history check, waiting on parent or task family, task collision, or other. A source mirror blocked by an unchanged local refusal stays in the receipt for a future Move and does not offer Finish on its own.
 - Move includes `--cloud`. Pending source checks continue in later passes.
 - Starts at login, shows progress in the icon, notifies when done.
+- Desktop reads an account's records only at launch or on an account switch. When background work lands in the account Desktop already shows, the icon changes to ⓘ and a notification asks you to restart Claude. Opening the panel restores the icon.
 - Bundles its own CLI, so rerun `menubar` after upgrading. The footer shows the installed version.
 - `menubar --snapshot panel.png` renders the live panel, `menubar --remove` uninstalls, `--demo <dir>` renders the animation above.
 
