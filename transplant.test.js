@@ -3768,7 +3768,7 @@ test('artifact legacy cache upgrades preserve warm history and manifest hits', a
   assert.ok(indexed.every(file => path.basename(file) === `${SOURCE}.jsonl` || path.basename(path.dirname(path.dirname(file))) === SOURCE))
   const saved = JSON.parse(await readFile(file))
   assert.deepEqual(saved.histories, cache.histories)
-  assert.equal(saved.version, 11)
+  assert.equal(saved.version, 12)
   assert.equal(saved.semanticVersion, 3)
   f.remote = f.main
   f.updated = '2026-09-02T00:00:00.000Z'
@@ -7587,7 +7587,7 @@ test('corrupt and legacy planning caches refresh replay analysis', async () => {
     assert.equal(inv.cacheStats.historyHits, 0)
     assert.ok(inv.cacheStats.historyMisses > 0)
     const refreshed = JSON.parse(await readFile(file))
-    assert.equal(refreshed.version, 11)
+    assert.equal(refreshed.version, 12)
     assert.equal(refreshed.semanticVersion, 3)
     assert.ok(Object.values(refreshed.histories).every(row => row.value.result.conflicts === 0 && row.value.result.comparable))
     const warm = await inventory([from], to, h.paths, () => {}, { processes: [] })
