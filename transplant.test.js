@@ -3565,12 +3565,13 @@ test('overlapping verified histories refuse absent, ambiguous, or unverified bri
   }
 })
 
-test('attachment prompts and tiny ordering drift prove semantic Remote Control containment', async () => {
+test('attachment and queue record prompts and tiny ordering drift prove semantic Remote Control containment', async () => {
   const h = await home()
   const remote = Array.from({ length: 100 }, (_, index) => entry(index % 2 ? 'assistant' : 'user', index + 100, index ? index + 99 : null, SOURCE))
   const local = structuredClone(remote)
-  const prompt = local[80].message.content
+  const [prompt, absorbed] = [local[80], local[60]].map(row => row.message.content)
   local.splice(80, 1, { type: 'attachment', uuid: id(800), sessionId: SOURCE, attachment: { prompt } })
+  local.splice(60, 1, { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', content: absorbed, sessionId: SOURCE })
   ;[local[20], local[21]] = [local[21], local[20]]
   await h.write(SOURCE, local)
   await h.record('Z', SOURCE, rehomeRecord())

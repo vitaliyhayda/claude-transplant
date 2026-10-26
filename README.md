@@ -265,6 +265,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Extend per-field replay omission lists | Claude Code changes which fields it blanks. A complete existing copy must cover every filled tool-result value instead |
 | Treat replay bookkeeping as changed content | Claude Code 2.1.286 replayed identical content with zeroed token usage and missing producer markers, blocking a notification conversation and its task family. Verified with Desktop 2.26454.0 on 2026-10-07 |
 | Rely only on cached conversation hashes | They omit subagent files and queued-prompt delivery evidence. Supplemental checks read the linked session's artifacts |
+| Count only user, assistant and attachment prompts as local history | Claude Code 2.1.299 and 2.1.304 kept prompts absorbed mid-turn as `queue-operation` records with the text in `content`, not as user messages. Two such phone prompts made a fully held 8,011-message mirror look divergent and forced a rescue. Seen 2026-10-26 |
 | Move a record while its Desktop worker runs | Desktop rewrites the record from cache, title and turn count roll back |
 | Leave a matching `.json.tmp` beside a retired record | Desktop restores the source entry from it on restart. Quarantine both, restore both on Undo |
 | Infer a restart-safe moment from activity logs | Cold records need no restart, held records get an explicit graceful shutdown |

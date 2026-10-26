@@ -26,7 +26,7 @@ const RESTART_BUDGET = 30_000
 const REOPEN_RESERVE = 8_000
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 11
+const CACHE_VERSION = 12
 const ARTIFACT_BYTES = 512 * 1024 * 1024
 const ARTIFACT_LINE_BYTES = 16 * 1024 * 1024
 const RESTART_LOG_BYTES = 1024 * 1024
@@ -1323,8 +1323,8 @@ const rescueTitle = (title) => `${(title || 'Untitled session').replace(/(?: · 
 
 const conversation = (entries) => entries.flatMap((entry) => {
   if (entry && ['user', 'assistant'].includes(entry.type) && entry.message) return [messageHash(entry.type, entry.message)]
-  if (entry?.type === 'attachment' && typeof entry.attachment?.prompt === 'string') return [messageHash('user', { role: 'user', content: entry.attachment.prompt })]
-  return []
+  const prompt = entry?.type === 'attachment' ? entry.attachment?.prompt : entry?.type === 'queue-operation' ? entry.content : null
+  return typeof prompt === 'string' ? [messageHash('user', { role: 'user', content: prompt })] : []
 })
 
 const conversationFromRows = (rows) => {
