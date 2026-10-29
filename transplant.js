@@ -2437,14 +2437,17 @@ function bridgePlan(base, state, entry) {
 
 async function bridgeSource(s, to, guard) {
   const canonical = await mappedPath(s.transcript), detail = await lstat(canonical, { bigint: true })
-  const recordIds = [...new Set([s, ...guard.sources, ...guard.targets].filter(row => row.id === s.id).map(row => desktopRecordOf(row).sessionId))].sort()
+  const records = [s, ...guard.sources, ...guard.targets].filter(row => row.id === s.id).map(desktopRecordOf)
+  const recordIds = [...new Set(records.map(record => record.sessionId))].sort()
   const base = { transcript: s.transcript, canonical, sessionId: s.id, recordIds, dev: String(detail.dev), ino: String(detail.ino) }
   return bridgeFile(base, false, async handle => {
     const state = await bridgeRead(base, handle, s.bridge !== false && s.contentSha !== s.bridgeAppend?.afterSha)
     if (s.transcriptFingerprint && state.fingerprint !== s.transcriptFingerprint || !s.contentSha || state.sha !== s.contentSha) throw new Error('source changed since inventory')
     const pointer = state.last?.bridgeSessionId ?? state.last?.bridge_session_id
     const destinationOwned = state.last?.ownerAccountUuid === to.account && state.last?.ownerOrganizationUuid === to.org
-    const append = typeof pointer === 'string' && pointer && !state.invalid && !destinationOwned
+    const mirror = records.some(record => record.sshConfig || typeof record.sshRemoteTranscriptPath === 'string' && record.sshRemoteTranscriptPath !== '') ||
+      [s.transcript, canonical].some(file => path.basename(path.dirname(file)) === `ssh-${s.id}`)
+    const append = typeof pointer === 'string' && pointer && !state.invalid && !destinationOwned && !mirror
       ? { ...bridgePlan(base, state, bridgeClear(s.id)), original: state.last } : null
     if (append) bridgePlans({ id: s.id, recordId: s.record.sessionId, transcript: s.transcript, bridgeAppend: append })
     return { fingerprint: state.fingerprint, append }
