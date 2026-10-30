@@ -4261,7 +4261,8 @@ async function restoreRemote(receipt, file, paths, options = {}) {
 async function transfer(inv, to, paths, report, context = {}) {
   if (!context.restart) return transferUnits(inv, to, paths, report, context)
   const families = Map.groupBy(inv.sources, row => row.taskFamily)
-  context = { ...context, at: context.existing?.receipt.at ?? context.at ?? stamp(), unit: { sources: inv.sources },
+  context = { ...context, at: context.existing?.receipt.at ?? context.at ?? stamp(),
+    unit: { sources: inv.sources, sessions: context.existing?.receipt.sessions.length ?? 0, superseded: context.existing?.receipt.superseded.length ?? 0 },
     units: new Map(inv.move.flatMap(row => (row.members ?? [row]).map(member => [member.file, row.taskFamily ? families.get(row.taskFamily) : row.members ?? [row]]))) }
   context.recovery.existing ??= Boolean(context.existing)
   const file = context.existing?.file ?? path.join(paths.state, `${context.at}.json`)
@@ -4300,7 +4301,7 @@ async function transfer(inv, to, paths, report, context = {}) {
     context.recovery.attempted = true
     context.progress()
     context.check(true)
-    const failures = [...receipt.failed], cloudChecks = structuredClone(receipt.cloudChecks), checkpoint = receipt.appendCheckpoint
+    const failures = [...receipt.failed], cloudChecks = structuredClone(receipt.cloudChecks), checkpoint = receipt.appendCheckpoint ?? context.unit
     receipt.localRecovery = { attempted: true, rollback: randomUUID(), rollbackPlacement: true }
     await saveJson(file, receipt)
     report(retry ? 'recovery' : 'rollback', retry ? 'Recovering and retrying unfinished work once' : 'Restoring unfinished work before continuing', { live: true })
@@ -4311,7 +4312,7 @@ async function transfer(inv, to, paths, report, context = {}) {
     if (needsRecovery(after) || after.retained?.length || after.verification?.problems?.length || after.sessions.length && after.verification?.ok === false) {
       return blocked(recovered?.error ?? 'Unfinished work could not be restored consistently')
     }
-    if (after.sessions.length !== (checkpoint?.sessions ?? 0) || after.superseded.length !== (checkpoint?.superseded ?? 0)) return blocked('Unfinished placement was not fully restored')
+    if (after.sessions.length !== checkpoint.sessions || after.superseded.length !== checkpoint.superseded) return blocked('Unfinished placement was not fully restored')
     const excluded = new Set(retry ? [] : failedSources.map(row => row.file))
     after.failed = [...failures, ...(retry ? [] : [{ id: failedSources[0]?.id, title: failedSources[0]?.title ?? 'Unfinished move',
       error: error.message, ...failureIdentity({ members: failedSources }) }])]
@@ -4619,6 +4620,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   delete receipt.cloudAttempts
   receipt.failed = receipt.failed.flatMap(unheldFailures)
   await save()
+  if (context.unit) Object.assign(context.unit, { sessions: receipt.sessions.length, superseded: receipt.superseded.length })
   context.sessionProgress?.(receipt)
   if (inv.move.length || rescues.length || context.wholeOperation) {
     const rehomed = receipt.sessions.filter((row) => row.strategy === 'rehome').length

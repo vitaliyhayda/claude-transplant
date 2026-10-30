@@ -707,6 +707,7 @@ final class Model: ObservableObject {
             let costs = UserDefaults.standard.dictionary(forKey: MoveProgress.storageKey) as? [String: Double] ?? [:]
             moveProgress = MoveProgress(costs: demo || snapshot ? [:] : costs)
         }
+        moveProgress.localOnly = true
         badge = "\(moveProgress.percent)%"
         pendingResult = false
         pendingPlan = nil

@@ -7239,15 +7239,18 @@ test('publication recovery retries once and cleans failed ordinary or task units
 })
 
 test('retirement recovery unwinds unfinished copies and isolates the exact dependency unit', async () => {
-  for (const shape of ['ordinary', 'parent', 'task']) for (const resume of [false, true]) for (const transient of [true, false]) {
-    const h = shape === 'task' ? await taskFamilyFixture() : await home(), other = id(710), child = id(711), cold = id(720)
-    const failed = shape === 'task' ? h.run : other
+  for (const shape of ['ordinary', 'parent', 'task', 'boundary']) for (const resume of [false, true]) for (const transient of shape === 'boundary' ? [true] : [true, false]) {
+    const family = shape === 'task' || shape === 'boundary'
+    const h = family ? await taskFamilyFixture() : await home(), other = id(710), child = id(711), cold = id(720)
+    const failed = shape === 'task' ? h.run : shape === 'boundary' ? null : other
     let ids
-    if (shape === 'task') {
+    if (family) {
       await h.write(other, [entry('user', 810, null, other)])
-      await h.record('P', other, rehomeRecord({ scheduledTaskId: 'independent' }))
-      h.sourceRegistry.scheduledTasks = [...h.tasks, { id: 'independent', enabled: true }]
-      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+      await h.record('P', other, rehomeRecord(shape === 'task' ? { scheduledTaskId: 'independent' } : {}))
+      if (shape === 'task') {
+        h.sourceRegistry.scheduledTasks = [...h.tasks, { id: 'independent', enabled: true }]
+        await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+      }
       ids = [SOURCE, h.run, h.second, h.cold, other]
     } else {
       ids = [SOURCE, other, ...shape === 'parent' ? [child] : [], ...resume ? [cold] : []]
@@ -7256,14 +7259,18 @@ test('retirement recovery unwinds unfinished copies and isolates the exact depen
         await h.record('P', sid, rehomeRecord(sid === child ? { forkedFromSessionId: `local_${other}` } : {}))
       }
     }
-    const mock = taskHarness(shape === 'task' ? [desktopFixture()[0]] : desktopFixture())
-    if (shape !== 'task') mock.rows[1].ids = ids.filter(sid => sid !== cold)
+    const mock = taskHarness(shape === 'task' ? [desktopFixture()[0]] : desktopFixture(other))
+    if (!family) mock.rows[1].ids = ids.filter(sid => sid !== cold)
     const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
     const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
     const seed = resume ? await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true }) : null
     const run = options => resume ? finishWorkflow(h.paths, options) : executeMove([from], to, h.paths, options)
-    const planned = await run({ io: mock.io }), native = fs.rename, reports = []
-    let refusals = 0
+    const planned = await run({ io: mock.io }), native = fs.rename, reports = [], inspect = mock.io.inspect
+    let refusals = 0, stalled = false
+    mock.io.inspect = () => {
+      if (shape === 'boundary' && !stalled && reports.at(-1)?.stage === 'sessions' && reports.some(row => row.stage === 'move' && row.completed && !row.preparatory)) { stalled = true; mock.time += 61_000 }
+      return inspect()
+    }
     fs.rename = async (...args) => {
       if (args[0] === path.join(h.dir('P'), `local_${failed}.json`) && (++refusals === 1 || !transient)) throw new Error(`Synthetic retirement refusal ${failed}`)
       return native(...args)
@@ -7275,9 +7282,10 @@ test('retirement recovery unwinds unfinished copies and isolates the exact depen
     assert.equal(result.recoveryRequired, undefined, result.reason)
     assert.equal(result.ok, transient, JSON.stringify(result.summary))
     assert.equal(result.complete, transient)
-    assert.equal(refusals, 2)
+    assert.deepEqual([refusals, stalled], shape === 'boundary' ? [0, true] : [2, false])
     assert.equal(reports.filter(row => row.stage === 'recovery').length, 1)
     const notMoved = transient ? [] : shape === 'task' ? [SOURCE, h.run, h.second] : shape === 'parent' ? [other, child] : [other]
+    assert.equal(result.summary.moved, ids.length - notMoved.length)
     assert.deepEqual(result.summary.notMoved.map(row => row.id).sort(), notMoved.sort())
     assert.deepEqual(result.receipt.sessions.map(row => row.id).sort(), ids.filter(sid => !notMoved.includes(sid)).sort())
     assert.equal(result.receipt.finalizing, false)
@@ -7295,7 +7303,7 @@ test('retirement recovery unwinds unfinished copies and isolates the exact depen
     if (!transient) assert.equal((await keepLocal(h.paths)).complete, true)
     assert.ok((await undo(h.paths, { processes: [] })).dest)
     const after = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
-    if (shape === 'task') {
+    if (family) {
       for (const file of [h.sourceFile, h.targetFile]) { delete before[file]; delete after[file] }
       assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
       assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
@@ -7305,38 +7313,48 @@ test('retirement recovery unwinds unfinished copies and isolates the exact depen
 })
 
 test('failed retirement restoration retains its journal and cannot continue independent writes', async () => {
-  const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
-  mock.rows[1].ids = [SOURCE, other]
-  for (const [index, sid] of [SOURCE, other].entries()) {
-    await h.write(sid, [entry('user', 810 + index, null, sid)])
-    await h.record('P', sid, rehomeRecord())
+  for (const placement of [false, true]) {
+    const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
+    mock.rows[1].ids = [SOURCE, other]
+    for (const [index, sid] of [SOURCE, other].entries()) {
+      await h.write(sid, [entry('user', 810 + index, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const planned = await executeMove([from], to, h.paths, { io: mock.io }), native = fs.rename
+    let attempts = 0
+    fs.rename = async (...args) => {
+      if (args[0] === path.join(h.dir('P'), `local_${other}.json`)) {
+        attempts++
+        if (placement) {
+          const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+          await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file)), finalizing: false }))
+        }
+        throw new Error('Synthetic retirement failure')
+      }
+      if (!placement && args[1] === path.join(h.dir('P'), `local_${SOURCE}.json`)) throw new Error('Synthetic restore failure')
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+    finally { fs.rename = native; syncBuiltinESMExports() }
+    assert.equal(attempts, 1)
+    assert.equal(result.code, 'LOCAL_RECOVERY_BLOCKED')
+    assert.match(result.reason, placement ? /placement was not fully restored/ : /restore failure/)
+    if (placement) continue
+    const receipt = await readReceipt(result.file)
+    assert.ok(receipt.retiring && receipt.finalizing && receipt.localRecovery.rollbackPlacement)
+    assert.equal(result.summary.moved, 0)
+    assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
+    assert.equal((await sweep(h.paths, { processes: [] })).ok, false)
+    await finishWorkflow(h.paths, { processes: [] })
+    const recovered = await readReceipt(result.file)
+    assert.equal(recovered.sessions.length, 0)
+    assert.equal(recovered.finalizing, false)
+    assert.equal((await readdir(h.dir('T'))).length, 0)
+    assert.equal((await readdir(h.dir('P'))).length, 2)
   }
-  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
-  const planned = await executeMove([from], to, h.paths, { io: mock.io }), native = fs.rename
-  let attempts = 0
-  fs.rename = async (...args) => {
-    if (args[0] === path.join(h.dir('P'), `local_${other}.json`)) { attempts++; throw new Error('Synthetic retirement failure') }
-    if (args[1] === path.join(h.dir('P'), `local_${SOURCE}.json`)) throw new Error('Synthetic restore failure')
-    return native(...args)
-  }
-  syncBuiltinESMExports()
-  let result
-  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
-  finally { fs.rename = native; syncBuiltinESMExports() }
-  assert.equal(attempts, 1)
-  assert.equal(result.code, 'LOCAL_RECOVERY_BLOCKED')
-  assert.match(result.reason, /restore failure/)
-  const receipt = await readReceipt(result.file)
-  assert.ok(receipt.retiring && receipt.finalizing && receipt.localRecovery.rollbackPlacement)
-  assert.equal(result.summary.moved, 0)
-  assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
-  assert.equal((await sweep(h.paths, { processes: [] })).ok, false)
-  await finishWorkflow(h.paths, { processes: [] })
-  const recovered = await readReceipt(result.file)
-  assert.equal(recovered.sessions.length, 0)
-  assert.equal(recovered.finalizing, false)
-  assert.equal((await readdir(h.dir('T'))).length, 0)
-  assert.equal((await readdir(h.dir('P'))).length, 2)
 })
 
 test('preflight refusals stay informational on cold, restarted and successfully retried moves', async () => {
@@ -10440,12 +10458,14 @@ struct StateChecks {
         precondition(progressModel.moveProgress.phase == "cloudScan" && progressModel.moveProgress.percent < 99)
         progressModel.begin()
         progressModel.handle("{\"stage\":\"scan\",\"text\":\"50/100\",\"live\":true,\"completed\":50,\"total\":100}")
+        progressModel.handle("{\"stage\":\"cloud scan\",\"text\":\"0/1\",\"live\":true,\"completed\":0,\"total\":1}")
         let percentage = progressModel.badge
         precondition(percentage.hasSuffix("%") && !percentage.contains("/"))
         progressModel.handle("{\"stage\":\"inventory\",\"text\":\"100 sessions\"}")
         precondition(progressModel.badge == percentage)
         progressModel.begin(resetProgress: false)
-        precondition(progressModel.badge == percentage)
+        progressModel.handle("{\"stage\":\"sessions\",\"text\":\"Remaining sessions\",\"live\":true,\"sessionTotal\":5,\"remainingCount\":3}")
+        precondition(progressModel.badge == percentage && progressModel.moveProgress.detail.contains("3 sessions remaining"))
         progressModel.handle("{\"done\":true,\"ok\":false,\"moved\":0,\"reason\":\"fixture rollback\"}")
         progressModel.checkFinish(1)
         precondition(progressModel.badge.isEmpty && !progressModel.running)
