@@ -260,7 +260,7 @@ test('restart waits for children, moves only after exit, and reopens on move fai
     calls.push('move')
     throw new Error('fixture move failed')
   }, () => {}, {
-    now: () => time, budget: 1000, reserve: 200, inspect: () => rows,
+    now: () => time, shutdownWait: 400, reserve: 200, inspect: () => rows,
     wait: async (ms) => { time += ms; rows = [] },
     command: async (file) => {
       if (file.endsWith('osascript')) { calls.push('quit'); rows = rows.slice(1); return { status: 0 } }
@@ -280,7 +280,7 @@ test('a native quit veto leaves held work untouched and does not reopen the runn
   const plan = await restartPlan(null, h.paths, rows)
   let time = 0, moved = false, opened = false
   const result = await withDesktopRestart(plan, h.paths, async () => { moved = true }, () => {}, {
-    now: () => time, budget: 1000, reserve: 200, inspect: () => rows, wait: async (ms) => { time += ms },
+    now: () => time, shutdownWait: 400, reserve: 200, inspect: () => rows, wait: async (ms) => { time += ms },
     command: async (file) => { if (file.endsWith('/open')) opened = true; return { status: 1 } }
   })
   assert.equal(moved, false)
@@ -289,13 +289,13 @@ test('a native quit veto leaves held work untouched and does not reopen the runn
   assert.equal(time, 0)
 })
 
-test('post-quit deadline exhaustion still sends a bounded reopen request', async () => {
+test('long closed work gets a fresh bounded reopen wait', async () => {
   const h = await home()
   let rows = desktopFixture(), time = 0
   const plan = await restartPlan(null, h.paths, rows)
   const calls = []
-  const result = await withDesktopRestart(plan, h.paths, async () => { time = 1100 }, () => {}, {
-    inspect: () => rows, now: () => time, budget: 1000, reserve: 200,
+  const result = await withDesktopRestart(plan, h.paths, async ({ progress, check }) => { for (let i = 0; i < 10; i++) { time += 30_000; progress(); check() } }, () => {}, {
+    inspect: () => rows, now: () => time, shutdownWait: 400, reserve: 200,
     command: async (file, args, timeout) => {
       calls.push({ file, timeout })
       rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
@@ -304,9 +304,10 @@ test('post-quit deadline exhaustion still sends a bounded reopen request', async
   })
   assert.equal(calls.at(-1).file, '/usr/bin/open')
   assert.ok(calls.at(-1).timeout > 0)
-  assert.equal(result.ok, false)
-  assert.match(result.error, /exceeded its deadline/)
-  assert.equal(lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8')).at(-1).stopCode, 'RESTART_DEADLINE')
+  assert.equal(result.ok, true)
+  assert.equal(result.error, undefined)
+  assert.equal(calls.at(-1).timeout, 200)
+  assert.equal(lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8')).at(-1).stopCode, 'NO_WORK')
 })
 
 test('a journal failure after quit cannot prevent the reopen request', async () => {
@@ -366,7 +367,7 @@ test('a slow shutdown uses only its shutdown budget and leaves held files untouc
   const plan = await restartPlan(null, h.paths, rows)
   let time = 0, moved = false
   const result = await withDesktopRestart(plan, h.paths, async () => { moved = true }, () => {}, {
-    now: () => time, budget: 1000, reserve: 200, inspect: () => rows,
+    now: () => time, shutdownWait: 400, reserve: 200, inspect: () => rows,
     wait: async (ms) => { time += ms }, command: async () => ({ status: 0 })
   })
   assert.equal(moved, false)
@@ -374,7 +375,7 @@ test('a slow shutdown uses only its shutdown budget and leaves held files untouc
   assert.equal(result.restart.outcome, 'quit-not-confirmed')
 })
 
-test('a twenty-second shutdown preserves the full move phase inside one minute', async () => {
+test('a twenty-second shutdown leaves moving and reopening their own phases', async () => {
   const h = await home()
   let rows = desktopFixture(), time = 0
   const plan = await restartPlan(null, h.paths, rows), calls = []
@@ -416,7 +417,7 @@ test('an approved plan moves held records only after shutdown and keeps cloud ca
   await h.record('P', SOURCE)
   const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
   let rows = desktopFixture(), time = 0, calls = []
-  const io = { inspect: () => rows, now: () => time, budget: 1000, reserve: 200, wait: async (ms) => { time += ms }, command: async (file) => {
+  const io = { inspect: () => rows, now: () => time, shutdownWait: 400, reserve: 200, wait: async (ms) => { time += ms }, command: async (file) => {
     calls.push(file)
     rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
@@ -7050,294 +7051,366 @@ test('task workers and changed restart inventories never authorize an external s
   assert.deepEqual(calls, [])
 })
 
-test('task restart capacity stops before quit and preserves held families after completed ordinary work', async () => {
-  for (const elapsed of [8000, 53000]) {
-    const h = await taskFamilyFixture(), { from, to } = await h.selection()
-    const mock = taskHarness(), { io } = mock
-    const planned = await executeMove([from], to, h.paths, { io })
-    const original = fs.rename
-    fs.rename = async (...args) => {
-      const result = await original(...args)
-      if (path.dirname(args[1]) === h.paths.state && /^\d.*\.json$/.test(path.basename(args[1]))) {
-        const receipt = JSON.parse(await readFile(args[1]))
-        if (receipt.finalizing === false && receipt.sessions.length === 1) mock.time = elapsed
-      }
-      return result
-    }
-    syncBuiltinESMExports()
-    let result
-    try { result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token }) }
-    finally { fs.rename = original; syncBuiltinESMExports() }
-    assert.equal(result.ok, false)
-    assert.equal(result.restarted, undefined)
-    assert.equal(result.capacity.fits, false)
-    assert.equal(result.code, 'RESTART_CAPACITY')
-    assert.equal(result.capacity.code, result.code)
-    if (elapsed === 8000) {
-      assert.equal(result.capacity.sample.elapsedMs, elapsed)
-      assert.equal(result.capacity.sample.records, 1)
-      assert.ok(result.capacity.estimatedMs > result.capacity.availableMs)
-    } else {
-      assert.equal(result.capacity.availableMs, 0)
-      assert.match(result.reason, /budget was reached before shutdown/)
-    }
-    assert.doesNotMatch(result.reason, /Move fewer sessions/)
-    assert.deepEqual(mock.calls, [])
-    assert.equal(mock.rows.length, 1)
-    assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart-plan.json'))).token, planned.plan.token)
-    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
-    const receipts = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
-    const receipt = JSON.parse(await readFile(path.join(h.paths.state, receipts[0])))
-    assert.deepEqual(receipt.sessions.map(row => row.id), [h.cold])
-    assert.equal(receipt.held.flatMap(row => row.sources).length, 3)
-    const finished = await finishHeld(h.paths, { processes: [] })
-    assert.equal(finished.ok, true)
-    assert.equal(finished.receipt.sessions.length, 4)
+test('productive preparation and cold moving do not spend shutdown or moving time', async () => {
+  for (const phase of ['scan', 'move', 'verify', 'retire']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+    const planned = await executeMove([from], to, h.paths, { io: mock.io })
+    let delayed = false
+    const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => {
+      if (stage === phase && extra?.preparatory && !delayed) { delayed = true; mock.time += 180_000 }
+    } })
+    assert.equal(delayed, true, phase)
+    assert.equal(result.ok, true, result.reason)
+    assert.equal(result.receipt.sessions.length, 4)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.equal(result.restartOutcome.deadline, undefined)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
   }
 })
 
-test('an approved pre-quit scan stops at its mutation deadline before any record is moved', async () => {
-  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
-  mock.io.budget = 1000
-  mock.io.reserve = 200
-  const plan = await executeMove([from], to, h.paths, { io: mock.io })
-  const before = await fixtureSnapshot(h), planFile = path.join(h.paths.state, 'restart-plan.json'), planBefore = await readFile(planFile)
-  let expired = false
-  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token, report: stage => {
-    if (stage === 'scan' && !expired) { expired = true; mock.time = 800 }
-  } })
-  assert.equal(expired, true)
-  assert.equal(result.ok, false)
-  assert.equal(result.code, 'RESTART_CAPACITY')
-  assert.equal(result.capacity.availableMs, 0)
-  assert.equal(result.receipt, null)
-  assert.deepEqual(mock.calls, [])
-  assert.equal(mock.time, 800)
-  assert.deepEqual(await fixtureSnapshot(h), before)
-  assert.deepEqual(await readFile(planFile), planBefore)
-  assert.equal(await stat(path.join(h.dir('T'), `local_${h.cold}.json`)).catch(() => null), null)
-  assert.equal(await stat(path.join(h.paths.state, 'restart-events.jsonl')).catch(() => null), null)
-})
-
-test('pre-quit expiry preserves the journal and stops later mutations until recovery', async () => {
-  for (const stage of ['journal', 'placement', 'row', 'retirement']) {
-    const h = await taskFamilyFixture(), second = id(704), mock = taskHarness()
-    await h.write(second, [entry('user', 804, null, second)])
-    await h.record('P', second, rehomeRecord())
-    const { from, to } = await h.selection(), originals = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
-    mock.io.budget = 1000
-    mock.io.reserve = 200
-    const plan = await executeMove([from], to, h.paths, { io: mock.io })
-    const planFile = path.join(h.paths.state, 'restart-plan.json'), planBefore = await readFile(planFile)
-    const native = { open: fs.open, link: fs.link, rename: fs.rename, writeFile: fs.writeFile, rm: fs.rm }, afterExpiry = []
-    let expired = false, receiptFile, checkpoint, journal
-    const expire = () => {
-      if (expired) return
-      expired = true
-      mock.time = 800
-      receiptFile = path.join(h.paths.state, readdirSync(h.paths.state).find(name => /^\d.*\.json$/.test(name)))
-      checkpoint = readFileSync(receiptFile)
-      try { journal = readFileSync(`${receiptFile}.journal`) } catch (error) { if (error.code !== 'ENOENT') throw error; journal = null }
-    }
-    for (const name of ['link', 'rename', 'writeFile', 'rm']) fs[name] = async (...args) => {
-      if (expired) afterExpiry.push({ name, file: String(args[0]) })
-      const result = await native[name](...args)
-      if (stage === 'placement' && name === 'link' && args[1] === path.join(h.dir('T'), `local_${h.cold}.json`) ||
-          stage === 'retirement' && name === 'rename' && args[0] === path.join(h.dir('P'), `local_${h.cold}.json`)) expire()
+test('productive reads and awaited mutations can exceed both old restart windows', async () => {
+  for (const phase of ['history', 'publication', 'retirement', 'durability']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+    if (phase === 'durability') await appendFile(path.join(h.project, `${SOURCE}.jsonl`), JSON.stringify({ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_fixture', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }) + '\n')
+    const planned = await executeMove([from], to, h.paths, { io: mock.io })
+    const native = { readFile: fs.readFile, link: fs.link, rename: fs.rename, open: fs.open }, timings = []
+    let writing = false, delayed = 0
+    const run = mock.io.command
+    mock.io.command = async (...args) => { assert.equal(writing, false); timings.push(args[2]); return run(...args) }
+    fs.readFile = async (...args) => {
+      const result = await native.readFile(...args)
+      if (phase === 'history' && !mock.rows.length && String(args[0]).endsWith('.jsonl')) { mock.time += 90_000; delayed++ }
       return result
     }
     fs.open = async (...args) => {
-      if (expired && mutatingOpen(args[1])) afterExpiry.push({ name: 'open', file: String(args[0]) })
       const handle = await native.open(...args)
-      if (String(args[0]).endsWith('.journal')) {
-        const write = handle.writeFile.bind(handle)
-        handle.writeFile = async (...data) => {
-          if (expired) afterExpiry.push({ name: 'journal', file: String(args[0]) })
-          const result = await write(...data)
-          if (stage === 'journal' && JSON.parse(data[0]).pending?.created) expire()
-          return result
-        }
+      if (phase === 'durability' && String(args[0]).endsWith('.journal')) {
+        const sync = handle.sync.bind(handle)
+        handle.sync = async () => { writing = true; mock.time += 90_000; delayed++; await sync(); writing = false }
+      }
+      if (phase === 'history' && String(args[0]).endsWith('.jsonl')) {
+        const read = handle.read.bind(handle)
+        handle.read = async (...args) => { const result = await read(...args); if (!mock.rows.length && result.bytesRead) { mock.time += 90_000; delayed++ }; return result }
       }
       return handle
     }
+    for (const name of ['link', 'rename']) fs[name] = async (...args) => {
+      const selected = !mock.rows.length && (phase === 'publication' && name === 'link' && path.dirname(args[1]) === h.dir('T') || phase === 'retirement' && name === 'rename' && path.dirname(args[0]) === h.dir('P'))
+      if (selected) { writing = true; mock.time += 90_000; delayed++ }
+      const result = await native[name](...args)
+      writing = false
+      return result
+    }
     syncBuiltinESMExports()
     let result
-    try {
-      result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token, report: (phase, text, progress) => {
-        if (stage === 'row' && phase === 'move' && progress?.completed === 1) expire()
-      } })
-    } finally { Object.assign(fs, native); syncBuiltinESMExports() }
-    assert.equal(expired, true, stage)
-    assert.equal(result.ok, false, stage)
-    assert.equal(result.code, 'RESTART_CAPACITY', stage)
-    assert.equal(result.recoveryRequired, true, stage)
-    assert.equal(result.file, receiptFile)
-    assert.equal(mock.time, 800)
-    assert.deepEqual(mock.calls, [])
-    assert.deepEqual(afterExpiry, [], stage)
-    assert.deepEqual(await readFile(receiptFile), checkpoint, stage)
-    assert.deepEqual(await readFile(`${receiptFile}.journal`).catch(error => { if (error.code === 'ENOENT') return null; throw error }), journal, stage)
-    assert.deepEqual(await readFile(planFile), planBefore)
-    if (stage !== 'retirement') assert.equal(await stat(path.join(h.dir('T'), `local_${second}.json`)).catch(() => null), null)
-    if (stage === 'journal') assert.equal(await stat(path.join(h.dir('T'), `local_${h.cold}.json`)).catch(() => null), null)
-    mock.time = 0
-    const recovered = await finishWorkflow(h.paths, { io: mock.io, processes: [] })
-    assert.equal(recovered.recoveryRequired, true, stage)
-    assert.equal(JSON.parse(await readFile(receiptFile)).finalizing, false)
-    if (stage === 'retirement') assert.ok((await undo(h.paths, { processes: [] })).dest)
-    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), originals, stage)
-    assert.deepEqual(mock.calls, [])
-  }
-})
-
-test('expiry inside an eligible task dependency check stays typed and starts no recovery writes', async () => {
-  const h = await taskFamilyFixture(), f = await identityFixture(h), { from, to } = await h.selection()
-  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
-  await f.write(f.init(1, h.acct.Z, h.org.Z))
-  const mock = taskHarness([{ ...f.processes[0], ppid: 1, worker: true, desktopPid: 500, ids: [] }, desktopFixture(h.cold)[1]])
-  mock.io.budget = 1000
-  mock.io.reserve = 200
-  const plan = await executeMove([from], to, h.paths, { io: mock.io })
-  assert.equal(plan.plan.held.length, 1)
-  const read = fs.readFile, write = fs.writeFile, afterExpiry = []
-  let reads = 0, expired = false
-  fs.readFile = async (...args) => {
-    const result = await read(...args)
-    if (args[0] === h.sourceFile && readdirSync(h.paths.state).some(name => /^\d.*\.json$/.test(name)) && ++reads === 2) {
-      expired = true
-      mock.time = 800
-    }
-    return result
-  }
-  fs.writeFile = async (...args) => { if (expired) afterExpiry.push(String(args[0])); return write(...args) }
-  syncBuiltinESMExports()
-  let result
-  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token }) }
-  finally { fs.readFile = read; fs.writeFile = write; syncBuiltinESMExports() }
-  assert.equal(expired, true)
-  assert.equal(result.code, 'RESTART_CAPACITY')
-  assert.equal(result.ok, false)
-  assert.deepEqual(afterExpiry, [])
-  assert.deepEqual(mock.calls, [])
-  assert.deepEqual(result.receipt.failed, [])
-  assert.equal(result.receipt.sessions.length, 0)
-  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
-  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
-})
-
-test('restart capacity excludes cloud scans and completed cold parsing from the shutdown forecast', async () => {
-  for (const delay of ['cloud', 'cold']) {
-    const h = await home(), mock = taskHarness()
-    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
-    await h.record('P', SOURCE, rehomeRecord())
-    await writeFile(path.join(h.dir('P'), 'scheduled-tasks.json'), JSON.stringify({ scheduledTasks: [{ id: 'task', notifySessionId: `local_${SOURCE}`, enabled: false }] }))
-    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
-    let delayed = false, cloudReads = 0
-    const cloud = delay === 'cloud' ? cloudFixture(h, { list: async () => { cloudReads++; mock.time += 60000; return [] } }) : null
-    const planned = await executeMove([from], to, h.paths, { io: mock.io, cloud, report: (stage, text, progress) => {
-      if (delay === 'cold' && !delayed && stage === 'scan' && progress?.completed === 1) { delayed = true; mock.time += 60000 }
-    } })
-    assert.equal(mock.time, 60000)
-    assert.equal(planned.ok, true)
-    assert.equal(planned.plan.capacity.preparationMs, null)
-    assert.equal(planned.plan.capacity.estimatedMs, null)
-    assert.equal(planned.plan.capacity.fits, null)
-    assert.equal(planned.plan.capacity.code, null)
-    assert.deepEqual(mock.calls, [])
-    const result = await executeMove([from], to, h.paths, { io: mock.io, cloud, approve: planned.plan.token })
+    try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+    finally { Object.assign(fs, native); syncBuiltinESMExports() }
+    assert.ok(delayed > 0, phase)
     assert.equal(result.ok, true, result.reason)
-    assert.equal(result.capacity.preparationMs, 0)
-    assert.equal(result.receipt.sessions.length, 1)
-    assert.equal(result.receipt.superseded.length, 1)
-    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
-    assert.equal(cloudReads, delay === 'cloud' ? 1 : 0)
+    assert.equal(result.receipt.sessions.length, 4)
+    assert.deepEqual(timings, [30_000, 8_000])
+    assert.equal(result.restartOutcome.deadline, undefined)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
   }
 })
 
-test('a measured capacity refusal agrees across CLI plans and approval and leaves other errors distinct', async () => {
-  const h = await taskCheckpointFixture(), raw = '500 1 Tue Sep  1 00:00:00 2026 /Applications/Claude.app/Contents/MacOS/Claude'
-  const mock = taskHarness(parseProcesses(raw, raw)), all = await accounts(h.paths, [])
-  const from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
-  await executeMove([from], to, h.paths, { io: mock.io })
-  const setup = `
-    import fs from 'node:fs/promises'
-    const read = fs.readFile, native = childProcess.spawnSync
-    let time = 0
-    performance.now = () => time
-    childProcess.spawnSync = (file, ...args) => file === '/bin/ps' ? { status: 0, stdout: ${JSON.stringify(raw)}, stderr: '' } : native(file, ...args)
-    fs.readFile = async (...args) => { const result = await read(...args); if (args[0] === ${JSON.stringify(path.join(h.paths.state, 'cache.json'))}) time += 25000; return result }
-  `
-  const args = ['--from', 'p@example.com', '--to', 't@example.com']
-  const json = await cli(h.root, [...args, '--json'], setup)
-  assert.equal(json.code, 1, json.stderr)
-  const plan = lines(json.stdout).find(row => row.plan)
-  assert.equal(plan.code, 'RESTART_CAPACITY')
-  assert.equal(plan.ok, false)
-  assert.equal(plan.capacity.code, plan.code)
-  assert.equal(plan.capacity.preparationMs, 25000)
-  assert.equal(plan.capacity.fits, false)
-  const text = await cli(h.root, args, setup)
-  assert.equal(text.code, 1, text.stderr)
-  assert.match(text.stdout, /not expected to fit/)
-  assert.doesNotMatch(text.stdout, /--restart-approved/)
-  const saved = JSON.parse(await readFile(path.join(h.paths.state, 'restart-plan.json')))
-  const refused = await executeMove([from], to, h.paths, { io: mock.io, approve: saved.token })
-  assert.equal(refused.ok, false)
-  assert.equal(refused.code, 'RESTART_CAPACITY')
-  assert.deepEqual(refused.capacity, saved.capacity)
-  const output = await cli(h.root, [...args, '--restart-approved', saved.token, '--json'], setup.replace('time += 25000', 'time += 0'))
-  assert.equal(output.code, 1, output.stderr)
-  assert.equal(lines(output.stdout).at(-1).code, 'RESTART_CAPACITY')
-  const beforeInvalid = await fixtureSnapshot(h, [h.root])
-  const invalid = await executeMove([from], to, h.paths, { io: mock.io, approve: '0'.repeat(64) })
-  assert.match(invalid.reason, /approval/)
-  assert.equal(invalid.code, 'RESTART_APPROVAL_CHANGED')
-  assert.notEqual(invalid.code, 'RESTART_CAPACITY')
-  assert.deepEqual(await fixtureSnapshot(h, [h.root]), beforeInvalid)
-  assert.deepEqual(mock.calls, [])
-  assert.equal((await readdir(h.paths.state)).some(name => /^\d.*\.json$/.test(name)), false)
+test('a saved 4.1.6 capacity-blocked receipt and bound plan remain finishable', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const partial = await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true })
+  assert.equal(partial.receipt.sessions.length, 1)
+  const planned = await finishWorkflow(h.paths, { io: mock.io })
+  const saved = { ...planned.plan, capacity: { records: 226, recordBytes: 20798433, availableMs: 22000, estimatedMs: 90000, fits: false, code: 'RESTART_CAPACITY' } }
+  delete saved.token
+  const sorted = value => Array.isArray(value) ? value.map(sorted) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sorted(value[key])])) : value
+  saved.token = createHash('sha256').update(JSON.stringify(sorted(saved))).digest('hex')
+  await writeFile(path.join(h.paths.state, 'restart-plan.json'), JSON.stringify(saved))
+  const finished = await finishWorkflow(h.paths, { io: mock.io, approve: saved.token })
+  assert.equal(finished.ok, true, finished.reason)
+  assert.equal(finished.file, partial.file)
+  assert.equal(finished.receipt.sessions.length, 4)
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
 })
 
-test('CLI pre-quit expiry preserves committed counts and exposes unfinished recovery without quitting', async () => {
-  for (const stage of ['completed', 'placement']) {
-    const h = await taskFamilyFixture(), { from, to } = await h.selection()
-    const raw = '500 1 Tue Sep 1 00:00:00 2026 /Applications/Claude.app/Contents/MacOS/Claude'
-    const planned = await executeMove([from], to, h.paths, { io: taskHarness(parseProcesses(raw, raw)).io })
-    const setup = `
-      import fs from 'node:fs/promises'
-      const rename = fs.rename, link = fs.link
-      let time = 0
-      performance.now = () => time
-      ${processSetup({ list: raw, commands: raw })}
-      fs.rename = async (...args) => {
-        const result = await rename(...args)
-        if (${JSON.stringify(stage)} === 'completed' && args[1].startsWith(${JSON.stringify(h.paths.state + '/')}) && /\\/\\d[^/]*\\.json$/.test(args[1])) {
-          const receipt = JSON.parse(await fs.readFile(args[1]))
-          if (receipt.finalizing === false && receipt.sessions.length === 1) time = 53000
+test('publication recovery retries once and cleans failed ordinary or task units before continuing', async () => {
+  for (const family of [false, true]) for (const transient of [true, false]) for (const resume of [false, true]) {
+    const h = family ? await taskFamilyFixture() : await home(), other = id(710), healthy = id(711)
+    const ids = family ? [SOURCE, h.run, h.second, h.cold, other, healthy] : [SOURCE, other, healthy]
+    for (const [index, sid] of (family ? [other, healthy] : ids).entries()) {
+      await h.write(sid, [entry('user', 810 + index, null, sid)])
+      await h.record('P', sid, rehomeRecord(family ? { scheduledTaskId: `independent_${index}` } : {}))
+    }
+    if (family) {
+      h.sourceRegistry.scheduledTasks = [...h.tasks, { id: 'independent_0', enabled: true }, { id: 'independent_1', enabled: true }]
+      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    }
+    await h.record('P', id(799), rehomeRecord())
+    const mock = taskHarness(family ? [desktopFixture()[0]] : desktopFixture())
+    if (!family) mock.rows[1].ids = ids
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const first = resume ? await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true }) : null
+    const run = options => resume ? finishWorkflow(h.paths, options) : executeMove([from], to, h.paths, options)
+    const planned = await run({ io: mock.io }), native = fs.link, reports = [], attempts = new Map()
+    const failedIds = [family ? h.run : SOURCE, other]
+    fs.link = async (...args) => {
+      if (path.dirname(args[1]) === h.dir('T')) {
+        const sid = path.basename(args[1]).slice(6, -5), count = (attempts.get(sid) ?? 0) + 1
+        attempts.set(sid, count)
+        if (sid === failedIds[0] && (!transient || count === 1) || !transient && sid === other) throw new Error(`Synthetic publication failure ${sid}`)
+      }
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await run({ io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => reports.push({ stage, ...extra }) }) }
+    finally { fs.link = native; syncBuiltinESMExports() }
+    assert.equal(result.recoveryRequired, undefined, result.reason)
+    assert.equal(result.ok, transient, JSON.stringify(result.summary))
+    assert.equal(result.complete, transient)
+    assert.equal(attempts.get(failedIds[0]), 2)
+    assert.equal(attempts.get(other), 1)
+    assert.equal(reports.filter(row => row.stage === 'recovery').length, 1)
+    assert.equal(reports.filter(row => row.stage === 'rollback').length, transient ? 0 : 2)
+    assert.equal(result.receipt.finalizing, false)
+    assert.equal(result.receipt.pending, null)
+    assert.equal(result.receipt.held.length, 0)
+    assert.equal(await stat(`${result.file}.journal`).catch(() => null), null)
+    const unmoved = transient ? [] : family ? [SOURCE, h.run, h.second, other] : [SOURCE, other]
+    assert.deepEqual(result.receipt.sessions.map(row => row.id).sort(), ids.filter(sid => !unmoved.includes(sid)).sort())
+    assert.deepEqual(result.summary.notMoved.map(row => row.id).sort(), unmoved.sort())
+    if (transient) { assert.deepEqual(result.receipt.failed, []); assert.ok(!result.receipt.localStopped) }
+    const counts = reports.filter(row => row.stage === 'sessions')
+    const total = ids.length - (resume && family ? 1 : 0)
+    assert.equal(planned.plan.remainingCount, total)
+    assert.ok(counts.length && counts.every(row => row.sessionTotal === total), JSON.stringify(counts))
+    assert.equal(counts.at(-1).remainingCount, result.summary.notMoved.length)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    if (resume) assert.equal(result.file, first.file)
+    if (!transient) {
+      const snapshot = await fixtureSnapshot(h), published = [...attempts]
+      for (let i = 0; i < 2; i++) {
+        const output = await cli(h.root, ['accounts', '--json'], processSetup({ list: '', commands: '' }))
+        const rows = lines(output.stdout)[0].filter(row => row.pending)
+        assert.deepEqual(rows.map(row => [row.account, row.pending, row.pendingCount, row.pendingAction]), [[h.acct.P, 'partial', unmoved.length, 'blocked']])
+        const pending = await finishWorkflow(h.paths, { processes: [] })
+        assert.equal(pending.summary.notMoved.length, unmoved.length)
+        assert.deepEqual(await fixtureSnapshot(h), snapshot)
+      }
+      assert.deepEqual([...attempts], published)
+      const kept = await keepLocal(h.paths)
+      assert.equal(kept.ok, true)
+      assert.equal(kept.complete, true)
+      assert.equal(kept.summary.notMoved.length, unmoved.length)
+    }
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    const after = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    if (family) {
+      for (const file of [h.sourceFile, h.targetFile]) { delete before[file]; delete after[file] }
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    }
+    assert.deepEqual(after, before)
+  }
+})
+
+test('one real stall retries the unfinished family and completes without another shutdown', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness(), reports = []
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  let stalled = false
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => {
+    reports.push(stage)
+    if (stage === 'move' && extra?.completed === 1 && !extra.preparatory && !stalled) { stalled = true; mock.time += 61_000 }
+  } })
+  assert.equal(stalled, true)
+  assert.equal(result.ok, true, result.reason)
+  assert.equal(result.complete, true)
+  assert.equal(reports.filter(stage => stage === 'recovery').length, 1)
+  assert.equal(result.receipt.sessions.length, 4)
+  assert.deepEqual(result.receipt.failed, [])
+  assert.ok(!result.receipt.localStopped)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+})
+
+test('progress excludes no-history placeholders and retains meaningful grouped refusals', async () => {
+  for (const shape of ['ordinary', 'grouped', 'partial']) {
+    const h = shape === 'grouped' ? await taskFamilyFixture() : await home(), empty = id(799), reports = []
+    if (shape !== 'grouped') { await h.write(SOURCE, [entry('user', 801, null, SOURCE)]); await h.record('P', SOURCE, rehomeRecord()) }
+    await h.record('P', empty, rehomeRecord())
+    if (shape === 'partial') {
+      const refused = id(790)
+      await h.write(refused, [entry('user', 802, null, refused), entry('user', 802, null, refused, { message: { role: 'user', content: 'Conflicting history' } })])
+      await h.record('P', refused, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const result = await executeMove([from], to, h.paths, { processes: [], report: (stage, text, extra) => { if (stage === 'sessions') reports.push(extra) } })
+    const expected = shape === 'grouped' ? 4 : shape === 'partial' ? 2 : 1
+    assert.ok(reports.length && reports.every(row => row.sessionTotal === expected), JSON.stringify(reports))
+    assert.equal(reports.at(-1).remainingCount, result.summary.notMoved.length)
+    assert.equal(result.summary.notMoved.length, shape === 'partial' ? 1 : 0)
+    assert.equal(result.summary.moved, shape === 'grouped' ? 4 : 1)
+    assert.equal(result.complete, true)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${empty}.json`)))
+    assert.equal(await stat(path.join(h.dir('T'), `local_${empty}.json`)).catch(() => null), null)
+  }
+})
+
+test('restart retry and cleanup preserve pending cloud checks until verification finishes', async () => {
+  for (const transient of [true, false]) {
+    const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
+    mock.rows[1].ids = [SOURCE, other]
+    for (const [index, sid] of [SOURCE, other].entries()) {
+      await h.write(sid, [entry('user', 810 + index, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const options = { io: mock.io, cloudRequested: true }, planned = await executeMove([from], to, h.paths, options), native = fs.link
+    let attempts = 0
+    fs.link = async (...args) => {
+      if (args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`) && (++attempts === 1 || !transient)) throw new Error('Synthetic publication failure')
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { ...options, approve: planned.plan.token }) }
+    finally { fs.link = native; syncBuiltinESMExports() }
+    assert.equal(attempts, 2)
+    assert.equal(result.receipt.cloudChecks.length, 1)
+    assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+    assert.equal(result.receipt.held.length, 0)
+    assert.equal(result.summary.notMoved.length, transient ? 0 : 1)
+    const cloud = cloudFixture(h), checked = await finishPending(h.paths, { processes: [], cloud, active: cloud })
+    assert.equal(checked.complete, transient)
+    assert.equal(checked.receipt.cloudChecks[0].status, 'complete')
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  }
+})
+
+test('terminal local failures stay stable across account refresh with cloud and held work', async () => {
+  for (const mode of ['partial', 'held', 'cloud', 'both']) {
+    const h = await home(), failed = [id(710), id(711)], held = id(712)
+    await h.write(SOURCE, [entry('user', 800, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    let all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const moved = await executeMove([from], to, h.paths, { processes: [] }), receipt = moved.receipt
+    for (const [index, sid] of failed.entries()) {
+      await h.write(sid, [entry('user', 810 + index, null, sid)])
+      await h.record(index ? 'Q' : 'P', sid, rehomeRecord())
+    }
+    const hasHeld = ['held', 'both'].includes(mode), hasCloud = ['cloud', 'both'].includes(mode)
+    if (hasHeld) { await h.write(held, [entry('user', 812, null, held)]); await h.record('Z', held, rehomeRecord()) }
+    all = await accounts(h.paths, [])
+    receipt.fromAccounts = all.filter(row => row.account !== h.acct.T).map(({ account, org, label }) => ({ account, org, label }))
+    receipt.failed = failed.map(sid => {
+      const account = all.find(row => row.sessions.some(session => session.id === sid)), session = account.sessions.find(row => row.id === sid)
+      return { id: sid, title: session.title, error: 'Synthetic permanent failure', sources: [{ account: account.account, org: account.org, label: account.label,
+        id: sid, sessionId: session.record.sessionId, file: session.file, title: session.title }] }
+    })
+    receipt.localStopped = true
+    receipt.localRecovery = { attempted: true }
+    receipt.held = hasHeld ? [{ id: held, recordId: `local_${held}`, title: 'Healthy held session', release: 'worker', workers: [],
+      sources: [{ id: held, account: h.acct.Z, org: h.org.Z, file: path.join(h.dir('Z'), `local_${held}.json`) }] }] : []
+    const cloud = cloudFixture(h, { account: h.acct.Q, org: h.org.Q })
+    receipt.cloudChecks = hasCloud ? [{ account: h.acct.Q, org: h.org.Q, label: 'Cloud source', status: 'pending', sessionIds: ['session_missing'] }] : []
+    await writeFile(moved.file, JSON.stringify(receipt))
+    const refresh = async () => {
+      const output = await cli(h.root, ['accounts', '--json'], processSetup({ list: '', commands: '' }))
+      assert.equal(output.code, 0, output.stderr)
+      const rows = lines(output.stdout)[0]
+      assert.ok(rows.filter(row => row.pending).every(row => row.pendingCount !== 0))
+      assert.equal(rows[0].receiptSummary.notMoved.length, 2)
+      return rows
+    }
+    for (let i = 0; i < 2; i++) {
+      const rows = await refresh()
+      const partial = rows.filter(row => row.pending === 'partial')
+      assert.deepEqual(partial.map(row => [row.account, row.pendingCount, row.pendingAction]).sort(), mode === 'partial' ? [[h.acct.P, 1, 'blocked'], [h.acct.Q, 1, 'blocked']].sort() : [])
+    }
+    const native = fs.link, published = []
+    fs.link = async (...args) => { published.push(args[1]); return native(...args) }
+    syncBuiltinESMExports()
+    try {
+      const result = await finishWorkflow(h.paths, { processes: [], ...hasCloud ? { cloud, active: cloud } : {} })
+      assert.equal(result.complete, false, mode)
+      for (const check of (await readReceipt(moved.file)).cloudChecks.filter(row => ['pending', 'failed'].includes(row.status))) {
+        const finished = await finishPending(h.paths, { processes: [], cloud: cloudFixture(h, check), active: check })
+        assert.equal(finished.complete, false, mode)
+      }
+      for (let i = 0; i < 2; i++) {
+        const rows = await refresh()
+        assert.deepEqual(rows.filter(row => row.pending).map(row => [row.account, row.pending, row.pendingCount]).sort(), [[h.acct.P, 'partial', 1], [h.acct.Q, 'partial', 1]].sort())
+        assert.equal((await sweep(h.paths, { processes: [], cloud, active: cloud })).complete, false)
+      }
+    } finally { fs.link = native; syncBuiltinESMExports() }
+    assert.deepEqual(published, hasHeld ? [path.join(h.dir('T'), `local_${held}.json`)] : [])
+    const after = await readReceipt(moved.file)
+    assert.deepEqual(after.failed, receipt.failed)
+    assert.equal(after.sessions.length, hasHeld ? 2 : 1)
+    assert.equal((await keepLocal(h.paths)).complete, true)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+  }
+})
+
+test('recovery blockers preserve unfinished journals and never repeat automatic recovery on refresh', async () => {
+  for (const scenario of ['changed target', 'ordinary rollback', 'task rollback', 'ordinary rollback after retry', 'task rollback after retry']) {
+    const ordinary = scenario.startsWith('ordinary'), h = ordinary ? { ...await home(), cold: id(703) } : await taskFamilyFixture(), healthy = id(710)
+    if (ordinary) for (const [index, sid] of [SOURCE, h.cold, healthy].entries()) {
+      await h.write(sid, [entry('user', 800 + index, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const mock = taskHarness(ordinary ? desktopFixture() : [desktopFixture()[0]])
+    if (ordinary) mock.rows[1].ids = [SOURCE, healthy]
+    const planned = await executeMove([from], to, h.paths, { io: mock.io })
+    const native = { link: fs.link, rename: fs.rename }, published = []
+    let attempts = 0, rollbacks = 0, publications = 0
+    fs.link = async (...args) => {
+      const result = await native.link(...args)
+      if (path.dirname(args[1]) === h.dir('T')) published.push(path.basename(args[1]))
+      if (args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`)) {
+        publications++
+        if (scenario === 'changed target') {
+          const record = JSON.parse(await readFile(args[1]))
+          await writeFile(args[1], JSON.stringify({ ...record, title: 'Changed by another owner' }))
         }
-        return result
+        throw new Error('Synthetic interrupted publication')
       }
-      fs.link = async (...args) => {
-        const result = await link(...args)
-        if (${JSON.stringify(stage)} === 'placement' && args[1] === ${JSON.stringify(path.join(h.dir('T'), `local_${h.cold}.json`))}) time = 53000
-        return result
+      return result
+    }
+    fs.rename = async (...args) => {
+      if (scenario.includes('rollback') && args[0] === path.join(h.dir('T'), `local_${SOURCE}.json`)) {
+        rollbacks++
+        if (!scenario.endsWith('after retry') || publications === 2) throw new Error('Synthetic rollback failure')
       }
-    `
-    const output = await cli(h.root, ['--from', 'p@example.com', '--to', 't@example.com', '--restart-approved', planned.plan.token, '--json'], setup)
-    assert.equal(output.code, 1, output.stderr)
-    const result = lines(output.stdout).at(-1)
-    assert.equal(result.code, 'RESTART_CAPACITY', output.stdout)
-    assert.equal(result.complete, false)
-    assert.equal(result.capacity.fits, false)
-    assert.equal(result.capacity.availableMs, 0)
-    assert.equal(result.moved, stage === 'completed' ? 1 : 0)
-    assert.equal(result.summary.moved, result.moved)
-    assert.equal(result.recoveryRequired, stage === 'placement')
-    assert.equal(result.heldCount, 3)
-    assert.equal(result.retryable, false)
-    assert.ok(result.receipt)
-    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
-    assert.equal(await stat(path.join(h.paths.state, 'restart-events.jsonl')).catch(() => null), null)
+      return native.rename(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: stage => { if (stage === 'recovery') attempts++ } }) }
+    finally { Object.assign(fs, native); syncBuiltinESMExports() }
+    assert.equal(attempts, 1)
+    assert.equal(publications, scenario.endsWith('after retry') ? 2 : 1)
+    assert.equal(rollbacks, scenario.endsWith('after retry') ? 2 : scenario.includes('rollback') ? 1 : 0)
+    assert.equal(result.recoveryRequired, true)
+    assert.equal(result.summary.moved, 1)
+    assert.equal(result.summary.notMoved.length, ordinary ? 2 : 3)
+    assert.match(result.reason, scenario.includes('rollback') ? /Synthetic rollback failure/ : /changed.*pending/)
+    const receipt = await readReceipt(result.file)
+    assert.equal(receipt.finalizing, true)
+    assert.ok(receipt.pending)
+    assert.ok(await readFile(`${result.file}.journal`))
+    assert.ok(!published.includes(`local_${healthy}.json`))
+    const before = await fixtureSnapshot(h)
+    for (let i = 0; i < 2; i++) {
+      const refreshed = await sweep(h.paths, { processes: [] })
+      assert.equal(refreshed.ok, false)
+      assert.equal(refreshed.recovered.error, result.reason)
+      assert.deepEqual(await fixtureSnapshot(h), before)
+    }
+    assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
+    assert.equal(receipt.sessions[0].id, h.cold)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
   }
 })
 
@@ -7357,7 +7430,7 @@ test('restart diagnostics never recreate a refused receipt or displace the previ
   const prior = await readFile(moved.file)
   const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, summary: () => {
     assert.equal(mock.rows.length, 0)
-    appendFileSync(path.join(h.project, `${refused}.jsonl`), JSON.stringify(entry('user', 30, 23, refused)) + '\n')
+    appendFileSync(path.join(h.project, `${refused}.jsonl`), JSON.stringify(entry('user', 20, null, refused, { message: { role: 'user', content: 'Conflicting source edit' } })) + '\n')
   } })
   assert.equal(result.validationOnly, true)
   assert.equal(result.file, null)
@@ -7412,15 +7485,16 @@ test('restart diagnostics never rewrite a failed family receipt or journal and f
     if (stage !== 'move' || progress?.completed !== 2 || snapshot) return
     file = path.join(h.paths.state, readdirSync(h.paths.state).find(name => /^\d.*\.json$/.test(name)))
     snapshot = [readFileSync(file), readFileSync(`${file}.journal`)]
-    mock.time = 23_000
+    mock.time += 200
+    mock.rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'unexpected' }]
   } })
   assert.ok(snapshot)
   assert.equal(failed.ok, false)
-  assert.match(failed.reason, /mutation deadline/)
+  assert.match(failed.reason, /reopened before/)
   assert.deepEqual([await readFile(file), await readFile(`${file}.journal`)], snapshot)
   const log = path.join(h.paths.state, 'restart-events.jsonl'), first = lines(await readFile(log, 'utf8'))
   assert.deepEqual(first.map(row => row.event), ['start', 'exited', 'outcome'])
-  assert.equal(first.at(-1).stopCode, 'RESTART_DEADLINE')
+  assert.equal(first.at(-1).stopCode, 'RESTART_REOPENED')
   assert.equal(first.at(-1).receiptCounts, null)
   assert.ok(['moved', 'failed', 'archived'].every(key => !Object.hasOwn(first.at(-1), key)))
   assert.ok(first.every(row => row.kind === 'move'))
@@ -7435,7 +7509,7 @@ test('restart diagnostics never rewrite a failed family receipt or journal and f
   const recovered = JSON.parse(await readFile(file))
   assert.equal(recovered.finalizing, false)
   assert.equal(recovered.restartHistory.length, 2)
-  assert.equal(recovered.restartHistory[0].stopCode, 'RESTART_DEADLINE')
+  assert.equal(recovered.restartHistory[0].stopCode, 'RESTART_REOPENED')
   assert.equal(recovered.restartHistory[0].receiptCounts, null)
   assert.equal(recovered.restartHistory[1].kind, 'finish')
   const continuation = await finishWorkflow(h.paths, { io: mock.io })
@@ -8868,7 +8942,7 @@ test('a thousand source records finish one restart with bounded polling and a li
   assert.equal((await readdir(h.dir('T'))).length, 0)
 })
 
-test('a thousand records in one task family finish the real restart budget with linear reads', async t => {
+test('a thousand records in one task family finish one restart with linear reads', async t => {
   const h = await home(), amount = 1000, first = id(10000)
   const registry = { scheduledTasks: [{ id: 'large_task', notifySessionId: `local_${first}`, enabled: false, fireAt: 123456 }],
     recordedSkips: { large_task: [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }] },
@@ -9174,7 +9248,7 @@ test('scheduler changes before approval move into the fresh restart batch', asyn
   assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
 })
 
-test('a partial restart batch publication rolls back every family and preserves task twins', async () => {
+test('a partial restart batch publication restores the failed twin and completes the independent family', async () => {
   const h = await taskCheckpointFixture()
   const target = { scheduledTasks: h.tasks.map(task => ({ ...task, enabled: false, notifySessionId: null })) }
   await writeFile(h.targetFile, JSON.stringify(target))
@@ -9186,12 +9260,20 @@ test('a partial restart batch publication rolls back every family and preserves 
   try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token }) }
   finally { fs.link = link; syncBuiltinESMExports() }
   assert.equal(result.ok, false)
-  assert.equal(result.receipt.sessions.length, 0)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(result.receipt.sessions[0].id, h.sessions[0])
   assert.equal(result.receipt.finalizing, false)
+  const source = JSON.parse(await readFile(h.sourceFile)), destination = JSON.parse(await readFile(h.targetFile))
+  assert.deepEqual(source.scheduledTasks, [h.tasks[1]])
+  assert.deepEqual(destination.scheduledTasks, [target.scheduledTasks[1], h.tasks[0]])
+  assert.deepEqual(source.recordedSkips, { task_2: h.sourceRegistry.recordedSkips.task_2 })
+  assert.deepEqual(source.runRetries, { task_2: h.sourceRegistry.runRetries.task_2 })
+  assert.deepEqual((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')), [`local_${h.sessions[0]}.json`])
+  assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${h.sessions[1]}.json`)), h.originalRecords[1])
+  assert.equal(result.summary.notMoved.length, 1)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
   assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
   assert.deepEqual(JSON.parse(await readFile(h.targetFile)), target)
-  assert.deepEqual((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')), [])
-  assert.deepEqual(await Promise.all(h.sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), h.originalRecords)
 })
 
 test('cold moves tolerate unrelated runtime writes while still catching new parent dependencies', async () => {
@@ -9298,28 +9380,20 @@ test('interrupted placement replays complete journal entries and ignores only a 
   }
 })
 
-test('a restart timeout before finalization never reports placed records as completed moves', async () => {
-  const h = await home()
-  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
-  await h.record('P', SOURCE, rehomeRecord())
-  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
-  let rows = desktopFixture(), time = 0
-  const io = { now: () => time, budget: 1000, reserve: 200, inspect: () => rows, command: async file => {
-    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
-    return { status: 0 }
-  } }
-  const planned = await executeMove([from], to, h.paths, { io }), reported = []
-  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, text, progress) => {
-    reported.push({ stage, text, progress })
-    if (stage === 'move' && progress?.completed === 1) time = 801
-  } })
+test('polling without productive work stalls without racing unfinished mutations', async () => {
+  const h = await home(), mock = taskHarness(desktopFixture())
+  const plan = await restartPlan(null, h.paths, mock.rows)
+  let settled = false
+  const command = mock.io.command
+  mock.io.command = async (...args) => { if (args[0].endsWith('/open')) assert.equal(settled, true); return command(...args) }
+  const result = await withDesktopRestart(plan, h.paths, async ({ check }) => {
+    await Promise.resolve().then(() => { mock.time += 61_000; settled = true })
+    check()
+  }, () => {}, mock.io)
   assert.equal(result.ok, false)
-  assert.match(result.reason, /mutation deadline/)
-  assert.equal(result.restarted, true)
-  assert.equal(reported.some(row => row.stage === 'move' && row.text.includes('✓')), false)
-  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
-  await sweep(h.paths, { io })
-  assert.equal((await readdir(h.dir('T'))).length, 0)
+  assert.equal(result.code, 'MOVE_STALLED')
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
 })
 
 test('a forced boundary detects reopening before retirement even inside the polling interval', async () => {
@@ -9738,6 +9812,10 @@ function wordingFixtures() {
   for (const row of twoSources.filter(row => row.pending)) row.receiptDestination = 'home/personal'
   const localUndo = pending(2, 'undo', 1)
   Object.assign(localUndo[2], pendingPresentation({ undoing: [], remote: [{ id: 'cse_one' }] }, localUndo[2], localUndo[2], 'undo'))
+  const partialSummary = { moved: 272, notMoved: Array.from({ length: 3 }, (_, i) => ({ account: 'work', org: 'personal', id: id(i + 1), title: `Remaining ${i + 1}`, error: 'Synthetic publication failure' })), groups: [], attention: [] }
+  const partial = structuredClone(base)
+  Object.assign(partial[1], { pending: 'partial', pendingState: 'partial', pendingAction: 'blocked', pendingCount: 3, pendingAutomatic: false,
+    receipt: 'synthetic-receipt', receiptSummary: partialSummary, receiptMoved: 272, receiptDestination: 'work/company' })
   const rows = [
     { name: '01-done', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label }, contains: ['Done. 361 sessions are now in', base[0].label], primary: null },
     { name: '02-held', accounts: held, contains: ['259 moved.', '102 more need Claude to restart.'], primary: 'Restart Claude and move 102' },
@@ -9769,7 +9847,7 @@ function wordingFixtures() {
     { name: '28-mixed-held-and-cloud', accounts: mixed, contains: ['259 moved.', '102 more need Claude to restart.', '3 old copies need checking'], primary: 'Restart Claude and move 102', stop: 'Leave them' },
     { name: '29-unreadable', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_UNREADABLE'), contains: ['Waiting to verify 1 conversation', 'The check will retry automatically.'], primary: null },
     { name: '30-unsupported-dismissed', operation: ['keep-local', '--json', '--leave-check', 'a'.repeat(64)], event: { done: true, ok: true, complete: true, moved: 0, keptLocal: 1, heldCancelled: 0 }, contains: ['Stopped here. Remaining source checks cancelled.'], primary: null },
-    { name: '31-mixed-unsupported-and-waiting', accounts: mixedWaiting, contains: ['Waiting to verify 2 conversations'], primary: 'Restart Claude and finish cleanup', stop: 'Stop here' },
+    { name: '31-mixed-unsupported-and-waiting', accounts: mixedWaiting, contains: ['Waiting to verify 2 conversations'], primary: 'Restart Claude and finish cleanup', stop: 'Keep moved sessions' },
     { name: '32-one-source-clearing', accounts: twoSources, background: true, event: { stage: 'cloud', live: true, text: '0/1', completed: 0, total: 1, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['Clearing 1 old copy from', base[1].label], primary: null },
     { name: '33-background-verification', accounts: twoSources, background: true, event: { stage: 'verify', live: true, text: '1/3', completed: 1, total: 3 }, contains: ['Cleanup will retry automatically.'], primary: null },
     { name: '34-same-login-undo', accounts: pending(1, 'undo', 1), contains: ['Press Finish undo.'], primary: 'Finish undo' },
@@ -9777,16 +9855,17 @@ function wordingFixtures() {
     { name: '36-background-companion', accounts: twoSources, event: { swept: true, ok: true, complete: false, moved: 1, rescuedTitles: ['Research conversation · from Remote Control'] }, contains: ['Brought over 1 conversation.', 'Brought over: Research conversation · from Remote Control'], primary: null },
     { name: '37-reopen-failed', accounts: pending(1, 'undo', 1), event: { swept: true, ok: false, code: 'REOPEN_FAILED', error: 'Synthetic reopen failure' }, contains: ['Claude could not be confirmed open.', 'Open Claude, then press Try again.'], primary: 'Try again' },
     { name: '38-same-login-uncertain', accounts: pending(1, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['The check will retry automatically.'], primary: null },
-    { name: '39-capacity-dialog', dialog: true, plan: capacityPlan, event: capacityPlan, contains: ['not expected to fit the restart time limit', 'Claude will stay running.'], primary: null },
-    { name: '40-capacity-suppressed-warning', dialog: true, suppressed: true, plan: capacityPlan, event: capacityPlan, contains: ['not expected to fit the restart time limit', 'Claude will stay running.'], primary: null },
-    { name: '41-pre-quit-expiry', accounts: held, event: expired, contains: ['259 moved.', 'Claude stayed running.', 'restart time limit was reached before shutdown.', '102 sessions remain pending.'], primary: null },
-    { name: '42-pre-quit-recovery', accounts: held, event: { ...expired, recoveryRequired: true }, contains: ['259 moved.', 'Claude stayed running.', 'Unfinished work needs recovery.'], primary: 'Finish the move' },
+    { name: '39-capacity-dialog', dialog: true, plan: capacityPlan, event: capacityPlan, contains: ['stay closed while', 'These open chats will stop:'], primary: 'Restart and move' },
+    { name: '40-capacity-suppressed-warning', dialog: true, suppressed: true, plan: capacityPlan, event: capacityPlan, contains: ['stay closed while', 'These open chats will stop:'], primary: 'Restart and move' },
+    { name: '41-pre-quit-expiry', accounts: held, event: expired, contains: ['259 moved.', 'remaining sessions are ready to continue.'], primary: 'Restart Claude and move 102' },
+    { name: '42-pre-quit-recovery', accounts: held, event: { ...expired, recoveryRequired: true }, contains: ['259 moved.', 'remaining sessions are ready to continue.'], primary: 'Restart Claude and move 102' },
     { name: '43-partial-quit-veto', accounts: held, event: { done: true, ok: false, complete: false, receipt: 'synthetic-receipt', moved: 259, heldCount: 102, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['259 moved. Move stopped:', 'Claude did not confirm it had closed.'], primary: 'Try again' },
     { name: '44-login-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for Claude to finish signing in.', 'Retrying in'], primary: null },
     { name: '45-memory-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_MEMORY_PRESSURE').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for memory', 'Retrying in'], primary: null },
     { name: '46-history-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_LIMIT'), contains: ['exceeds the history limit'], primary: null, stop: 'Got it' },
     { name: '47-budget-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_BUDGET_LIMIT'), contains: ['memory budget', 'even one at a time'], primary: null, stop: 'Got it' },
-    { name: '48-parser-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_PARSER_LIMIT'), contains: ["history reader's limit"], primary: null, stop: 'Got it' }
+    { name: '48-parser-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_PARSER_LIMIT'), contains: ["history reader's limit"], primary: null, stop: 'Got it' },
+    { name: '49-local-partial', accounts: partial, contains: ['272 moved.', '3 sessions remain', 'Keep moved sessions or undo this move.'], primary: null, stop: 'Keep moved sessions' }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
@@ -9812,6 +9891,7 @@ async function swiftFixtureSource() {
 ` + source.slice(promptEnd)
   return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
     .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)')
+    .replace('DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in', 'scheduleBadgeReset { [weak self] in')
     .replaceAll('UserDefaults.standard', 'fixtureDefaults') + String.raw`
 @MainActor final class FixtureDefaults {
     var values: [String: Any] = [:]
@@ -9822,6 +9902,8 @@ async function swiftFixtureSource() {
 @MainActor let fixtureDefaults = FixtureDefaults()
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 @MainActor var automaticRefreshFixture = false
+@MainActor var badgeResets: [() -> Void] = []
+@MainActor func scheduleBadgeReset(_ action: @escaping () -> Void) { badgeResets.append(action) }
 @MainActor var restartDialogs: [RestartPrompt] = []
 @MainActor var restartDialogResponse: (NSApplication.ModalResponse, Bool) = (.alertThirdButtonReturn, false)
 extension Model {
@@ -10048,6 +10130,26 @@ struct StateChecks {
             let image = MenuLabel(symbol: symbol, badge: "").image
             precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
         }
+        var counts = MoveProgress(now: 0)
+        counts.sessions(total: 498, remaining: 226)
+        counts.update("scan", completed: 0, total: 800, now: 0)
+        precondition(counts.remainingSessions == 226 && counts.remainingSeconds == nil)
+        counts.update("scan", completed: 3, total: 800, now: 3)
+        precondition(counts.remainingSeconds != nil && counts.detail.contains("About") && counts.detail.contains("226 sessions remaining"))
+        counts.sessions(total: 498, remaining: 220)
+        counts.update("move", completed: 1, total: 6, now: 4)
+        counts.update("move", completed: 1, total: 6, now: 5)
+        precondition(counts.sessionTotal == 498 && counts.remainingSessions == 220)
+        counts.sessions(total: 498, remaining: 0)
+        counts.update("verify", completed: 1, total: 226, now: 6)
+        precondition(counts.percent < 100 && counts.detail.contains("0 sessions remaining"))
+        let continued = Model(demo: Demo.accounts)
+        continued.begin()
+        continued.handle(#"{"stage":"sessions","text":"Remaining sessions","live":true,"sessionTotal":226,"remainingCount":226}"#)
+        continued.handle(#"{"stage":"move","text":"1/3","live":true,"completed":1,"total":3}"#)
+        precondition(continued.moveProgress.remainingSessions == 226)
+        continued.handle(#"{"stage":"sessions","text":"Remaining sessions","live":true,"sessionTotal":226,"remainingCount":223}"#)
+        precondition(continued.moveProgress.remainingSessions == 223)
         var progress = MoveProgress(now: 0)
         var previous = 0
         for (stage, completed, total, at) in [("scan", 0, 100, 0.0), ("scan", 50, 100, 2.0), ("scan", 100, 100, 4.0), ("cloud scan", 1, 2, 5.0), ("desktop", 0, 1, 6.0), ("scan", 1, 100, 8.0), ("scan", 100, 100, 8.2), ("move", 1, 100, 8.3), ("move", 100, 100, 8.5), ("verify", 100, 100, 8.6), ("retire", 100, 100, 8.7), ("finalize", 0, 1, 8.8), ("reopen", 0, 1, 9.0), ("cloud", 1, 2, 10.0), ("cloud", 2, 2, 11.0)] {
@@ -10248,7 +10350,7 @@ struct StateChecks {
                 precondition(inventory.recoveryProblem?.receipt == discoveredAccounts[0].recoveryProblem?.receipt)
                 precondition(inventory.detailLines.contains { $0.0 == "recovery" && $0.1 == "Invalid append checkpoint" })
                 precondition(inventory.detailLines.contains { $0.0 == "receipt" && $0.1 == inventory.recoveryProblem?.receipt })
-                precondition(inventory.detailLines.count == previousLines.count + 2)
+                precondition(inventory.detailLines.count == previousLines.count + 3)
                 inventory.move()
                 inventory.finishPending()
                 inventory.keepLocal()
@@ -10557,17 +10659,33 @@ struct StateChecks {
                 item.move()
                 let args = requests[0].0
                 requests[0].1(#"{"plan":true,"kind":"move","token":"capacity-token","capacity":{"fits":"# + (fits.map { $0 ? "true" : "false" } ?? "null") + #"},"heldCount":3}"#)
-                requests[0].2(fits == false ? 1 : 0, "")
-                if fits == false {
-                    precondition(restartDialogs.count == 1 && !restartDialogs[0].canRestart)
-                    precondition(requests.allSatisfy { !$0.0.contains("--restart-approved") })
-                    if response == .alertSecondButtonReturn { precondition(requests.last!.0 == args + ["--move-only"]) }
-                    else { precondition(!item.running && item.primaryTitle == nil && item.note.contains("Claude stayed running.")) }
-                } else {
-                    precondition(restartDialogs.isEmpty)
-                    precondition(requests.last!.0 == args + ["--restart-approved", "capacity-token"])
-                }
+                requests[0].2(0, "")
+                precondition(restartDialogs.isEmpty)
+                precondition(requests.last!.0 == args + ["--restart-approved", "capacity-token"])
             }
+        }
+        for refresh in [false, true] {
+            let accounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("49-local-partial").utf8))
+            let partial = Model(demo: accounts)
+            if !refresh {
+                partial.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"summary":{"moved":272,"notMoved":[{"title":"One","error":"failed"},{"title":"Two","error":"failed"},{"title":"Three","error":"failed"}],"groups":[],"attention":[]}}"#)
+            }
+            precondition(partial.primaryTitle == nil && partial.canKeepLocal && partial.stopTitle == "Keep moved sessions")
+            precondition(partial.displaySummary.contains("3 sessions remain"))
+            precondition(partial.visibleCompletion == nil)
+        }
+        for fixture in ["02-held", "31-mixed-unsupported-and-waiting"] {
+            let accounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(fixture).utf8))
+            let partial = Model(demo: accounts), primary = partial.primaryTitle
+            let event: [String: Any] = ["done": true, "ok": false, "complete": false, "partial": true, "heldCount": fixture == "02-held" ? 102 : 0,
+                "pendingCloud": fixture == "02-held" ? 0 : 3, "summary": ["moved": 272, "notMoved": [["title": "One", "error": "failed"]], "groups": [], "attention": []]]
+            partial.handle(String(data: try! JSONSerialization.data(withJSONObject: event), encoding: .utf8)!)
+            precondition(primary != nil && partial.primaryTitle == primary)
+            precondition(!partial.displaySummary.contains("Keep moved sessions or undo this move."))
+            refreshReply(partial, wordingAccounts(fixture))
+            precondition(partial.primaryTitle == primary)
+            let relaunched = Model(demo: accounts)
+            precondition(relaunched.primaryTitle == primary)
         }
         restartDialogResponse = (.alertThirdButtonReturn, false)
         let moveArgs = ["--from", "work personal", "--to", "work company", "--cloud", "--json"]
@@ -10719,7 +10837,8 @@ struct StateChecks {
         sweepReply(failedWithRestart, #"{"swept":true,"ok":true,"complete":true,"issues":0,"restart":true}"#)
         precondition(failedWithoutRestart.symbol == "exclamationmark.triangle" && !failedWithoutRestart.restartAvailable)
         precondition(failedWithRestart.symbol == "exclamationmark.triangle" && failedWithRestart.restartAvailable)
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 4.1))
+        for action in badgeResets { action() }
+        badgeResets = []
         precondition(delayed.restartAvailable && delayed.symbol == "info.circle" && delayed.badge.isEmpty)
         precondition(failedWithoutRestart.symbol == "arrow.left.arrow.right" && failedWithoutRestart.badge.isEmpty)
         precondition(failedWithRestart.symbol == "exclamationmark.triangle" && failedWithRestart.badge.isEmpty)
