@@ -1831,6 +1831,30 @@ test('interrupted retirement restores partially parked entries', async () => {
   assert.equal(recovered.finalizing, false)
 })
 
+test('legacy retirement recovery preserves placed copies until explicit Undo', async () => {
+  const h = await home()
+  for (const [index, sid] of [SOURCE, id(710)].entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await executeMove([from], to, h.paths, { processes: [] }), receipt = moved.receipt
+  receipt.finalizing = true
+  receipt.retiring = receipt.superseded
+  receipt.superseded = []
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const result = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(result.recoveryRequired, true)
+  assert.match(result.reconciled.error, /retirement rolled back/)
+  const recovered = await readReceipt(moved.file)
+  assert.equal(recovered.finalizing, false)
+  assert.equal(recovered.sessions.length, 2)
+  assert.equal((await readdir(h.dir('P'))).length, 2)
+  assert.equal((await readdir(h.dir('T'))).length, 2)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
 test('interrupted retirement keeps its journal when a required artifact vanished', async () => {
   const h = await home()
   const at = '2099-01-01T00-00-00-000'
@@ -7214,6 +7238,144 @@ test('publication recovery retries once and cleans failed ordinary or task units
   }
 })
 
+test('retirement recovery unwinds unfinished copies and isolates the exact dependency unit', async () => {
+  for (const shape of ['ordinary', 'parent', 'task']) for (const resume of [false, true]) for (const transient of [true, false]) {
+    const h = shape === 'task' ? await taskFamilyFixture() : await home(), other = id(710), child = id(711), cold = id(720)
+    const failed = shape === 'task' ? h.run : other
+    let ids
+    if (shape === 'task') {
+      await h.write(other, [entry('user', 810, null, other)])
+      await h.record('P', other, rehomeRecord({ scheduledTaskId: 'independent' }))
+      h.sourceRegistry.scheduledTasks = [...h.tasks, { id: 'independent', enabled: true }]
+      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+      ids = [SOURCE, h.run, h.second, h.cold, other]
+    } else {
+      ids = [SOURCE, other, ...shape === 'parent' ? [child] : [], ...resume ? [cold] : []]
+      for (const [index, sid] of ids.entries()) {
+        await h.write(sid, [entry('user', 810 + index, null, sid)])
+        await h.record('P', sid, rehomeRecord(sid === child ? { forkedFromSessionId: `local_${other}` } : {}))
+      }
+    }
+    const mock = taskHarness(shape === 'task' ? [desktopFixture()[0]] : desktopFixture())
+    if (shape !== 'task') mock.rows[1].ids = ids.filter(sid => sid !== cold)
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const seed = resume ? await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true }) : null
+    const run = options => resume ? finishWorkflow(h.paths, options) : executeMove([from], to, h.paths, options)
+    const planned = await run({ io: mock.io }), native = fs.rename, reports = []
+    let refusals = 0
+    fs.rename = async (...args) => {
+      if (args[0] === path.join(h.dir('P'), `local_${failed}.json`) && (++refusals === 1 || !transient)) throw new Error(`Synthetic retirement refusal ${failed}`)
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await run({ io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => reports.push({ stage, ...extra }) }) }
+    finally { fs.rename = native; syncBuiltinESMExports() }
+    assert.equal(result.recoveryRequired, undefined, result.reason)
+    assert.equal(result.ok, transient, JSON.stringify(result.summary))
+    assert.equal(result.complete, transient)
+    assert.equal(refusals, 2)
+    assert.equal(reports.filter(row => row.stage === 'recovery').length, 1)
+    const notMoved = transient ? [] : shape === 'task' ? [SOURCE, h.run, h.second] : shape === 'parent' ? [other, child] : [other]
+    assert.deepEqual(result.summary.notMoved.map(row => row.id).sort(), notMoved.sort())
+    assert.deepEqual(result.receipt.sessions.map(row => row.id).sort(), ids.filter(sid => !notMoved.includes(sid)).sort())
+    assert.equal(result.receipt.finalizing, false)
+    assert.equal(result.receipt.retiring, null)
+    assert.equal(result.receipt.held.length, 0)
+    if (seed) assert.equal(result.file, seed.file)
+    for (const sid of ids) {
+      const source = await stat(path.join(h.dir('P'), `local_${sid}.json`)).catch(() => null)
+      const target = await stat(path.join(h.dir('T'), `local_${sid}.json`)).catch(() => null)
+      assert.equal(Boolean(source), notMoved.includes(sid), `${shape}/${resume}/${transient}/${sid}`)
+      assert.equal(Boolean(target), !notMoved.includes(sid))
+    }
+    assert.equal(reports.filter(row => row.stage === 'sessions').at(-1).remainingCount, notMoved.length)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    if (!transient) assert.equal((await keepLocal(h.paths)).complete, true)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    const after = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    if (shape === 'task') {
+      for (const file of [h.sourceFile, h.targetFile]) { delete before[file]; delete after[file] }
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    }
+    assert.deepEqual(after, before)
+  }
+})
+
+test('failed retirement restoration retains its journal and cannot continue independent writes', async () => {
+  const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
+  mock.rows[1].ids = [SOURCE, other]
+  for (const [index, sid] of [SOURCE, other].entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const planned = await executeMove([from], to, h.paths, { io: mock.io }), native = fs.rename
+  let attempts = 0
+  fs.rename = async (...args) => {
+    if (args[0] === path.join(h.dir('P'), `local_${other}.json`)) { attempts++; throw new Error('Synthetic retirement failure') }
+    if (args[1] === path.join(h.dir('P'), `local_${SOURCE}.json`)) throw new Error('Synthetic restore failure')
+    return native(...args)
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+  finally { fs.rename = native; syncBuiltinESMExports() }
+  assert.equal(attempts, 1)
+  assert.equal(result.code, 'LOCAL_RECOVERY_BLOCKED')
+  assert.match(result.reason, /restore failure/)
+  const receipt = await readReceipt(result.file)
+  assert.ok(receipt.retiring && receipt.finalizing && receipt.localRecovery.rollbackPlacement)
+  assert.equal(result.summary.moved, 0)
+  assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
+  assert.equal((await sweep(h.paths, { processes: [] })).ok, false)
+  await finishWorkflow(h.paths, { processes: [] })
+  const recovered = await readReceipt(result.file)
+  assert.equal(recovered.sessions.length, 0)
+  assert.equal(recovered.finalizing, false)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+  assert.equal((await readdir(h.dir('P'))).length, 2)
+})
+
+test('preflight refusals stay informational on cold, restarted and successfully retried moves', async () => {
+  for (const mode of ['cold', 'restart', 'retry', 'retry refusal']) {
+    const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
+    const good = [entry('user', 810, null, SOURCE)], bad = entry('user', 811, null, other)
+    await h.write(SOURCE, good)
+    await h.write(other, mode === 'retry refusal' ? [bad] : [bad, { ...bad, message: { role: 'user', content: 'Conflicting history' } }])
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.record('P', other, rehomeRecord())
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const options = mode === 'cold' ? { processes: [] } : { io: mock.io }, planned = mode === 'cold' ? null : await executeMove([from], to, h.paths, options)
+    const native = fs.link
+    let attempts = 0
+    fs.link = async (...args) => {
+      if (mode.startsWith('retry') && args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`) && ++attempts === 1) throw new Error('Synthetic temporary failure')
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { ...options, approve: planned?.plan.token, report: stage => {
+      if (mode === 'retry refusal' && stage === 'recovery') appendFileSync(path.join(h.project, `${SOURCE}.jsonl`), JSON.stringify({ ...good[0], message: { role: 'user', content: 'New conflicting history' } }) + '\n')
+    } }) }
+    finally { fs.link = native; syncBuiltinESMExports() }
+    assert.equal(result.summary.moved, 1)
+    assert.equal(result.summary.notMoved.length, 1)
+    assert.equal(Boolean(result.receipt.localStopped), mode === 'retry refusal')
+    assert.equal(result.complete, mode !== 'retry refusal')
+    const finished = await cli(h.root, ['finish', '--json'], processSetup({ list: '', commands: '' }))
+    assert.equal(finished.code, mode === 'retry refusal' ? 1 : 0, finished.stdout)
+    const event = lines(finished.stdout).at(-1)
+    assert.equal(event.nothing === true, mode !== 'retry refusal')
+    const listed = await cli(h.root, ['accounts', '--json'], processSetup({ list: '', commands: '' }))
+    const pending = lines(listed.stdout)[0].filter(row => row.pending)
+    assert.equal(pending.length, mode === 'retry refusal' ? 1 : 0)
+    if (pending.length) assert.equal(pending[0].pendingAction, 'blocked')
+  }
+})
+
 test('one real stall retries the unfinished family and completes without another shutdown', async () => {
   const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness(), reports = []
   const planned = await executeMove([from], to, h.paths, { io: mock.io })
@@ -9039,7 +9201,8 @@ test('one restart batches the 361 record seven family shape and multiple registr
     const command = mock.io.command
     mock.io.command = async file => { if (file.endsWith('/open')) reopenAt = performance.now(); return command(file) }
     const planned = await executeMove(from, to, h.paths, { io: mock.io })
-    assert.equal(planned.plan.capacity.records, sizes.reduce((sum, n) => sum + n, 0))
+    assert.equal(planned.plan.remainingCount, index)
+    assert.equal(new Set(planned.plan.held.flatMap(row => row.sources.map(source => source.file))).size, sizes.reduce((sum, n) => sum + n, 0))
     let recordReads = 0, readBytes = 0, receiptWrites = 0, writeBytes = 0, namespaceScans = 0
     const read = fs.readFile, write = fs.writeFile, list = fs.readdir
     fs.readFile = async (...args) => {
@@ -9773,6 +9936,60 @@ test('panel leave tokens survive sweep bookkeeping and reject changed receipt or
   }
 })
 
+async function cliProgressFixture() {
+  const h = await home()
+  for (const [index, sid] of [SOURCE, id(710)].entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  await h.record('P', id(799), rehomeRecord())
+  const output = await cli(h.root, ['--from', 'p@example.com', '--to', 't@example.com', '--json'], processSetup({ list: '', commands: '' }))
+  assert.equal(output.code, 0, output.stderr)
+  const events = lines(output.stdout), counts = events.filter(row => row.stage === 'sessions')
+  assert.deepEqual(counts.map(row => [row.sessionTotal, row.remainingCount]), [[2, 2], [2, 0]])
+  assert.ok(counts.every(row => row.live && Number.isSafeInteger(row.sessionTotal) && Number.isSafeInteger(row.remainingCount) && row.remainingCount >= 0 && row.remainingCount <= row.sessionTotal))
+  assert.equal(events.at(-1).summary.moved, 2)
+  assert.equal(events.at(-1).summary.notMoved.length, 0)
+  return output.stdout.trim().split('\n')
+}
+
+async function rescueProgressFixture(fail) {
+  const h = await home(), mock = taskHarness(desktopFixture()), events = []
+  await h.write(SOURCE, [...branchEntries(8, SOURCE, 20), entry('user', 28, 27, SOURCE, { message: { role: 'user', content: 'Local branch' } })])
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_counter'] }))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true, cloudRequested: true })
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_counter', title: 'Remote branch', status })],
+    eventRows: async () => remoteRows([...branchEntries(8, SOURCE, 20), entry('user', 30, 27, SOURCE, { message: { role: 'user', content: 'Remote branch' } })]),
+    session: async () => remoteState(status), archive: async () => { status = 'archived' }
+  })
+  const planned = await finishWorkflow(h.paths, { io: mock.io, cloud }), native = fs.link
+  fs.link = async (...args) => {
+    if (fail && path.dirname(args[1]) === h.dir('T') && args[1] !== path.join(h.dir('T'), `local_${SOURCE}.json`)) throw new Error('Synthetic rescue failure')
+    return native(...args)
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await finishWorkflow(h.paths, { io: mock.io, cloud, approve: planned.plan.token, report: (stage, text, extra = {}) => events.push({ stage, text, ...extra }) }) }
+  finally { fs.link = native; syncBuiltinESMExports() }
+  assert.equal(result.ok, !fail, JSON.stringify(result.receipt.failed))
+  assert.equal(result.summary.moved, fail ? 1 : 2)
+  assert.equal(result.receipt.sessions.filter(row => row.strategy === 'remote').length, fail ? 0 : 1)
+  assert.equal(status, fail ? 'active' : 'archived')
+  assert.ok(events.some(row => row.stage === 'sessions' && row.remainingCount === 0))
+  assert.ok(events.findIndex(row => row.stage === 'reopen') < events.findIndex(row => row.stage === 'rescue' && row.total > 0))
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  return events.map(row => JSON.stringify(row))
+}
+
+test('CLI JSON forwards validated whole-move session counters', async () => { await cliProgressFixture() })
+
+test('post-restart remote rescue reports real progress without counting a failed rescue as moved', async () => {
+  for (const fail of [false, true]) await rescueProgressFixture(fail)
+})
+
 function wordingFixtures() {
   const base = [
     { account: 'work', org: 'company', email: 'work@example.test', orgName: 'Nomad Inc.', label: 'work@example.test · Nomad Inc.', active: true, signedIn: true },
@@ -9798,7 +10015,6 @@ function wordingFixtures() {
   const plan = { plan: true, kind: 'move', token: 'a'.repeat(64), heldCount: 102, remainingCount: 102, moved: 259,
     sourceLabels: [base[1].label], affected: [{ pid: 501, started: 'synthetic', recordId: 'local_one', title: 'Research notes' }, { pid: 502, started: 'synthetic', recordId: 'local_two', title: 'Daily brief' }] }
   const capacityPlan = { ...plan, ok: false, code: 'RESTART_CAPACITY', capacity: { records: 102, estimatedMs: 26000, availableMs: 22000, fits: false } }
-  const expired = { done: true, ok: false, complete: false, moved: 259, heldCount: 102, code: 'RESTART_CAPACITY', capacity: { fits: false, availableMs: 0 } }
   const held = pending(1, 'local', 102, null, 'scheduler')
   held[1].receiptMoved = 259
   const mixed = pending(2, 'cloud', 3)
@@ -9857,8 +10073,6 @@ function wordingFixtures() {
     { name: '38-same-login-uncertain', accounts: pending(1, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['The check will retry automatically.'], primary: null },
     { name: '39-capacity-dialog', dialog: true, plan: capacityPlan, event: capacityPlan, contains: ['stay closed while', 'These open chats will stop:'], primary: 'Restart and move' },
     { name: '40-capacity-suppressed-warning', dialog: true, suppressed: true, plan: capacityPlan, event: capacityPlan, contains: ['stay closed while', 'These open chats will stop:'], primary: 'Restart and move' },
-    { name: '41-pre-quit-expiry', accounts: held, event: expired, contains: ['259 moved.', 'remaining sessions are ready to continue.'], primary: 'Restart Claude and move 102' },
-    { name: '42-pre-quit-recovery', accounts: held, event: { ...expired, recoveryRequired: true }, contains: ['259 moved.', 'remaining sessions are ready to continue.'], primary: 'Restart Claude and move 102' },
     { name: '43-partial-quit-veto', accounts: held, event: { done: true, ok: false, complete: false, receipt: 'synthetic-receipt', moved: 259, heldCount: 102, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['259 moved. Move stopped:', 'Claude did not confirm it had closed.'], primary: 'Try again' },
     { name: '44-login-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for Claude to finish signing in.', 'Retrying in'], primary: null },
     { name: '45-memory-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_MEMORY_PRESSURE').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for memory', 'Retrying in'], primary: null },
@@ -9959,20 +10173,9 @@ struct WordingChecks {
             if fixture.dialog == true {
                 let prompt = RestartPrompt(plan: fixture.plan!)
                 text = prompt.title + "\n" + prompt.body
-                primary = prompt.canRestart ? prompt.confirm : nil
+                primary = prompt.confirm
                 let alert = prompt.alert()
-                precondition(alert.buttons[0].isEnabled == prompt.canRestart)
-                if !prompt.canRestart {
-                    precondition(!alert.showsSuppressionButton)
-                    precondition(alert.buttons.map(\.title) == [prompt.confirm, "Move the others only", "Cancel"])
-                    model.skipRestartWarning = fixture.suppressed == true
-                    model.begin()
-                    model.handle(fixture.event!)
-                    model.checkFinish(1)
-                    precondition(restartDialogs.count == 1 && !restartDialogs[0].canRestart)
-                    precondition(!model.running && model.primaryTitle == nil)
-                    precondition(requests.allSatisfy { !$0.0.contains("--restart-approved") })
-                }
+                precondition(alert.buttons[0].isEnabled && alert.showsSuppressionButton)
                 precondition(alert.buttons.map(\.title) == ["Restart and move", "Move the others only", "Cancel"])
                 precondition(alert.suppressionButton?.title == "Don't ask again")
                 png = Snapshot.dialogData(fixture.plan!)
@@ -10015,6 +10218,7 @@ struct WordingChecks {
                     precondition(requests.count == count)
                 }
                 if fixture.name == "09-open-chats" || fixture.name == "27-timed-open-chats" { precondition(model.sourceTag(model.pendingAccounts[0]) == "waiting") }
+                if fixture.name == "49-local-partial" { precondition(model.sourceTag(model.pendingAccounts[0]) == "not moved") }
                 if fixture.name == "06-clearing" || fixture.name == "07-bringing-over" {
                     precondition(model.to == "work/company" && model.from == ["work/personal"])
                 }
@@ -10066,6 +10270,8 @@ struct WordingChecks {
 
 test('Swift preserves command, progress, metadata, and completion states', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
+  const cliProgress = await cliProgressFixture(), rescues = []
+  for (const fail of [false, true]) rescues.push(await rescueProgressFixture(fail))
   const checkpointAccounts = await checkpointAccountsFixture()
   const h = await taskFamilyFixture(true, 1)
   await interruptTaskFamily(h, 'move', 'target')
@@ -10139,17 +10345,43 @@ struct StateChecks {
         counts.sessions(total: 498, remaining: 220)
         counts.update("move", completed: 1, total: 6, now: 4)
         counts.update("move", completed: 1, total: 6, now: 5)
-        precondition(counts.sessionTotal == 498 && counts.remainingSessions == 220)
+        precondition(counts.remainingSessions == 220)
         counts.sessions(total: 498, remaining: 0)
         counts.update("verify", completed: 1, total: 226, now: 6)
         precondition(counts.percent < 100 && counts.detail.contains("0 sessions remaining"))
+        let cliProgress = try! JSONDecoder().decode([String].self, from: Data(base64Encoded: "CLI_COUNTER_EVENTS")!)
         let continued = Model(demo: Demo.accounts)
         continued.begin()
-        continued.handle(#"{"stage":"sessions","text":"Remaining sessions","live":true,"sessionTotal":226,"remainingCount":226}"#)
-        continued.handle(#"{"stage":"move","text":"1/3","live":true,"completed":1,"total":3}"#)
-        precondition(continued.moveProgress.remainingSessions == 226)
-        continued.handle(#"{"stage":"sessions","text":"Remaining sessions","live":true,"sessionTotal":226,"remainingCount":223}"#)
-        precondition(continued.moveProgress.remainingSessions == 223)
+        var countEvents = 0
+        for line in cliProgress {
+            let event = try! JSONDecoder().decode(Event.self, from: Data(line.utf8))
+            continued.handle(line)
+            if event.stage == "sessions" { countEvents += 1; precondition(continued.moveProgress.remainingSessions == event.remainingCount) }
+        }
+        precondition(countEvents == 2 && continued.moveProgress.remainingSessions == 0)
+        let rescueRuns = try! JSONDecoder().decode([[String]].self, from: Data(base64Encoded: "RESCUE_PROGRESS_EVENTS")!)
+        for run in rescueRuns {
+            let model = Model(demo: Demo.accounts)
+            model.begin()
+            var unknown = false, sawRescue = false
+            for line in run {
+                let event = try! JSONDecoder().decode(Event.self, from: Data(line.utf8))
+                if ["cloud scan", "rescue"].contains(event.activity ?? event.stage ?? ""), (event.total ?? 0) > 0 { unknown = true }
+                if event.stage == "rescue", (event.total ?? 0) > 0 { sawRescue = true }
+                model.handle(line)
+                if unknown { precondition(model.moveProgress.remainingSessions == nil && !model.moveProgress.detail.contains("sessions remaining")) }
+            }
+            precondition(sawRescue && unknown)
+        }
+        let sourceProgress = Model(demo: Demo.accounts)
+        sourceProgress.begin()
+        sourceProgress.handle(#"{"stage":"cloud","text":"0/2","live":true,"completed":0,"total":2,"sourceId":"work/personal","sourceLabel":"Source"}"#)
+        let activity = sourceProgress.sourceActivity?.sourceId, activityText = sourceProgress.progressLabel
+        sourceProgress.handle(#"{"stage":"sessions","text":"Remaining sessions","live":true,"sessionTotal":5,"remainingCount":3}"#)
+        precondition(sourceProgress.moveProgress.remainingSessions == 3 && sourceProgress.sourceActivity?.sourceId == activity && sourceProgress.progressLabel == activityText)
+        for line in [#"{"stage":"sessions","text":"Invalid","live":true,"sessionTotal":2,"remainingCount":3}"#,
+                     #"{"stage":"sessions","text":"Invalid","live":true,"sessionTotal":-1,"remainingCount":0}"#] { sourceProgress.handle(line) }
+        precondition(sourceProgress.moveProgress.remainingSessions == 3)
         var progress = MoveProgress(now: 0)
         var previous = 0
         for (stage, completed, total, at) in [("scan", 0, 100, 0.0), ("scan", 50, 100, 2.0), ("scan", 100, 100, 4.0), ("cloud scan", 1, 2, 5.0), ("desktop", 0, 1, 6.0), ("scan", 1, 100, 8.0), ("scan", 100, 100, 8.2), ("move", 1, 100, 8.3), ("move", 100, 100, 8.5), ("verify", 100, 100, 8.6), ("retire", 100, 100, 8.7), ("finalize", 0, 1, 8.8), ("reopen", 0, 1, 9.0), ("cloud", 1, 2, 10.0), ("cloud", 2, 2, 11.0)] {
@@ -10616,6 +10848,23 @@ struct StateChecks {
             sweepReply(item, #"{"swept":true,"ok":false,"error":"Synthetic failure"}"#)
             precondition(item.symbol == "exclamationmark.triangle")
         }
+        for blocked in [false, true] {
+            let model = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("10-interrupted").utf8)))
+            let code = blocked ? "LOCAL_RECOVERY_BLOCKED" : ""
+            model.restartAvailable = true
+            model.handle(#"{"done":true,"ok":false,"recoveryRequired":true,"code":""# + code + #"","reconciled":{"title":"Unfinished copies","error":"interrupted finalization rolled back"}}"#)
+            if blocked {
+                precondition(!model.canMutate && !model.canKeepLocal && model.primaryTitle == nil)
+            } else {
+                precondition(model.detailLines.contains { $0.0 == "recovered" && $0.1.contains("Unfinished copies") })
+                precondition(model.note.contains("Press Finish the move to continue.") && !model.restartAvailable)
+                precondition(model.primaryTitle == "Finish the move" && model.canMutate)
+            }
+        }
+        let undoActions = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("26-undo-ready").utf8)))
+        precondition(undoActions.primaryTitle == "Finish undo" && !undoActions.hasSecondaryActions)
+        let freshActions = Model(demo: Demo.accounts)
+        precondition(freshActions.primaryTitle == "Move" && freshActions.hasSecondaryActions)
         requests = []
         let login = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("12-undo-pending").utf8)))
         precondition(login.undoPending && !login.pendingReady && login.primaryTitle == nil)
@@ -10671,6 +10920,7 @@ struct StateChecks {
                 partial.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"summary":{"moved":272,"notMoved":[{"title":"One","error":"failed"},{"title":"Two","error":"failed"},{"title":"Three","error":"failed"}],"groups":[],"attention":[]}}"#)
             }
             precondition(partial.primaryTitle == nil && partial.canKeepLocal && partial.stopTitle == "Keep moved sessions")
+            precondition(partial.sourceTag(partial.pendingAccounts[0]) == "not moved")
             precondition(partial.displaySummary.contains("3 sessions remain"))
             precondition(partial.visibleCompletion == nil)
         }
@@ -10707,7 +10957,7 @@ struct StateChecks {
             ("restart", ["restart", "--json"], emptyAccounts, "synthetic-receipt", ["restart", "--json"]),
             ("changed receipt", moveArgs, changedAccounts, "synthetic-receipt", nil)
         ]
-        for code in ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED", "REOPEN_FAILED", "QUIT_UNCONFIRMED", "RESTART_DEADLINE"] {
+        for code in ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED", "REOPEN_FAILED", "QUIT_UNCONFIRMED"] {
             for (name, args, accounts, receipt, expected) in routes {
                 requests = []
                 restartDialogs = []
@@ -10715,7 +10965,7 @@ struct StateChecks {
                 item.skipRestartWarning = true
                 item.checkOperation(args + ["--restart-approved", "obsolete-token"])
                 item.begin()
-                var event: [String: Any] = ["done": true, "ok": false, "complete": name == "completed", "code": code, "heldCount": ["fresh", "completed"].contains(name) ? 0 : 3, "retryable": code != "RESTART_DEADLINE"]
+                var event: [String: Any] = ["done": true, "ok": false, "complete": name == "completed", "code": code, "heldCount": ["fresh", "completed"].contains(name) ? 0 : 3, "retryable": true]
                 if let receipt { event["receipt"] = receipt }
                 item.handle(String(data: try! JSONSerialization.data(withJSONObject: event), encoding: .utf8)!)
                 item.checkFinish(1)
@@ -10724,8 +10974,6 @@ struct StateChecks {
                     precondition(item.primaryTitle == nil, code + name)
                     item.primary()
                     precondition(requests.count == count)
-                } else if code == "RESTART_DEADLINE" && accounts.allSatisfy({ $0.pending == nil }) {
-                    precondition(item.primaryTitle == nil && requests.count == count)
                 } else {
                     precondition(item.primaryTitle != nil, code + name)
                     item.primary()
@@ -10851,6 +11099,8 @@ struct StateChecks {
   source = source.replace('REPAIRED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.repaired).toString('base64'))
   source = source.replace('WORDING_FIXTURES', Buffer.from(JSON.stringify(wordingFixtures())).toString('base64'))
   source = source.replace('CAPTURED_RESTART_PROGRESS', Buffer.from(JSON.stringify(captured)).toString('base64'))
+  source = source.replace('CLI_COUNTER_EVENTS', Buffer.from(JSON.stringify(cliProgress)).toString('base64'))
+  source = source.replace('RESCUE_PROGRESS_EVENTS', Buffer.from(JSON.stringify(rescues)).toString('base64'))
   source = source.replace('ACTUAL_CONTINUATION', Buffer.from(JSON.stringify(continuation)).toString('base64'))
   const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
   await writeFile(file, source)

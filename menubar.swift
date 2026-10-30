@@ -101,13 +101,6 @@ struct MetadataChange: Decodable {
 }
 
 
-struct RestartCapacity: Decodable {
-    let fits: Bool?
-    let records: Int?
-    let estimatedMs: Double?
-    let availableMs: Double?
-}
-
 struct Event: Decodable {
     let receipt: String?
     let summary: ReceiptSummary?
@@ -172,14 +165,12 @@ struct Event: Decodable {
     let undoRecovery: Bool?
     let rescuedTitles: [String]?
     let activity: String?
-    let capacity: RestartCapacity?
     var issues: Int { (summary?.attention.count ?? failed?.count ?? 0) + (problems?.count ?? 0) }
 }
 
 @MainActor
 struct RestartPrompt {
     let plan: Event
-    var canRestart: Bool { true }
     var isUndo: Bool { plan.kind == "undo" || plan.undoRecovery == true }
     var title: String {
         if isUndo { return "Restart Claude to finish Undo?" }
@@ -194,8 +185,7 @@ struct RestartPrompt {
         var seen = Set<String>()
         let names = (plan.affected ?? []).filter { seen.insert($0.recordId ?? "pid/\($0.pid)").inserted }.map { $0.title ?? "An open Claude chat" }
         let work = isUndo ? "finish Undo" : plan.kind == "refresh" ? "refresh the sidebar" : "continue the move"
-        let estimate = plan.capacity?.estimatedMs.map { " The move may take about \(max(1, Int(ceil($0 / 1000)))) seconds." } ?? ""
-        return "Claude will close, including Chat, Cowork and background commands, and stay closed while Claude Transplant finishes. It will \(work), then try to reopen Claude." + estimate + "\n\nThese open chats will stop:\n" + (names.isEmpty ? "No Code chats are open." : names.joined(separator: "\n")) + "\n\nIf Claude shows a quit confirmation, answer it to continue."
+        return "Claude will close, including Chat, Cowork and background commands, and stay closed while Claude Transplant finishes. It will \(work), then try to reopen Claude.\n\nThese open chats will stop:\n" + (names.isEmpty ? "No Code chats are open." : names.joined(separator: "\n")) + "\n\nIf Claude shows a quit confirmation, answer it to continue."
     }
     func alert() -> NSAlert {
         let alert = NSAlert()
@@ -204,10 +194,9 @@ struct RestartPrompt {
         alert.messageText = title
         alert.informativeText = body
         alert.addButton(withTitle: confirm)
-        alert.buttons[0].isEnabled = canRestart
         if plan.kind == "move" { alert.addButton(withTitle: "Move the others only") }
         alert.addButton(withTitle: "Cancel")
-        alert.showsSuppressionButton = canRestart
+        alert.showsSuppressionButton = true
         alert.suppressionButton?.title = "Don't ask again"
         return alert
     }
@@ -236,7 +225,7 @@ struct MoveProgress {
     var value = 0.0
     var restarting = false
     var remainingSessions: Int?
-    var sessionTotal: Int?
+    var localOnly = true
     var sampled: Set<String> = []
 
     init(costs learned: [String: Double] = [:], now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
@@ -264,8 +253,7 @@ struct MoveProgress {
         return parts.joined(separator: " · ")
     }
     mutating func sessions(total: Int, remaining: Int) {
-        sessionTotal = total
-        remainingSessions = min(total, max(0, remaining))
+        if localOnly { remainingSessions = min(total, max(0, remaining)) }
     }
 
     mutating func record(_ now: TimeInterval) {
@@ -434,6 +422,7 @@ final class Model: ObservableObject {
     var recoveryProblem: RecoveryProblem? { accounts.compactMap(\.recoveryProblem).first }
     var canMutate: Bool { !running && recoveryProblem == nil && !recoveryBlocked }
     var undoPending: Bool { pendingAccounts.contains { $0.pending == "undo" } }
+    var hasSecondaryActions: Bool { canKeepLocal || !undoPending }
     var canKeepLocal: Bool { canMutate && (partialResult || pendingAccounts.contains { ["cloud", "local", "partial"].contains($0.pending ?? "") }) }
     var pendingReady: Bool { canMutate && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.pending == "recovery" || $0.pending == "undo" && $0.signedIn == true ? "finish" : "wait")) } && (config != nil || demo) }
     var pendingButtonTitle: String {
@@ -523,6 +512,7 @@ final class Model: ObservableObject {
         if let event = sourceActivity, event.sourceId == account.id { return (event.activity ?? event.stage) == "cloud" ? "clearing" : (event.activity ?? event.stage) == "rescue" ? "bringing over" : "checking" }
         if account.kept == true { return "kept" }
         guard account.pending != nil else { return nil }
+        if account.pendingState == "partial" { return "not moved" }
         if ["unsupported", "limit", "budget-limit", "parser-limit"].contains(account.pendingState ?? "") { return "kept" }
         if account.pendingState == "login", account.signedIn == true { return "signing in" }
         if account.pendingState == "open" && account.pendingAutomatic == true { return "waiting" }
@@ -728,10 +718,18 @@ final class Model: ObservableObject {
             pendingPlan = event
         } else if let stage = event.stage, let text = event.text {
             if event.live == true {
+                if stage == "sessions" {
+                    if let total = event.sessionTotal, let remaining = event.remainingCount, total >= 0, remaining >= 0, remaining <= total {
+                        moveProgress.sessions(total: total, remaining: remaining)
+                    }
+                    return
+                }
+                if ["cloud scan", "rescue"].contains(event.activity ?? stage), (event.total ?? 0) > 0 {
+                    moveProgress.localOnly = false
+                    moveProgress.remainingSessions = nil
+                }
                 updateSourceActivity(event)
-                if let total = event.sessionTotal, let remaining = event.remainingCount { moveProgress.sessions(total: total, remaining: remaining) }
                 moveProgress.update(stage, completed: event.completed, total: event.total, preparatory: event.preparatory == true)
-                if stage == "sessions" { return }
                 progressLabel = event.preparatory == true ? (["move", "retire", "finalize"].contains(stage) ? "Moving eligible sessions" : stage == "verify" ? "Checking moved sessions" : "Checking remaining sessions") : ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : ["desktop", "reopen"].contains(stage) ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
                 if event.preparatory != true, let text = sourceProgressText(event) { progressLabel = text }
                 badge = "\(moveProgress.percent)%"
@@ -739,7 +737,7 @@ final class Model: ObservableObject {
                 lines.removeAll { $0.0 == stage }
                 lines.append((stage, text))
             }
-        } else if let reconciled = event.reconciled, event.done != true {
+        } else if let reconciled = event.reconciled, event.code != "LOCAL_RECOVERY_BLOCKED" {
             lines = [("recovered", reconciled.title + " | " + reconciled.error)]
             note = "The interrupted operation was checked. " + (event.retry == true ? "Press Undo this move to continue." : "Press Finish the move to continue.")
             restartAvailable = false
@@ -759,14 +757,11 @@ final class Model: ObservableObject {
             partialResult = event.partial == true
             retryable = event.retryable == true
             stopped = event.ok == false
-            if event.code == "RESTART_CAPACITY" {
-                stopped = false
-                note = prefix + "The remaining sessions are ready to continue."
-            } else if ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED"].contains(event.code ?? "") {
+            if ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED"].contains(event.code ?? "") {
                 changedApproval()
             } else if event.code == "REOPEN_FAILED" {
                 reopenFailure()
-            } else if ["QUIT_UNCONFIRMED", "RESTART_DEADLINE"].contains(event.code ?? "") {
+            } else if event.code == "QUIT_UNCONFIRMED" {
                 note = prefix + "\(operationName) stopped: \(plainReason(event.code))."
                 preserveNotice = true
             } else if event.recoveryRequired == true {
@@ -825,7 +820,7 @@ final class Model: ObservableObject {
 
     private func plainReason(_ code: String?) -> String {
         switch code {
-        case "RESTART_DEADLINE", "MOVE_STALLED": return "the move stopped making progress"
+        case "MOVE_STALLED": return "the move stopped making progress"
         case "QUIT_UNCONFIRMED": return "Claude did not confirm it had closed"
         case "REOPEN_FAILED": return "Claude could not be confirmed open"
         case "RESTART_EXTERNAL_WORKER": return "an external Claude session is still running"
@@ -932,12 +927,12 @@ final class Model: ObservableObject {
         var response = NSApplication.ModalResponse.alertFirstButtonReturn
         var suppress = false
         let prompt = RestartPrompt(plan: plan)
-        if !skipRestartWarning || forceRestartWarning || !prompt.canRestart { (response, suppress) = restartResponse(prompt) }
+        if !skipRestartWarning || forceRestartWarning { (response, suppress) = restartResponse(prompt) }
         pendingPlan = nil
         forceRestartWarning = false
         if let paused = moveProgress.paused, let started = operationStarted { operationStarted = started + ProcessInfo.processInfo.systemUptime - paused }
         moveProgress.resume()
-        if response == .alertFirstButtonReturn && prompt.canRestart {
+        if response == .alertFirstButtonReturn {
             if suppress { skipRestartWarning = true; UserDefaults.standard.set(true, forKey: "skipRestartWarning") }
             begin(resetProgress: false)
             approvalAttempted = true
@@ -1414,7 +1409,7 @@ struct Panel: View {
                 if model.undoPending && !model.pendingReady {
                     Pill(title: "Finish undo", prominent: false, enabled: false) { }
                 }
-                if model.primaryTitle != nil {
+                if model.primaryTitle != nil && model.hasSecondaryActions {
                     if model.snapshot { moreActionsLabel }
                     else {
                         Menu {
