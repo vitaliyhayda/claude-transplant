@@ -9791,6 +9791,7 @@ function wordingFixtures() {
     receipt: 'synthetic-receipt', receiptSummary: partialSummary, receiptMoved: 272, receiptDestination: 'work/company' })
   const recorded = base.map(row => ({ ...row, receipt: '/synthetic/2026-10-30T21-00-00-000.json', receiptDone: base[1].label, receiptSummary: { moved: 499, notMoved: [], groups: [], attention: [], kept: [] } }))
   const starting = pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING', null, 2).map(row => ({ ...row, active: false, signedIn: false, identityState: 'unknown' }))
+  const unfinished = pending(2, 'cloud', 3).map(row => row.pending ? { ...row, receiptSummary: partialSummary } : row)
   const rows = [
     { name: '01-done', screen: 'moved', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label }, contains: ['Done. 361 sessions are now in', base[0].label], primary: null },
     { name: '02-held', screen: 'needs a restart', accounts: held, contains: ['259 sessions moved\n102 more need Claude to restart.'], primary: 'Restart Claude and move 102' },
@@ -9835,7 +9836,8 @@ function wordingFixtures() {
     { name: '49-local-partial', screen: "can't move", accounts: partial, contains: ['272 sessions moved\n3 sessions remain', 'Keep moved sessions or undo this move.'], primary: null, keep: true },
     { name: '50-limit-and-sign-in', screen: 'needs a sign-in', accounts: limitAndSignIn, contains: ['361 sessions moved\n3 old copies need checking', 'exceeds the history limit'], primary: null },
     { name: '51-recorded-result', screen: 'moved', accounts: recorded, contains: [`Done. 499 sessions are now in ${base[1].label}.\nHistory verified`], primary: 'Move' },
-    { name: '52-waiting-for-claude', accounts: starting, contains: ['361 sessions moved\nWaiting for Claude.'], primary: null }
+    { name: '52-waiting-for-claude', accounts: starting, contains: ['361 sessions moved\nWaiting for Claude.'], primary: null },
+    { name: '53-other-login-and-unfinished-local', screen: 'needs a sign-in', accounts: unfinished, contains: ['272 sessions moved\n3 old copies need checking'], primary: null }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
@@ -9862,6 +9864,7 @@ async function swiftFixtureSource() {
   return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
     .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)')
     .replace('DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in', 'scheduleBadgeReset { [weak self] in')
+    .replace('if demo || snapshot { return }', 'notices.append(title)\n        if demo || snapshot { return }')
     .replaceAll('UserDefaults.standard', 'fixtureDefaults') + String.raw`
 @MainActor final class FixtureDefaults {
     var values: [String: Any] = [:]
@@ -9876,6 +9879,7 @@ async function swiftFixtureSource() {
 @MainActor func scheduleBadgeReset(_ action: @escaping () -> Void) { badgeResets.append(action) }
 @MainActor var restartDialogs: [RestartPrompt] = []
 @MainActor var restartDialogResponse: (NSApplication.ModalResponse, Bool) = (.alertThirdButtonReturn, false)
+@MainActor var notices: [String] = []
 extension Model {
     func checkSweep() { sweep() }
     func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
@@ -9975,7 +9979,8 @@ struct WordingChecks {
                 if fixture.name == "50-limit-and-sign-in" { precondition(model.primaryTitle == nil && !model.directActions && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"] && !model.undoPending) }
                 if fixture.name == "46-history-limit" { precondition(model.directActions && model.canKeepLocal && !model.undoPending && model.links.isEmpty) }
                 if fixture.name == "51-recorded-result" { precondition(model.links.map(\.title) == ["Undo last move"]) }
-                if fixture.name == "52-waiting-for-claude" { precondition(!text.contains("Sign Claude in") && model.sourceTag(model.pendingAccounts[0]) == "waiting" && !model.movable) }
+                if fixture.name == "52-waiting-for-claude" { precondition(!text.contains("Sign Claude in") && model.sourceTag(model.pendingAccounts[0]) == "waiting" && !model.movable && model.identityLabel == "waiting for Claude") }
+                if fixture.name == "53-other-login-and-unfinished-local" { precondition(!model.movable && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"]) }
                 if fixture.name == "12-undo-pending" || fixture.name == "26-undo-ready" {
                     precondition(model.undoPending && !text.contains("361 moved"))
                     let count = requests.count
@@ -10111,7 +10116,7 @@ struct StateChecks {
         precondition(counts.detail == "\(counts.percent)% · 1 session left")
         counts.sessions(total: 498, remaining: 0)
         counts.update("verify", completed: 1, total: 226, now: 6)
-        precondition(counts.percent < 100 && counts.detail == "\(counts.percent)% · 0 sessions left")
+        precondition(counts.percent < 100 && counts.detail == "\(counts.percent)%")
         let cliProgress = try! JSONDecoder().decode([String].self, from: Data(base64Encoded: "CLI_COUNTER_EVENTS")!)
         let continued = Model(demo: Demo.accounts)
         continued.begin()
@@ -10175,6 +10180,8 @@ struct StateChecks {
         progressModel.handle("{\"stage\":\"cloud scan\",\"text\":\"0/1\",\"live\":true,\"completed\":0,\"total\":1}")
         let percentage = progressModel.badge
         precondition(percentage.hasSuffix("%") && !percentage.contains("/"))
+        progressModel.handle("{\"stage\":\"sessions\",\"text\":\"Remaining sessions\",\"live\":true,\"sessionTotal\":5,\"remainingCount\":4}")
+        precondition(progressModel.displaySummary == percentage + " · 4 sessions left" && progressModel.tooltip == progressModel.displaySummary)
         progressModel.handle("{\"stage\":\"inventory\",\"text\":\"100 sessions\"}")
         precondition(progressModel.badge == percentage)
         progressModel.begin(resetProgress: false)
@@ -10182,7 +10189,7 @@ struct StateChecks {
         precondition(progressModel.badge == percentage && progressModel.moveProgress.detail == percentage + " · 3 sessions left" && progressModel.displaySummary == progressModel.moveProgress.detail)
         progressModel.handle("{\"done\":true,\"ok\":false,\"moved\":0,\"reason\":\"fixture rollback\"}")
         progressModel.checkFinish(1)
-        precondition(progressModel.badge.isEmpty && !progressModel.running)
+        precondition(progressModel.badge.isEmpty && !progressModel.running && progressModel.tooltip == "Claude Transplant")
         progressModel.begin()
         progressModel.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":100}")
         progressModel.checkFinish(0)
@@ -10834,6 +10841,7 @@ struct StateChecks {
         func recordedModel(_ stamp: String) -> Model { Model(demo: try! JSONDecoder().decode([Account].self, from: Data(recordedAt(stamp).utf8))) }
         let background = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8)))
         background.selectTarget("work/personal")
+        notices = []
         background.begin()
         background.handle(#"{"done":true,"ok":true,"complete":false,"moved":499,"pendingCloud":1}"#)
         background.checkFinish(0)
@@ -10850,6 +10858,7 @@ struct StateChecks {
         requests.last!.1(recordedAt("2026-10-30T21-00-00-000"))
         requests.last!.2(0, "")
         precondition(background.visibleCompletion?.summary == done && background.primaryTitle == "Move")
+        precondition(notices == ["499 moved. Checking the remaining source conversations.", done])
         let relaunched = recordedModel("2026-10-30T21-00-00-000")
         precondition(relaunched.visibleCompletion?.summary == done && relaunched.links.map(\.title) == ["Undo last move"])
         relaunched.reset()
@@ -10863,8 +10872,11 @@ struct StateChecks {
         requests.last!.1(#"{"undone":"2026-11-01T09-00-00-000","restored":1,"sessions":1}"#)
         requests.last!.2(0, "")
         precondition(undoing.visibleCompletion == nil && undoing.note.hasPrefix("Undo complete.") && recordedModel("2026-10-31T09-00-00-000").visibleCompletion == nil)
+        requests.last!.1(recordedAt("2026-10-31T09-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(undoing.links.isEmpty && recordedModel("2026-10-31T09-00-00-000").links.isEmpty)
         let next = recordedModel("2026-11-02T09-00-00-000")
-        precondition(next.visibleCompletion?.summary == done)
+        precondition(next.visibleCompletion?.summary == done && next.links.map(\.title) == ["Undo last move"])
         next.selectTarget("home/personal")
         next.move()
         precondition(next.visibleCompletion == nil && requests.last!.0.contains("--from"))
@@ -10872,7 +10884,28 @@ struct StateChecks {
         requests.last!.1(recordedAt("2026-11-02T09-00-00-000"))
         requests.last!.2(0, "")
         precondition(next.visibleCompletion == nil && recordedModel("2026-11-02T09-00-00-000").visibleCompletion == nil)
+        let cleared = recordedModel("2026-11-02T09-00-00-000")
+        cleared.reset()
+        requests.last!.1(recordedAt("2026-11-02T09-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(cleared.links.map(\.title) == ["Undo last move"])
         requests = []
+        notices = []
+        let signIn = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8)))
+        signIn.selectTarget("work/personal")
+        signIn.begin()
+        signIn.handle(#"{"done":true,"ok":true,"complete":false,"moved":499,"pendingCloud":1}"#)
+        signIn.checkFinish(0)
+        requests[0].1(wordingAccounts("05-other-login"))
+        requests[0].2(0, "")
+        precondition(signIn.movable && notices.count == 1)
+        refreshReply(signIn, recordedAt("2026-11-03T09-00-00-000"))
+        precondition(notices.count == 2 && notices[1] == done)
+        let partialLeave = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        partialLeave.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"pendingCloud":1,"summary":{"moved":272,"notMoved":[{"id":"fixture","error":"failed"}],"groups":[],"attention":[]}}"#)
+        precondition(!partialLeave.movable && partialLeave.primaryTitle == nil)
+        requests = []
+        notices = []
         let leaving = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
         precondition(leaving.primaryTitle == "Leave old copies and move" && leaving.movable)
         leaving.selectTarget("home/personal")
@@ -10889,6 +10922,7 @@ struct StateChecks {
         requests[2].1(#"{"done":true,"ok":true,"complete":true,"moved":4,"destinationLabel":"home@example.test · Personal","summary":{"moved":4,"notMoved":[],"groups":[],"attention":[],"kept":[]}}"#)
         requests[2].2(0, "")
         precondition(leaving.visibleCompletion?.summary == "Done. 4 sessions are now in home@example.test · Personal.")
+        precondition(notices == ["Done. 4 sessions are now in home@example.test · Personal."])
         precondition(leaving.detailLines.filter { $0.1.contains("left unarchived") }.map(\.1) == ["3 old copies left unarchived in home@example.test · Personal"])
         requests = []
         let refusedLeave = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
@@ -10898,6 +10932,7 @@ struct StateChecks {
         precondition(requests.count == 2 && requests[1].0 == ["accounts", "--json"] && !refusedLeave.running && refusedLeave.note == "Remaining work could not be cancelled. Check Details.")
         let waiting = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("52-waiting-for-claude").utf8)))
         precondition(waiting.statusDetail == "Waiting for Claude." && waiting.primaryTitle == nil)
+        precondition(Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("52-waiting-for-claude").replacingOccurrences(of: #""identityState":"unknown""#, with: #""identityState":"logged-out""#).utf8))).identityLabel == "signed out")
         refreshReply(waiting, wordingAccounts("44-login-retry"))
         precondition(waiting.statusDetail?.hasPrefix("Waiting for Claude to finish signing in.") == true)
         refreshReply(waiting, wordingAccounts("05-other-login"))

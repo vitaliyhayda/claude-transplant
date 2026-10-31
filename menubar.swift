@@ -228,17 +228,14 @@ struct MoveProgress {
     var value = 0.0
     var restarting = false
     var remainingSessions: Int?
-    var localOnly = true
 
     init(now: TimeInterval = ProcessInfo.processInfo.systemUptime) { started = now }
 
     var percent: Int { min(99, Int(value * 100)) }
     private func units(_ key: String) -> Double { Self.scaled.contains(key) ? Double(max(1, sessions)) : 1 }
     private func duration(_ key: String) -> Double { skipped.contains(key) ? 0 : (Self.costs[key] ?? 1) * units(key) }
-    var detail: String { remainingSessions.map { "\(percent)% · \($0) \($0 == 1 ? "session" : "sessions") left" } ?? "\(percent)%" }
-    mutating func sessions(total: Int, remaining: Int) {
-        if localOnly { remainingSessions = min(total, max(0, remaining)) }
-    }
+    var detail: String { remainingSessions.flatMap { $0 > 0 ? "\(percent)% · \($0) \($0 == 1 ? "session" : "sessions") left" : nil } ?? "\(percent)%" }
+    mutating func sessions(total: Int, remaining: Int) { remainingSessions = min(total, max(0, remaining)) }
 
     mutating func update(_ stage: String, completed count: Int?, total size: Int?, preparatory: Bool = false, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         if stage == "desktop", !preparatory { restarting = true }
@@ -317,6 +314,8 @@ final class Model: ObservableObject {
     private var followUp: (() -> Void)?
     private var left: [(String, String)] = []
     private var dismissed = UserDefaults.standard.string(forKey: "dismissedReceipt") ?? ""
+    private var undone = UserDefaults.standard.string(forKey: "undoneReceipt") ?? ""
+    private var notifyWhenDone = false
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var moveProgress = MoveProgress()
@@ -382,7 +381,8 @@ final class Model: ObservableObject {
         settle()
     }
 
-    var identityLabel: String? { accounts.contains { $0.active == true } ? nil : accounts.first?.identityState == "logged-out" ? "signed out" : "unknown" }
+    var identityLabel: String? { accounts.contains { $0.active == true } ? nil : ["logged-out": "signed out", "unknown": "waiting for Claude"][accounts.first?.identityState ?? "", default: "unknown"] }
+    var tooltip: String { running ? moveProgress.detail : "Claude Transplant" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var visibleAccounts: [Account] { accounts.filter { listed($0) || $0.id == to } }
     private func listed(_ account: Account) -> Bool { account.active == true || account.email != nil || account.sessions != 0 }
@@ -390,7 +390,7 @@ final class Model: ObservableObject {
     private func signInNeeded(_ account: Account) -> Bool { account.pendingAction == "sign-in" && account.identityState != "unknown" }
     private var leaveChecks: [String] {
         let checks = pendingAccounts.compactMap { $0.pending == "cloud" && signInNeeded($0) ? $0.pendingCancel : nil }
-        return checks.count == pendingAccounts.count ? checks : []
+        return checks.count == pendingAccounts.count && !partialResult && receiptSummaries.allSatisfy({ $0.notMoved.isEmpty }) ? checks : []
     }
     var movable: Bool { pendingAccounts.isEmpty || !leaveChecks.isEmpty }
     var receiptSummaries: [ReceiptSummary] {
@@ -407,7 +407,7 @@ final class Model: ObservableObject {
     var directActions: Bool { screen == .blocked }
     var canKeepLocal: Bool { canMutate && (partialResult || pendingAccounts.contains { ["cloud", "local", "partial"].contains($0.pending ?? "") }) }
     var links: [(title: String, action: @MainActor () -> Void)] {
-        let all: [(Bool, String, @MainActor () -> Void)] = [(canMutate && !undoPending && !directActions && (latestReceipt ?? retryReceipt) != nil, "Undo last move", undo),
+        let all: [(Bool, String, @MainActor () -> Void)] = [(canMutate && !undoPending && !directActions && max(latestReceipt ?? "", retryReceipt ?? "") > undone, "Undo last move", undo),
             (canKeepLocal && !directActions, "Keep moved sessions", stopHere), (skipRestartWarning, "Show restart warnings", restoreRestartWarning)]
         return all.filter { $0.0 }.map { ($0.1, $0.2) }
     }
@@ -560,6 +560,11 @@ final class Model: ObservableObject {
         dismissed = max(dismissed, latestReceipt ?? "", retryReceipt ?? "")
         UserDefaults.standard.set(dismissed, forKey: "dismissedReceipt")
     }
+    private func markUndone() {
+        dismiss()
+        undone = max(undone, latestReceipt ?? "")
+        UserDefaults.standard.set(undone, forKey: "undoneReceipt")
+    }
 
     func canSource(_ account: Account) -> Bool { account.id != to }
 
@@ -660,8 +665,9 @@ final class Model: ObservableObject {
             guard status == 0, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             recoveryBlocked = list.contains { $0.recoveryProblem != nil }
-            if undoPending { dismiss() }
+            if undoPending { markUndone() }
             if pendingResult && movable { pendingResult = false; clearSelection() }
+            if notifyWhenDone && pendingAccounts.isEmpty { notifyWhenDone = false; if let done = receiptCompletion { notify(done.summary, "") } }
             settle()
             if !pendingAccounts.isEmpty && !preserveNotice {
                 completion = nil
@@ -722,7 +728,6 @@ final class Model: ObservableObject {
             operationDestination = accounts.first(where: { $0.id == to })?.label
             moveProgress = MoveProgress()
         }
-        moveProgress.localOnly = true
         badge = "\(moveProgress.percent)%"
         pendingResult = false
         pendingPlan = nil
@@ -740,10 +745,6 @@ final class Model: ObservableObject {
                     }
                     return
                 }
-                if (event.activity ?? stage) == "cloud scan", (event.total ?? 0) > 0 {
-                    moveProgress.localOnly = false
-                    moveProgress.remainingSessions = nil
-                }
                 updateSourceActivity(event)
                 moveProgress.update(stage, completed: event.completed, total: event.total, preparatory: event.preparatory == true)
                 badge = "\(moveProgress.percent)%"
@@ -760,6 +761,7 @@ final class Model: ObservableObject {
             let waiting = event.waiting ?? event.held ?? []
             let pendingCloud = event.pendingCloud ?? 0
             pendingResult = event.complete == false || event.recoveryRequired == true || (event.heldCount ?? 0) > 0 || pendingCloud > 0 || !(event.pendingUndo ?? []).isEmpty || !waiting.isEmpty
+            notifyWhenDone = pendingResult
             recordIssues(event)
             if !waiting.isEmpty { lines.append(("open", waiting.map(\.title).joined(separator: "\n"))) }
             if let reason = event.reason ?? (event.ok == false ? event.note : nil) { lines.append(("reason", reason)) }
@@ -803,9 +805,9 @@ final class Model: ObservableObject {
             }
             restartAvailable = event.code == "REOPEN_FAILED" ? false : event.restart ?? false
             if !pendingResult && event.ok != false { clearSelection() }
-            notify(note, "")
+            if followUp == nil { notify(note, "") }
         } else if event.undone != nil {
-            dismiss()
+            markUndone()
             restartAvailable = event.restart ?? false
             let restored = event.restored ?? 0
             let cloudRestored = event.cloudRestored ?? 0
@@ -1675,7 +1677,7 @@ struct TransplantApp: App {
             Panel().environmentObject(model).environment(\.controlActiveState, .key).environment(\.colorScheme, .dark)
         } label: {
             MenuLabel(symbol: model.recoveryProblem == nil ? model.symbol : "exclamationmark.triangle", badge: model.recoveryProblem == nil ? model.badge : "")
-                .help(model.running ? "Estimated completion" : "Claude Transplant")
+                .help(model.tooltip)
         }
         .menuBarExtraStyle(.window)
     }
