@@ -5421,6 +5421,7 @@ async function main(argv) {
       const identity = deferred ? await signedIn(paths, table) : null
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
+      const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? latest.receipt.to : null
       return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
@@ -5450,6 +5451,7 @@ async function main(argv) {
           kept: Boolean(latest?.receipt?.cloudChecks?.some(check => sameAccount(check, { account, org }) && check.status === 'cancelled')),
           receiptMoved: summary?.moved ?? null,
           receiptSummary: summary,
+          receiptDone: done,
           receiptDestination: source ? `${deferred.receipt.toAccount.account}/${deferred.receipt.toAccount.org}` : null,
           pendingFailures: source?.failures ?? [],
           receipt: latest?.file ?? null,

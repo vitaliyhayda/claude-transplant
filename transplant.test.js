@@ -1117,11 +1117,21 @@ test('menubar-style cloud moves do not invent pending work for a cleared source'
   const listed = await cli(h.root, ['accounts', '--json'])
   const accountRows = JSON.parse(listed.stdout)
   assert.equal(accountRows.find((account) => account.account === h.acct.P && account.org === h.org.P).pending, null)
+  assert.ok(accountRows.every(account => account.receiptDone === result.destinationLabel))
+  const done = async () => [...new Set(JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout).map(account => account.receiptDone))]
+  const saved = JSON.parse(await readFile(result.receipt))
+  await writeFile(result.receipt, JSON.stringify({ ...saved, cloudChecks: [{ account: h.acct.P, org: h.org.P, label: 'P', sessionIds: ['session_old'], status: 'pending' }] }))
+  assert.deepEqual(await done(), [null])
+  await writeFile(result.receipt, JSON.stringify({ ...saved, verification: { ok: false, problems: [{ id: SOURCE, check: 'transcript' }] } }))
+  assert.deepEqual(await done(), [null])
+  await writeFile(result.receipt, JSON.stringify(saved))
+  assert.deepEqual(await done(), [result.destinationLabel])
 
   const undone = await cli(h.root, ['undo', '--json'])
   assert.equal(undone.code, 0)
   assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`])
   assert.deepEqual(await readdir(h.dir('Z')), [])
+  assert.ok(JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout).every(account => account.receiptDone === null))
 })
 
 test('human CLI names staged Undo instead of printing false success', async () => {
@@ -9689,6 +9699,7 @@ test('panel leave tokens survive sweep bookkeeping and reject changed receipt or
     assert.equal(listed.code, 0, listed.stderr)
     const selected = lines(listed.stdout)[0].find(row => row.account === from.account)
     assert.match(selected.pendingCancel, /^[a-f0-9]{64}$/)
+    assert.equal(selected.receiptDone, null)
     const receipt = JSON.parse(await readFile(moved.file)), other = { account: h.acct.Q, org: h.org.Q, label: 'Other source', status: 'pending', sessionIds: ['session_other'] }
     receipt.cloudChecks.push(other)
     receipt.held = [{ id: id(998), title: 'Unrelated held work', sources: [{ account: h.acct.T, org: h.org.T, id: id(998), file: '/synthetic/held.json' }], workers: [] }]
@@ -9778,13 +9789,15 @@ function wordingFixtures() {
   const partial = structuredClone(base)
   Object.assign(partial[1], { pending: 'partial', pendingState: 'partial', pendingAction: 'blocked', pendingCount: 3, pendingAutomatic: false,
     receipt: 'synthetic-receipt', receiptSummary: partialSummary, receiptMoved: 272, receiptDestination: 'work/company' })
+  const recorded = base.map(row => ({ ...row, receipt: '/synthetic/2026-10-30T21-00-00-000.json', receiptDone: base[1].label, receiptSummary: { moved: 499, notMoved: [], groups: [], attention: [], kept: [] } }))
+  const starting = pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING', null, 2).map(row => ({ ...row, active: false, signedIn: false, identityState: 'unknown' }))
   const rows = [
     { name: '01-done', screen: 'moved', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label }, contains: ['Done. 361 sessions are now in', base[0].label], primary: null },
     { name: '02-held', screen: 'needs a restart', accounts: held, contains: ['259 sessions moved\n102 more need Claude to restart.'], primary: 'Restart Claude and move 102' },
     { name: '03-restart-dialog', plan, dialog: true, contains: ['Restart Claude to move 102 more sessions?', 'These open chats will stop:'], primary: 'Restart and move' },
     { name: '04-same-login', screen: 'moved', accounts: pending(1, 'cloud', 1), contains: ['361 sessions moved\n1 old copy needs checking', 'Cleanup will retry automatically.'], primary: null },
-    { name: '05-other-login', screen: 'needs a sign-in', accounts: pending(2, 'cloud', 3), contains: ['361 sessions moved\n3 old copies need checking', 'Sign Claude in as home@example.test'], primary: null },
-    { name: '06-clearing', screen: 'moving', accounts: pending(1, 'cloud', 1, null, null, 1), operation: ['finish', '--json'], event: { stage: 'cloud', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['361 moved. Clearing 1 old copy from', base[1].label], primary: null },
+    { name: '05-other-login', screen: 'needs a sign-in', accounts: pending(2, 'cloud', 3), contains: ['361 sessions moved\n3 old copies need checking', 'Sign Claude in as home@example.test'], primary: 'Leave old copies and move' },
+    { name: '06-clearing', screen: 'moving', accounts: pending(1, 'cloud', 1, null, null, 1), operation: ['finish', '--json'], event: { stage: 'cloud', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['0%'], primary: null },
     { name: '08-unproven', screen: 'moved', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label, summary: { moved: 361, notMoved: [], groups: [], attention: [], kept: [{ id: 'cse_research', title: 'Research conversation', error: `not proven to be on this Mac, kept in ${base[1].label}` }] } }, contains: ['Done. 361 sessions are now in', `Research conversation | cse_rese | not proven to be on this Mac, kept in ${base[1].label}`], primary: null, expanded: true },
     { name: '09-open-chats', screen: 'needs a restart', accounts: pending(1, 'local', 2, null, 'worker'), contains: ['359 sessions moved\n2 open chats move after they go idle'], primary: 'Restart Claude and move 2' },
     { name: '10-interrupted', screen: 'needs a restart', accounts: pending(1, 'recovery', 0), contains: ['361 sessions moved\nThe last move was interrupted.'], primary: 'Finish the move' },
@@ -9820,7 +9833,9 @@ function wordingFixtures() {
     { name: '47-budget-limit', screen: "can't move", accounts: pending(0, 'cloud', 1, 'CLOUD_BUDGET_LIMIT'), contains: ['memory budget', 'even one at a time'], primary: null, keep: true },
     { name: '48-parser-limit', screen: "can't move", accounts: pending(0, 'cloud', 1, 'CLOUD_PARSER_LIMIT'), contains: ["history reader's limit"], primary: null, keep: true },
     { name: '49-local-partial', screen: "can't move", accounts: partial, contains: ['272 sessions moved\n3 sessions remain', 'Keep moved sessions or undo this move.'], primary: null, keep: true },
-    { name: '50-limit-and-sign-in', screen: 'needs a sign-in', accounts: limitAndSignIn, contains: ['361 sessions moved\n3 old copies need checking', 'exceeds the history limit'], primary: null }
+    { name: '50-limit-and-sign-in', screen: 'needs a sign-in', accounts: limitAndSignIn, contains: ['361 sessions moved\n3 old copies need checking', 'exceeds the history limit'], primary: null },
+    { name: '51-recorded-result', screen: 'moved', accounts: recorded, contains: [`Done. 499 sessions are now in ${base[1].label}.\nHistory verified`], primary: 'Move' },
+    { name: '52-waiting-for-claude', accounts: starting, contains: ['361 sessions moved\nWaiting for Claude.'], primary: null }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
@@ -9851,7 +9866,7 @@ async function swiftFixtureSource() {
 @MainActor final class FixtureDefaults {
     var values: [String: Any] = [:]
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
-    func dictionary(forKey key: String) -> [String: Any]? { values[key] as? [String: Any] }
+    func string(forKey key: String) -> String? { values[key] as? String }
     func set(_ value: Any?, forKey key: String) { values[key] = value }
 }
 @MainActor let fixtureDefaults = FixtureDefaults()
@@ -9864,7 +9879,6 @@ async function swiftFixtureSource() {
 extension Model {
     func checkSweep() { sweep() }
     func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
-    func checkStarted(_ secondsAgo: TimeInterval) { operationStarted = ProcessInfo.processInfo.systemUptime - secondsAgo }
     func checkOperation(_ args: [String]) { operationArgs = args }
     func checkCancel(_ plan: Event) { cancelRestart(plan) }
 }
@@ -9931,13 +9945,13 @@ struct WordingChecks {
                         if event.swept == true { requests.last!.2(event.ok == false ? 1 : 0, "") }
                     } else {
                         model.begin()
-                        model.checkStarted(8.1)
                         model.handle(line)
                         if event.live != true { model.checkFinish(event.ok == false ? 1 : 0) }
                     }
                 }
                 model.detailsExpanded = fixture.expanded == true
-                text = ([model.statusHeadline, model.statusDetail].compactMap { $0 } + model.detailLines.map(\.1)).joined(separator: "\n")
+                text = ([model.visibleCompletion?.summary, model.visibleCompletion?.detail, model.statusHeadline, model.statusDetail].compactMap { $0 } + model.detailLines.map(\.1)).joined(separator: "\n")
+                if model.running { precondition(model.statusHeadline == model.moveProgress.detail && model.statusDetail == nil, fixture.name + ": " + text) }
                 if let screen = fixture.screen { precondition(model.screen?.rawValue == screen, fixture.name + ": " + (model.screen?.rawValue ?? "none")) }
                 if ["44-login-retry", "45-memory-retry", "46-history-limit"].contains(fixture.name) {
                     precondition(model.statusHeadline == "361 sessions moved")
@@ -9948,18 +9962,20 @@ struct WordingChecks {
                 for account in model.accounts {
                     let from = Row(account: account, radio: false, selected: false, muted: false, tag: model.sourceTag(account), action: {})
                     let to = Row(account: account, radio: true, selected: false, muted: false, tag: model.sourceTag(account), action: {})
-                    precondition(to.tagLabels.isEmpty)
+                    precondition(to.tagLabels == (account.active == true ? ["active"] : []))
                     precondition(from.tagLabels.contains("active") == (account.active == true))
                 }
-                if fixture.name == "01-done" { precondition(model.visibleCompletion?.detail == "History verified · 8.1 seconds") }
+                if fixture.name == "01-done" { precondition(model.visibleCompletion?.detail == "History verified") }
                 if fixture.name == "11-repair" { precondition(model.detailLines.map(\.0) == ["receipt"]) }
                 if fixture.name == "05-other-login" {
                     precondition(model.statusHeadline == "361 sessions moved" && model.statusDetail?.contains("Sign Claude in as home@example.test") == true)
-                    precondition(model.primaryTitle == nil && !model.directActions && model.hasSecondaryActions && model.canKeepLocal && !model.undoPending)
+                    precondition(!model.directActions && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"] && !model.undoPending)
                 }
                 if fixture.name == "08-unproven" { precondition(model.detailLines.filter { $0.1.contains("Research conversation") }.count == 1 && !model.directActions && model.canMutate) }
-                if fixture.name == "50-limit-and-sign-in" { precondition(model.primaryTitle == nil && !model.directActions && model.hasSecondaryActions && model.canKeepLocal && !model.undoPending) }
-                if fixture.name == "46-history-limit" { precondition(model.directActions && model.canKeepLocal && !model.undoPending) }
+                if fixture.name == "50-limit-and-sign-in" { precondition(model.primaryTitle == nil && !model.directActions && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"] && !model.undoPending) }
+                if fixture.name == "46-history-limit" { precondition(model.directActions && model.canKeepLocal && !model.undoPending && model.links.isEmpty) }
+                if fixture.name == "51-recorded-result" { precondition(model.links.map(\.title) == ["Undo last move"]) }
+                if fixture.name == "52-waiting-for-claude" { precondition(!text.contains("Sign Claude in") && model.sourceTag(model.pendingAccounts[0]) == "waiting" && !model.movable) }
                 if fixture.name == "12-undo-pending" || fixture.name == "26-undo-ready" {
                     precondition(model.undoPending && !text.contains("361 moved"))
                     let count = requests.count
@@ -10082,18 +10098,20 @@ struct StateChecks {
             precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
         }
         var counts = MoveProgress(now: 0)
+        precondition(counts.detail == "0%")
         counts.sessions(total: 498, remaining: 226)
         counts.update("scan", completed: 0, total: 800, now: 0)
-        precondition(counts.remainingSessions == 226 && counts.remainingSeconds == nil)
         counts.update("scan", completed: 3, total: 800, now: 3)
-        precondition(counts.remainingSeconds != nil && counts.detail.contains("About") && counts.detail.contains("226 sessions remaining"))
+        precondition(counts.remainingSessions == 226 && counts.detail == "\(counts.percent)% · 226 sessions left")
         counts.sessions(total: 498, remaining: 220)
         counts.update("move", completed: 1, total: 6, now: 4)
         counts.update("move", completed: 1, total: 6, now: 5)
         precondition(counts.remainingSessions == 220)
+        counts.sessions(total: 498, remaining: 1)
+        precondition(counts.detail == "\(counts.percent)% · 1 session left")
         counts.sessions(total: 498, remaining: 0)
         counts.update("verify", completed: 1, total: 226, now: 6)
-        precondition(counts.percent < 100 && counts.detail.contains("0 sessions remaining"))
+        precondition(counts.percent < 100 && counts.detail == "\(counts.percent)% · 0 sessions left")
         let cliProgress = try! JSONDecoder().decode([String].self, from: Data(base64Encoded: "CLI_COUNTER_EVENTS")!)
         let continued = Model(demo: Demo.accounts)
         continued.begin()
@@ -10107,9 +10125,9 @@ struct StateChecks {
         let sourceProgress = Model(demo: Demo.accounts)
         sourceProgress.begin()
         sourceProgress.handle(#"{"stage":"cloud","text":"0/2","live":true,"completed":0,"total":2,"sourceId":"work/personal","sourceLabel":"Source"}"#)
-        let activity = sourceProgress.sourceActivity?.sourceId, activityText = sourceProgress.progressLabel
+        let activity = sourceProgress.sourceActivity?.sourceId
         sourceProgress.handle(#"{"stage":"sessions","text":"Remaining sessions","live":true,"sessionTotal":5,"remainingCount":3}"#)
-        precondition(sourceProgress.moveProgress.remainingSessions == 3 && sourceProgress.sourceActivity?.sourceId == activity && sourceProgress.progressLabel == activityText)
+        precondition(sourceProgress.moveProgress.remainingSessions == 3 && sourceProgress.sourceActivity?.sourceId == activity && sourceProgress.displaySummary == sourceProgress.moveProgress.detail)
         for line in [#"{"stage":"sessions","text":"Invalid","live":true,"sessionTotal":2,"remainingCount":3}"#,
                      #"{"stage":"sessions","text":"Invalid","live":true,"sessionTotal":-1,"remainingCount":0}"#] { sourceProgress.handle(line) }
         precondition(sourceProgress.moveProgress.remainingSessions == 3)
@@ -10125,24 +10143,10 @@ struct StateChecks {
         for stage in ["", "undo", "keep-local", "unknown"] {
             var idle = MoveProgress(now: 0)
             idle.update(stage, completed: nil, total: nil, now: 1)
-            idle.record(120)
-            precondition(!idle.hasProgress && idle.observed.isEmpty)
-            precondition(idle.costs == MoveProgress.defaults)
+            precondition(!idle.hasProgress && idle.percent == 0)
         }
-        var empty = MoveProgress(now: 0)
-        empty.update("scan", completed: 0, total: 0, now: 0)
-        empty.update("retire", completed: nil, total: nil, now: 1)
-        empty.update("finalize", completed: nil, total: nil, now: 2)
-        empty.record(3)
-        precondition(empty.observed.isEmpty)
-        var reopen = MoveProgress(now: 0)
-        reopen.update("reopen", completed: nil, total: nil, now: 10)
-        reopen.record(12)
-        precondition(reopen.observed["prepare"] == nil && reopen.observed["reopen"] == 2)
         var local = MoveProgress(now: 0)
         local.update("scan", completed: 100, total: 100, now: 1)
-        local.record(1)
-        precondition(local.observed["prepare"] == 0.01)
         local.update("move", completed: 100, total: 100, now: 2)
         precondition(!local.skipped.contains("move"))
         local.update("finalize", completed: nil, total: nil, now: 3)
@@ -10160,8 +10164,7 @@ struct StateChecks {
         paused.update("scan", completed: 0, total: 1, now: 0)
         paused.paused = 2
         paused.resume(102)
-        paused.record(103)
-        precondition(paused.observed["prepare"] == 3)
+        precondition(paused.started == 100 && paused.paused == nil)
         let progressModel = Model(demo: Demo.accounts)
         progressModel.begin()
         precondition(progressModel.badge == "0%")
@@ -10176,7 +10179,7 @@ struct StateChecks {
         precondition(progressModel.badge == percentage)
         progressModel.begin(resetProgress: false)
         progressModel.handle("{\"stage\":\"sessions\",\"text\":\"Remaining sessions\",\"live\":true,\"sessionTotal\":5,\"remainingCount\":3}")
-        precondition(progressModel.badge == percentage && progressModel.moveProgress.detail.contains("3 sessions remaining"))
+        precondition(progressModel.badge == percentage && progressModel.moveProgress.detail == percentage + " · 3 sessions left" && progressModel.displaySummary == progressModel.moveProgress.detail)
         progressModel.handle("{\"done\":true,\"ok\":false,\"moved\":0,\"reason\":\"fixture rollback\"}")
         progressModel.checkFinish(1)
         precondition(progressModel.badge.isEmpty && !progressModel.running)
@@ -10187,16 +10190,15 @@ struct StateChecks {
         let completed = Model(demo: Demo.accounts)
         completed.selectTarget(Demo.accounts[2].id)
         completed.begin()
-        completed.checkStarted(8.1)
         completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
         precondition(completed.visibleCompletion == nil)
         completed.checkFinish(0)
         precondition(completed.visibleCompletion?.summary == "Done. 167 sessions are now in you@home.com · Personal.")
-        precondition(completed.visibleCompletion?.detail == "History verified · 8.1 seconds")
+        precondition(completed.visibleCompletion?.detail == "History verified")
         completed.note = "A moved session has a newer title"
-        precondition(completed.visibleCompletion == nil)
+        precondition(completed.visibleCompletion?.summary == "Done. 167 sessions are now in you@home.com · Personal.")
         completed.selectTarget(Demo.accounts[3].id)
-        precondition(completed.completion == nil)
+        precondition(completed.visibleCompletion != nil && completed.note.isEmpty)
         for event in [
             "{\"done\":true,\"ok\":true,\"complete\":false,\"moved\":167}",
             "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167,\"pendingCloud\":1}",
@@ -10221,7 +10223,7 @@ struct StateChecks {
         model.checkSweep()
         precondition(model.ready && !model.running)
         model.move()
-        precondition(model.running && !model.ready && model.displaySummary == "Waiting for background check")
+        precondition(model.running && !model.ready && model.displaySummary == "0%")
         model.selectTarget(Demo.accounts[3].id)
         precondition(model.to == selected)
         model.to = Demo.accounts[3].id
@@ -10316,7 +10318,7 @@ struct StateChecks {
                 precondition(inventory.detailLines.count == previousLines.count + 3)
                 inventory.move()
                 inventory.finishPending()
-                inventory.keepLocal()
+                inventory.stopHere()
                 inventory.undo()
                 inventory.restartDesktop()
                 inventory.checkSweep()
@@ -10593,9 +10595,13 @@ struct StateChecks {
             }
         }
         let undoActions = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("26-undo-ready").utf8)))
-        precondition(undoActions.primaryTitle == "Finish undo" && !undoActions.hasSecondaryActions)
+        precondition(undoActions.primaryTitle == "Finish undo" && undoActions.links.isEmpty)
         let freshActions = Model(demo: Demo.accounts)
-        precondition(freshActions.primaryTitle == "Move" && freshActions.hasSecondaryActions)
+        precondition(freshActions.primaryTitle == "Move" && freshActions.links.isEmpty)
+        freshActions.skipRestartWarning = true
+        precondition(freshActions.links.map(\.title) == ["Show restart warnings"])
+        freshActions.links[0].action()
+        precondition(!freshActions.skipRestartWarning && freshActions.links.isEmpty)
         requests = []
         let login = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("12-undo-pending").utf8)))
         precondition(login.undoPending && !login.pendingReady && login.primaryTitle == nil)
@@ -10821,6 +10827,90 @@ struct StateChecks {
         precondition(delayed.restartAvailable && delayed.symbol == "info.circle" && delayed.badge.isEmpty)
         precondition(failedWithoutRestart.symbol == "arrow.left.arrow.right" && failedWithoutRestart.badge.isEmpty)
         precondition(failedWithRestart.symbol == "exclamationmark.triangle" && failedWithRestart.badge.isEmpty)
+        fixtureDefaults.values = [:]
+        requests = []
+        let done = "Done. 499 sessions are now in work@example.test · Personal."
+        func recordedAt(_ stamp: String) -> String { wordingAccounts("51-recorded-result").replacingOccurrences(of: "2026-10-30T21-00-00-000", with: stamp) }
+        func recordedModel(_ stamp: String) -> Model { Model(demo: try! JSONDecoder().decode([Account].self, from: Data(recordedAt(stamp).utf8))) }
+        let background = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8)))
+        background.selectTarget("work/personal")
+        background.begin()
+        background.handle(#"{"done":true,"ok":true,"complete":false,"moved":499,"pendingCloud":1}"#)
+        background.checkFinish(0)
+        requests[0].1(wordingAccounts("17-uncertain"))
+        requests[0].2(0, "")
+        precondition(background.visibleCompletion == nil && background.primaryTitle == nil && background.symbol == "clock.arrow.circlepath")
+        refreshReply(background, recordedAt("2026-10-30T21-00-00-000"))
+        precondition(background.visibleCompletion?.summary == done && background.visibleCompletion?.detail == "History verified" && background.screen == .moved)
+        precondition(background.from.isEmpty && background.to == nil && background.symbol == "arrow.left.arrow.right")
+        background.selectTarget("home/personal")
+        precondition(background.primaryTitle == "Move" && background.visibleCompletion?.summary == done)
+        background.panelVisibility(false)
+        background.panelVisibility(true)
+        requests.last!.1(recordedAt("2026-10-30T21-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(background.visibleCompletion?.summary == done && background.primaryTitle == "Move")
+        let relaunched = recordedModel("2026-10-30T21-00-00-000")
+        precondition(relaunched.visibleCompletion?.summary == done && relaunched.links.map(\.title) == ["Undo last move"])
+        relaunched.reset()
+        requests.last!.1(recordedAt("2026-10-30T21-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(relaunched.visibleCompletion == nil && recordedModel("2026-10-30T21-00-00-000").visibleCompletion == nil)
+        precondition(recordedModel("2026-10-31T09-00-00-000").visibleCompletion?.summary == done)
+        let undoing = recordedModel("2026-11-01T09-00-00-000")
+        undoing.links[0].action()
+        precondition(requests.last!.0 == ["undo", "--json"] && undoing.running)
+        requests.last!.1(#"{"undone":"2026-11-01T09-00-00-000","restored":1,"sessions":1}"#)
+        requests.last!.2(0, "")
+        precondition(undoing.visibleCompletion == nil && undoing.note.hasPrefix("Undo complete.") && recordedModel("2026-10-31T09-00-00-000").visibleCompletion == nil)
+        let next = recordedModel("2026-11-02T09-00-00-000")
+        precondition(next.visibleCompletion?.summary == done)
+        next.selectTarget("home/personal")
+        next.move()
+        precondition(next.visibleCompletion == nil && requests.last!.0.contains("--from"))
+        requests.last!.2(1, "Synthetic move failure")
+        requests.last!.1(recordedAt("2026-11-02T09-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(next.visibleCompletion == nil && recordedModel("2026-11-02T09-00-00-000").visibleCompletion == nil)
+        requests = []
+        let leaving = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        precondition(leaving.primaryTitle == "Leave old copies and move" && leaving.movable)
+        leaving.selectTarget("home/personal")
+        leaving.skipRestartWarning = true
+        leaving.primary()
+        precondition(requests.count == 1 && requests[0].0 == ["keep-local", "--json", "--leave-check", String(repeating: "3", count: 64)])
+        requests[0].1(#"{"done":true,"ok":true,"complete":true,"keptLocal":1,"heldCancelled":0}"#)
+        requests[0].2(0, "")
+        let leaveMove = ["--from", "work company", "--from", "work personal", "--to", "home personal", "--cloud", "--json"]
+        precondition(requests.count == 2 && requests[1].0 == leaveMove && leaving.running)
+        requests[1].1(#"{"plan":true,"kind":"move","token":"leave-token","affected":[]}"#)
+        requests[1].2(0, "")
+        precondition(requests.count == 3 && requests[2].0 == leaveMove + ["--restart-approved", "leave-token"])
+        requests[2].1(#"{"done":true,"ok":true,"complete":true,"moved":4,"destinationLabel":"home@example.test · Personal","summary":{"moved":4,"notMoved":[],"groups":[],"attention":[],"kept":[]}}"#)
+        requests[2].2(0, "")
+        precondition(leaving.visibleCompletion?.summary == "Done. 4 sessions are now in home@example.test · Personal.")
+        precondition(leaving.detailLines.filter { $0.1.contains("left unarchived") }.map(\.1) == ["3 old copies left unarchived in home@example.test · Personal"])
+        requests = []
+        let refusedLeave = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        refusedLeave.primary()
+        requests[0].1(#"{"refused":[],"code":"PENDING_CHANGED","reason":"The pending source checks changed. Review them again."}"#)
+        requests[0].2(1, "")
+        precondition(requests.count == 2 && requests[1].0 == ["accounts", "--json"] && !refusedLeave.running && refusedLeave.note == "Remaining work could not be cancelled. Check Details.")
+        let waiting = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("52-waiting-for-claude").utf8)))
+        precondition(waiting.statusDetail == "Waiting for Claude." && waiting.primaryTitle == nil)
+        refreshReply(waiting, wordingAccounts("44-login-retry"))
+        precondition(waiting.statusDetail?.hasPrefix("Waiting for Claude to finish signing in.") == true)
+        refreshReply(waiting, wordingAccounts("05-other-login"))
+        precondition(waiting.statusDetail?.contains("Sign Claude in as home@example.test") == true && waiting.primaryTitle == "Leave old copies and move")
+        let ghost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: false, signedIn: false, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
+        let crowded = Model(demo: Demo.accounts + [ghost])
+        precondition(crowded.visibleAccounts.map(\.id) == Demo.accounts.map(\.id))
+        crowded.selectTarget(Demo.accounts[2].id)
+        precondition(crowded.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[2].id]))
+        crowded.selectTarget(ghost.id)
+        precondition(crowded.visibleAccounts.last?.id == ghost.id)
+        let activeGhost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: true, signedIn: true, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
+        precondition(Model(demo: [activeGhost] + Demo.accounts.dropFirst()).visibleAccounts.contains { $0.id == ghost.id })
         print("Swift queue and metadata states passed")
     }
 }

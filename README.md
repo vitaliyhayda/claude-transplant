@@ -55,10 +55,11 @@ From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (appe
 
 ## Menubar
 
-- When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Uncheck accounts to leave behind, Reset clears both columns.
-- Open chats offer Restart Claude and move, and Finish the move continues pending work. Keep moved sessions and Undo this move sit in the "..." menu and show as buttons only when the remaining work can't move.
-- Held sessions move once their workers stop. Cloud cleanup retries on its own under the signed-in login, and other logins wait until you sign in.
-- Starts at login, shows percent, sessions left and time left while moving, and notifies when done.
+- When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Accounts with no sessions and no email stay hidden. Uncheck accounts to leave behind, Reset clears both columns.
+- The last move's result stays until the next move or Reset, even after a restart.
+- Open chats offer Restart Claude and move, and Finish the move continues pending work. Small links offer Undo last move, Keep moved sessions while work remains, and Show restart warnings when they are off. When the remaining work can't move, Keep and Undo are buttons.
+- Held sessions move once their workers stop. Cloud cleanup retries under the signed-in login, and cleanup for another login waits for that sign-in unless Leave old copies and move skips it. While Claude starts, the panel says Waiting for Claude instead of asking you to sign in.
+- Starts at login, shows percent and sessions left while moving, and notifies when done.
 - Bundles its own CLI, so rerun `menubar` after upgrading.
 - The app binary's `--demo <dir>` renders the frames of the animation above.
 
@@ -212,7 +213,7 @@ Safety:
 - retired: source records moved to quarantine after verification
 - cloud mirrors: active or paused Remote Control copies under the signed-in source
 - cloud blocked: not proven to be on this Mac, connected worker, changed history, or account mismatch
-- kept: Remote Control copies not proven to be on this Mac, left unarchived in their account
+- kept: Remote Control copies left unarchived in their account, not proven to be on this Mac or left by Leave old copies and move
 - source cloud checks: sources whose cloud cleanup still waits, usually for another login
 - newer cloud sessions: created after Move, left for the next move
 
