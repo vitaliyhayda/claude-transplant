@@ -58,6 +58,7 @@ struct ReceiptSummary: Decodable {
     let notMoved: [Failure]
     let groups: [FailureGroup]
     let attention: [Failure]
+    let kept: [Failure]?
 }
 
 struct FailureGroup: Decodable {
@@ -467,7 +468,6 @@ final class Model: ObservableObject {
         case "limit": return "\(conversations) \(count == 1 ? "exceeds" : "exceed") the history limit of 1,000,000 events and \(count == 1 ? "remains" : "remain") in \(account.label)."
         case "budget-limit": return "\(conversations) could not fit the operation's memory budget, even one at a time. \(count == 1 ? "It remains" : "They remain") in \(account.label)."
         case "parser-limit": return "\(conversations) exceeded the history reader's limit and \(count == 1 ? "remains" : "remain") in \(account.label)."
-        case "unproven": return "\(copies) \(count == 1 ? "stays" : "stay") in \(account.label). \(count == 1 ? "It is" : "They are") not proven to be on this Mac."
         case "partial": return "\(amount) \(count == 1 ? "session remains" : "sessions remain") in \(account.label). Keep moved sessions or undo this move. See Details for titles and reasons."
         case "external": return "Waiting for external Claude sessions to stop before moving \(amount.lowercased()) remaining sessions."
         case "waiting": return "Waiting to verify \(conversations.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? retry : " \(signInText) and the check will retry automatically.")
@@ -535,7 +535,7 @@ final class Model: ObservableObject {
         if running { return .moving }
         if recoveryProblem != nil || recoveryBlocked { return .blocked }
         if reviewRestart || retryable { return .restart }
-        if let first = [Screen.restart, .blocked, .signIn, .moved].first(where: pendingAccounts.map(screen).contains) { return first }
+        if let first = [Screen.restart, .signIn, .moved, .blocked].first(where: pendingAccounts.map(screen).contains) { return first }
         if partialResult || stopped || !receiptSummaries.allSatisfy({ $0.notMoved.isEmpty }) && note.isEmpty { return .blocked }
         return displaySummary.isEmpty ? nil : .moved
     }
@@ -898,7 +898,8 @@ final class Model: ObservableObject {
 
     private func summaryLines(_ summary: ReceiptSummary) -> [(String, String)] {
         summary.groups.map { ($0.cause, $0.records.map { [ $0.label, identity($0.title, $0.sessionId.map { String($0.dropFirst(6)) } ?? $0.id), $0.error ].compactMap { $0 }.joined(separator: " | ") }.joined(separator: "\n")) } +
-        summary.attention.map { ("issue", identity($0.title, $0.id) + " | " + $0.error) }
+        summary.attention.map { ("issue", identity($0.title, $0.id) + " | " + $0.error) } +
+        (summary.kept ?? []).map { ("kept", identity($0.title, $0.id) + " | " + $0.error) }
     }
 
     private func identity(_ title: String?, _ id: String?) -> String {

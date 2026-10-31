@@ -180,7 +180,7 @@ A session is three files: the transcript in `~/.claude/projects`, the sidecar di
 
 Eligibility:
 
-- a session whose Desktop record is the only one pointing at its transcript, with no fork, parent or rewind lineage, moves by record identity and transcript fingerprints, any other history is a single comparable version
+- a sole session, the only Desktop record pointing at its transcript with no fork, parent or rewind lineage, moves by record identity and transcript fingerprints. Its transcript is still parsed, but a parse failure never blocks it. Any other history is a single comparable version
 - record filename and identity are valid
 - no running worker owns it, and any task registrations, generated runs, notification routes, parents, and forks form a complete movable family
 - parent record is already in the target or moves first in the same batch, and stays wherever surviving forks refer to it, including archived forks or forks without history
@@ -193,14 +193,14 @@ Restarts:
 - When an operation needs Desktop to close, the engine emits a plan first. The menubar warns which Code workers, windows, Chat, Cowork, and background commands will close.
 - Restart and move approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or both source and target account/organization pairs to be known inactive. An active or unknown scheduler requires this plan even without a worker. Other cold moves show no dialog.
 - An approved restart moves eligible records before quitting Desktop, then waits for Desktop and its descendants to exit, moves held task families together, and reopens Desktop. Shutdown and reopen have fresh waits of up to 30s and 8s. Moving has no total deadline or predictive capacity veto. Claude stays closed while productive work finishes, and open chats stop. Graceful quit, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
-- A unit is a session, its fork family, or a complete routine family. When a unit fails, or a minute passes at a safe boundary without useful reads or completed work, only unfinished units are unwound, and each is retried once with fresh data. A unit that fails again stays in the source with its dependents while the other units continue. In-flight filesystem calls stay awaited, so a call that never returns cannot trigger that check or reopen Claude. Unchanged failures remain listed with their titles and reasons, with Keep moved sessions and Undo this move. Unresolved ownership or history blocks further writes and keeps the recovery journal.
+- A unit is a session, its fork family, or a complete routine family. When a unit fails, or a minute passes at a safe boundary without useful reads or completed work, only unfinished units are unwound, and each is retried once with fresh data. A unit that fails again stays in the source with its dependents while the other units continue. A copy that changed after placement stays in place with its failure. In-flight filesystem calls stay awaited, so a call that never returns cannot trigger that check or reopen Claude. Unchanged failures remain listed with their titles and reasons, with Keep moved sessions and Undo this move. Unresolved ownership or history blocks further writes and keeps the recovery journal.
 - Background retries never start a new shutdown. Continuation stays primary for pending local work, including saved 4.1.6 receipts. Keep and Undo use a secondary menu unless the remaining work can't move.
 - Private, bounded `restart-events.jsonl` logs retain attempt outcomes without prompts or raw errors. Diagnostics never rewrite unfinished receipts or their journals, or recreate discarded receipts. Completed recovery folds matching outcomes into an existing receipt's `restartHistory` once, preserving `receipt.restart`.
 
 Remote Control (`--cloud`):
 
 - Reads selected source organizations under the signed-in login through Claude Desktop's authenticated `claude.ai` session. Cookies are decrypted in memory via Keychain, sent only to `claude.ai`, never stored.
-- After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. A mirror the engine cannot prove is already on this Mac stays unarchived in its account, is named once in Details, and is not retried until the engine or its local session changes.
+- After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. A mirror the engine cannot prove is already on this Mac stays unarchived in its account, is named once in Details with that account, and is never retried. The move still completes and the next move can start.
 - The source mirror is archived only after the remote worker is disconnected and unchanged and the local target verifies.
 - Consumed queued prompts count once per proven command. Enqueued, cancelled, foreign-session and conflicting copies cannot supply missing history. A declared prior transcript in the same project can cover a mirror through its receipt link or its own matching session, source account and organization bridge record. One complete comparable prior must cover the mirror, and its file and project mapping are checked again before archival.
 - A unique bridge-linked parent can also prove owned subagent messages and absorbed queued prompts, including images. UUID, role, payload, delivery evidence and per-stream order must agree. The receipt records main, subagent and queued event counts. Final archival repeats the proof against fresh files and remote rows.
@@ -238,6 +238,7 @@ Safety:
 - retired: source entries moved to quarantine after verification
 - cloud mirrors: active or paused Remote Control rows under the signed-in source
 - cloud blocked: not proven to be on this Mac, connected worker, changed history, or account mismatch
+- kept: Remote Control copies not proven to be on this Mac, left unarchived in their account
 - cloud checks pending: inaccessible sources with unreadable or unarchived local records or known source mirrors
 - newer cloud sessions: rows created after Move, left for the next move
 
@@ -250,6 +251,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
 - Chat messages and sidecars stay intact. A move can append Claude Code's native empty Remote Control pointer to avoid stale foreign-owner title and history suppression. A destination-owned pointer stays. New moves leave SSH mirrors unchanged. This does not repair existing damage or migrate older bridge-write receipts. Recovery only appends, completing a proven partial metadata tail before restoring the saved pointer when still owned. Undo of a completed move leaves later transcript edits and newer pointers alone. Unproven interrupted writes stay pending. Existing history suppression stays, and existing cloud sessions are not renamed. Local metadata needs no `--cloud`, which controls network work.
+- A move to another account or organization drops the source account's saved error (`error`, `errorAt`, `priorErrorMark`) from the placed record. The quarantined original keeps it for Undo.
 - Moves with no active worker or affected scheduler need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
 - No model reconstructs history.
 - Remote Control network requests require `--cloud`, with no credential persistence. Local bridge metadata does not.

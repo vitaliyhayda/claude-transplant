@@ -2,7 +2,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
-import { constants, createReadStream, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile as readBytes, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -155,7 +155,7 @@ const sourceProgress = source => source ? { sourceId: `${source.account}/${sourc
 const retryableCode = code => ['RESTART_PLAN_CHANGED', 'RESTART_APPROVAL_CHANGED', 'QUIT_UNCONFIRMED', 'REOPEN_FAILED'].includes(code)
 const loginLabel = (row) => accountLabel(row).split(' · ')[0]
 const openCloudChecks = (receipt) => (receipt.cloudChecks ?? []).filter((check) => !['complete', 'cancelled', 'blocked-local'].includes(check.status))
-const actionableCloudFailure = (receipt, row) => row.cloudAccount && !row.blockedByLocal?.length && receiptCloudCheck(receipt, { account: row.cloudAccount, org: row.cloudOrg })?.status !== 'cancelled'
+const actionableCloudFailure = (receipt, row) => row.cloudAccount && !keptCopy(receipt)(row) && !row.blockedByLocal?.length && receiptCloudCheck(receipt, { account: row.cloudAccount, org: row.cloudOrg })?.status !== 'cancelled'
 const cloudCheckLabels = (receipt) => [...new Set(openCloudChecks(receipt).map((check) => check.label))]
 const waitingSessions = (receipt) => [...new Map([
   ...(receipt.held ?? []).map(row => ({ id: row.id, title: row.title, localId: row.id, recordId: row.recordId })),
@@ -188,7 +188,7 @@ export function pendingPresentation(receipt, source, account, mode, table = [], 
   const archived = new Set((receipt.remote ?? []).filter(row => sameAccount(row, source)).map(row => remoteId(row.id)))
   const count = failures.some(row => !row.id) ? null : ids.length || (source.sessionIds ? source.sessionIds.filter(id => !archived.has(remoteId(id))).length : null)
   const blocked = historyLimited(source)
-  const state = blocked ? failures.some(row => row.code === 'CLOUD_BUDGET_LIMIT') ? 'budget-limit' : failures.some(row => row.code === 'CLOUD_PARSER_LIMIT') ? 'parser-limit' : failures.some(row => row.code === 'CLOUD_HISTORY_LIMIT') ? 'limit' : 'unproven'
+  const state = blocked ? failures.some(row => row.code === 'CLOUD_BUDGET_LIMIT') ? 'budget-limit' : failures.some(row => row.code === 'CLOUD_PARSER_LIMIT') ? 'parser-limit' : 'limit'
     : failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING') ? 'login'
     : failures.length && failures.every(row => row.code === 'CLOUD_MEMORY_PRESSURE') ? 'memory'
     : failures.length || waiting.some(row => row.code === 'CLOUD_MEMORY_DEFERRED') ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
@@ -211,7 +211,11 @@ const recoveryFamilies = (receipt) => {
   return transfers.slice(offset)
 }
 const inspector = (paths, options) => options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
-const receiptOkay = (receipt) => receipt.verification?.ok !== false && !receipt.failed?.length
+const keptCopy = receipt => {
+  const linked = new Set((receipt.failed ?? []).filter(row => !row.cloudAccount).flatMap(row => (row.sources ?? []).flatMap(source => source.remoteIds ?? [])))
+  return row => row.code === 'CLOUD_UNPROVEN' && !row.blockedByLocal?.length && !linked.has(remoteId(row.id))
+}
+const receiptOkay = (receipt) => receipt.verification?.ok !== false && (receipt.failed ?? []).every(keptCopy(receipt))
 const finishOkay = (receipt) => receipt.verification?.ok !== false && !receipt.verification?.problems?.length &&
   !(receipt.failed ?? []).some(row => actionableCloudFailure(receipt, row)) && !(receipt.cloudError && openCloudChecks(receipt).length)
 const problemText = (problem) => `${problem.title ?? problem.id} | ${problem.check} verification failed`
@@ -897,13 +901,15 @@ function taskFamilies(from, to, found) {
       const family = { key: `${account.account}/${account.org}/${seed}`, from: accountRef(account), to: accountRef(to),
         sourceFile: account.taskFile, targetFile: to.taskFile, ids, recordIds, files: members.map(row => row.file), links: members.map(row => taskLinks(row.record)),
         routes: tasks.filter(task => ids.includes(task.id)).map(task => [task.id, task.notifySessionId ?? null]) }
+      const historical = !family.routes.length && members.every(row => row.record.isArchived === true && row.record.scheduledTaskId && !row.record.notifySessionId) &&
+        TASK_STATE_KEYS.every(key => ids.every(id => !Object.hasOwn(account.taskSessions.registry?.[key] ?? {}, id) && !Object.hasOwn(to.taskSessions.registry?.[key] ?? {}, id)))
       const twins = (to.taskSessions.registry?.scheduledTasks ?? []).filter(task => ids.includes(task.id))
       const twinProblem = twins.map(twin => {
         const source = tasks.find(task => task.id === twin.id)
         return source ? staleTaskProblem(source, twin, { source: account.taskSessions.registry, target: to.taskSessions.registry }, (to.allSessions ?? to.sessions).map(row => row.record), to.unreadable.length) : 'target scheduled task collision'
       }).find(Boolean)
       family.error = account.taskError ?? to.taskError ?? (account.unreadable.length ? 'unreadable scheduled task family member' :
-        ids.some(id => !tasks.some(task => task.id === id)) || recordIds.length !== members.length ? 'scheduled task family member missing' :
+        (!historical && ids.some(id => !tasks.some(task => task.id === id))) || recordIds.length !== members.length ? 'scheduled task family member missing' :
         twinProblem ?? ((to.taskSessions.registry?.scheduledTasks ?? []).some(task => !ids.includes(task.id) && recordIds.includes(task.notifySessionId)) ? 'target scheduled task collision' :
         taskStateConflict(taskState(account.taskSessions.registry, ids), taskState(to.taskSessions.registry, ids)) ? 'target scheduled task state collision' : null))
       for (const row of members) Object.assign(row, { taskFamily: family, coldRun: false })
@@ -1406,6 +1412,11 @@ export function semantic(entries, sessionId, invalid = 0) {
   return sha(stable({ rows, state: sessionState(entries, sessionId), invalid, conflicts: normalized.conflicts }))
 }
 
+const scanLineage = (ctx, transcript) => {
+  const forked = ctx.scans.get(transcript)?.forked ?? new Map()
+  return { forks: forked.size, lineage: [...new Set([...forked.values()].map(from => from.sessionId))] }
+}
+
 async function scanned(id, ctx, cwd = '', dependencies = null) {
   const file = locate(ctx.index, id, cwd)
   if (!file) return null
@@ -1865,8 +1876,7 @@ async function history(id, transcript, ctx, cwd = '') {
   const bridges = data.entries.filter((entry) => entry.type === 'bridge-session')
   const bridgeIds = [...new Set(bridges.map((entry) => entry.bridgeSessionId ?? entry.bridge_session_id).filter((value) => typeof value === 'string'))]
   const bridgeOwners = uniqueBridgeOwners(bridges.map(entry => ({ id: remoteId(entry.bridgeSessionId ?? entry.bridge_session_id), sessionId: entry.sessionId ?? null, account: entry.ownerAccountUuid ?? null, org: entry.ownerOrganizationUuid ?? null })))
-  const forked = ctx.scans.get(transcript)?.forked ?? new Map()
-  const result = { roots, events, conversation: conversation(normalized.entries, id), forks: forked.size, lineage: [...new Set([...forked.values()].map(from => from.sessionId))], state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
+  const result = { roots, events, conversation: conversation(normalized.entries, id), ...scanLineage(ctx, transcript), state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
   if (ctx.cache) {
     const encoded = { ...result, roots: undefined, events: [...events] }
     cacheStore(ctx.cache, 'histories', cacheKey, sha(stable(dependencyRows)), { dependencies: dependencyRows, result: encoded })
@@ -2053,8 +2063,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
           return { blocked: { id: session.id, title: session.title, account, code: typed ? error.code : 'CLOUD_ARTIFACT_UNCERTAIN', error: typed ? error.message : 'Supplemental cloud coverage is uncertain: local artifacts could not be verified' } }
         } finally { if (checked) cacheStore(cache, 'remote', session.id, signature, remote); release() }
       }
-      return { blocked: { id: session.id, title: session.title, account, code: 'CLOUD_UNPROVEN', error: 'not proven to be on this Mac, kept in its account',
-        inputs: anchors.map(candidate => [candidate.row.transcript, candidate.row.transcriptFingerprint]) } }
+      return { blocked: { id: session.id, title: session.title, account, code: 'CLOUD_UNPROVEN', error: `not proven to be on this Mac, kept in ${account.label}` } }
     } catch (error) {
       return { blocked: { id: session.id, title: session.title, account, code: memoryErrorCode(error), error: `Remote Control history unreadable: ${error.message}` } }
     } finally {
@@ -2203,7 +2212,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
           let detail = analyzed.get(transcript)
           if (!detail) {
             const historyDetail = await history(s.id, transcript, ctx, s.cwd).catch(error => { if (!soleRecord(s)) throw error })
-            detail = { ...historyDetail ?? { roots: new Set(), events: new Map(), conversation: [], forks: 0 }, transcriptFingerprint: await fingerprint(transcript, cache), sidecar: await sidecars(transcript, s.id, cache) }
+            detail = { ...historyDetail ?? { roots: new Set(), events: new Map(), conversation: [], ...scanLineage(ctx, transcript) }, transcriptFingerprint: await fingerprint(transcript, cache), sidecar: await sidecars(transcript, s.id, cache) }
             analyzed.set(transcript, detail)
           }
           if (detail.contentSha && !detail.roots.size && !detail.invalid) { missing.push(s); continue }
@@ -2676,7 +2685,6 @@ const inventoryFailure = (item) => ({
     : `${item.account.label} | ${item.title || path.basename(item.file)}`,
   error: item.error ?? 'unreadable Desktop record',
   ...(item.code ? { code: item.code } : {}),
-  ...(item.inputs ? { inputs: item.inputs } : {}),
   ...failureIdentity(item)
 })
 const taggedCloudFailure = (cloud, failure) => ({ ...failure, cloudAccount: cloud.account, cloudOrg: cloud.org })
@@ -2694,7 +2702,7 @@ export const receiptSummary = (receipt) => {
     .map(row => [localFailureKey(row), row])).values()]
   return { moved: receipt.finalizing ? receipt.appendCheckpoint?.sessions ?? 0 : receipt.sessions?.length ?? 0, notMoved,
     groups: [...Map.groupBy(notMoved, row => row.cause)].map(([cause, records]) => ({ cause, records })),
-    attention: (receipt.failed ?? []).filter(row => row.cloudAccount ? actionableCloudFailure(receipt, row) : !row.sources?.length) }
+    attention: (receipt.failed ?? []).filter(row => row.cloudAccount ? actionableCloudFailure(receipt, row) : !row.sources?.length), kept: (receipt.failed ?? []).filter(keptCopy(receipt)) }
 }
 
 async function projectLocalFailures(receipt, paths, project = true) {
@@ -2750,9 +2758,10 @@ async function projectLocalFailures(receipt, paths, project = true) {
     if (links.length) failure.blockedByLocal = links
     else delete failure.blockedByLocal
   }
+  const kept = keptCopy(receipt)
   for (const check of receipt.cloudChecks ?? []) {
     if (['complete', 'cancelled'].includes(check.status)) continue
-    const failures = (receipt.failed ?? []).filter(row => cloudTagged(row, check))
+    const failures = (receipt.failed ?? []).filter(row => cloudTagged(row, check) && !kept(row))
     const blocked = failures.length && failures.every(row => row.blockedByLocal?.length) && !check.waiting?.length && check.checkedAt && !receipt.cloudError
     if (blocked) check.status = 'blocked-local'
     else if (check.status === 'blocked-local') check.status = 'failed'
@@ -3522,6 +3531,7 @@ async function undoParentProblems(receipt) {
 async function retire(inv, to, receipt, paths, at, problems, save, report = () => {}, check = () => {}, snapshots = null) {
   check(true)
   report('retire', 'checking', { live: true })
+  const retained = new Set()
   const bad = new Set(problems.map((p) => p.id))
   const dest = path.join(paths.state, 'quarantine', at)
   let plan = []
@@ -3618,7 +3628,7 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
     } else readyPlan.push(await snapshotPlan(item))
   }
   plan = readyPlan
-  if (!plan.length) return
+  if (!plan.length) return retained
   const root = path.dirname(dest)
   const retiringRows = items => items.flatMap(item => item.source ? [sourceRows.get(item.moved[0][0])] : [])
   const restoreItems = async items => {
@@ -3635,11 +3645,9 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
       const parent = parents.get(file)
       if (retiring.delete(parent)) kept.push(parent)
     }
-    for (const item of plan) if (item.source && !retiring.has(item.moved[0][0]) && landed.some(row => row.by === item.by)) {
-      receipt.failed.push({ id: item.id, title: item.title, error: 'a fork left in the source still refers to it', ...failureIdentity(sourceRows.get(item.moved[0][0])) })
-    }
+    for (const item of plan) if (item.source && !retiring.has(item.moved[0][0])) retained.add(item.moved[0][0])
     plan = plan.filter(item => retiring.has(item.moved[0][0]))
-    if (!plan.length) return
+    if (!plan.length) return retained
     const checkParents = async (parked = false) => {
       for (const [file, parent] of await parentReferences(directories, snapshots, check)) {
         if (retiring.has(parent) && (parked || !retiring.has(file))) throw new Error(`parent reference changed during retirement: ${file}`)
@@ -3690,11 +3698,12 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
     receipt.retiring = null
     receipt.failed.push({ id: null, title: 'retirement', error: error.message, ...failureIdentity({ members: retiringRows(plan) }) })
     await save()
-    return
+    return retained
   }
   receipt.superseded = [...receipt.superseded, ...plan]
   receipt.retiring = null
   await save()
+  return retained
 }
 
 const REMOTE_OPEN = new Set(['active', 'paused'])
@@ -3881,19 +3890,20 @@ function finishCloudAttempt(receipt, cloud, later = [], waiting = [], options = 
   const isolatedId = Object.hasOwn(options, 'isolatedId') ? options.isolatedId : cloud.isolatedId
   for (const failure of failures) {
     if (failure.code === 'CLOUD_MEMORY_BUDGET' && isolatedId !== undefined && remoteId(failure.id) === isolatedId) failure.code = 'CLOUD_BUDGET_LIMIT'
-    if (['CLOUD_MEMORY_BUDGET', 'CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT', 'CLOUD_UNPROVEN'].includes(failure.code)) {
+    if (['CLOUD_MEMORY_BUDGET', 'CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT'].includes(failure.code)) {
       failure.limitEngine ??= artifactEngine()
-      if (!['CLOUD_HISTORY_LIMIT', 'CLOUD_UNPROVEN'].includes(failure.code)) failure.limitBudget ??= budget
+      if (failure.code !== 'CLOUD_HISTORY_LIMIT') failure.limitBudget ??= budget
     }
   }
+  const kept = keptCopy(receipt), open = failures.filter(row => !kept(row))
   check.attemptEngine = artifactEngine()
   check.attemptBudget = budget
-  if (failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING')) check.authRetries = (check.authRetries ?? 0) + 1
+  if (open.length && open.every(row => row.code === 'CLOUD_AUTH_PENDING')) check.authRetries = (check.authRetries ?? 0) + 1
   else delete check.authRetries
   check.waiting = [...new Map([...(check.waiting ?? []), ...waiting].map(row => [row.id, row])).values()]
-  check.status = failures.length ? failures.every(row => row.blockedByLocal?.length) && !check.waiting.length ? 'blocked-local' : 'failed' : check.waiting.length ? 'waiting' : 'complete'
+  check.status = open.length ? open.every(row => row.blockedByLocal?.length) && !check.waiting.length ? 'blocked-local' : 'failed' : check.waiting.length ? 'waiting' : 'complete'
   check.checkedAt = new Date().toISOString()
-  if (failures.length) check.failures = failures.map(({ id, title, error, code, limitEngine, limitBudget, inputs }) => ({ id, title, error, ...(code ? { code } : {}), ...(limitEngine ? { limitEngine } : {}), ...(limitBudget ? { limitBudget } : {}), ...(inputs ? { inputs } : {}) }))
+  if (open.length) check.failures = open.map(({ id, title, error, code, limitEngine, limitBudget }) => ({ id, title, error, ...(code ? { code } : {}), ...(limitEngine ? { limitEngine } : {}), ...(limitBudget ? { limitBudget } : {}) }))
   else delete check.failures
   if (later.length) check.later = later
   else delete check.later
@@ -4012,10 +4022,9 @@ const cloudAttemptAt = (receipt, source) => {
   const key = `${source.account}/${source.org}`, at = receipt.cloudAttempts?.[key] ?? 0
   return Number.isFinite(at) && at >= 0 ? at : 0
 }
-const unchangedInputs = inputs => (inputs ?? []).every(([file, signature]) => { try { return statIdentity(statSync(file, { bigint: true })) === signature } catch { return false } })
 const unchangedLimit = (source, row, memory) => source.attemptEngine === artifactEngine() && (row.limitEngine ?? source.attemptEngine) === artifactEngine() &&
-  (['CLOUD_HISTORY_LIMIT', 'CLOUD_UNPROVEN'].includes(row.code) ? unchangedInputs(row.inputs) : source.attemptBudget === memorySignature(memory) && (row.limitBudget ?? source.attemptBudget) === memorySignature(memory))
-const limitedFailure = (source, row, memory) => ['CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT', 'CLOUD_UNPROVEN'].includes(row.code) && unchangedLimit(source, row, memory)
+  (row.code === 'CLOUD_HISTORY_LIMIT' || source.attemptBudget === memorySignature(memory) && (row.limitBudget ?? source.attemptBudget) === memorySignature(memory))
+const limitedFailure = (source, row, memory) => ['CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT'].includes(row.code) && unchangedLimit(source, row, memory)
 const budgetRetryRows = (source, memory) => [
   ...(source.waiting ?? []).filter(row => row.code === 'CLOUD_MEMORY_DEFERRED'),
   ...(source.failures ?? []).filter(row => row.code === 'CLOUD_MEMORY_BUDGET' && unchangedLimit(source, row, memory))
@@ -4156,7 +4165,7 @@ async function transfer(inv, to, paths, report, context = {}) {
       let after = receipt
       if (needsRecovery(receipt)) {
         report('rollback', 'Restoring unfinished work before continuing', { live: true })
-        receipt.localRecovery = { rollback: randomUUID() }
+        receipt.localRecovery = { rollback: receipt.localRecovery?.rollback ?? randomUUID() }
         await saveJson(file, receipt)
         let recovered
         try { recovered = await reconcileFiles(paths, { receiptFile: file, inspect: inv.inspect, check: context.check }) }
@@ -4213,7 +4222,7 @@ async function transfer(inv, to, paths, report, context = {}) {
   if (receipt && !context.existing && !receipt.sessions.length && !receipt.superseded.length && !receipt.remote.length && !receipt.held?.length && !openCloudChecks(receipt).length &&
     !await exists(path.join(paths.state, 'quarantine', context.at, 'failed'))) {
     if (result.file) await rm(result.file, { force: true })
-    return { file: null, receipt, summary: receiptSummary(receipt), ok: false, validationOnly: true }
+    return { file: null, receipt, summary: receiptSummary(receipt), ok: receiptOkay(receipt), validationOnly: true }
   }
   if (!result?.file) {
     const refused = { failed: orphans, sessions: [], superseded: [], verification: { ok: true, problems: [] } }
@@ -4367,7 +4376,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     const problems = await taskTransferProblems(recoveryFamilies(receipt), paths, inv.inspect, true, context.check, context.snapshots)
     if (problems.length) throw new Error(problems.join(', '))
   }
-  await retire(inv, to, receipt, paths, at, problems, save, report, context.check, context.snapshots)
+  const retained = await retire(inv, to, receipt, paths, at, problems, save, report, context.check, context.snapshots)
   const unwound = []
   if (family) {
     const retired = retiredFiles(receipt)
@@ -4384,24 +4393,39 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     const taskProblems = await taskTransferProblems(transfers, paths, inv.inspect, false, context.check, context.snapshots)
     if (taskProblems.length) throw new Error(taskProblems.join(', '))
   } else {
-    const retired = retiredFiles(receipt), liveWorkers = workers(inv.inspect()), failedDirectory = path.join(paths.state, 'quarantine', at, 'failed', randomUUID())
-    for (const rows of unitsOf([...inv.move, ...inv.there])) {
-      const members = rows.flatMap(row => row.members ?? [row]), files = new Set(members.map(member => member.file)), ids = new Set(rows.map(row => row.id))
-      if (!rows.some(row => inv.move.includes(row)) || members.every(member => retired.has(member.file) || heldFiles.has(member.file))) continue
-      const items = receipt.superseded.slice(previousSuperseded).filter(item => item.source ? files.has(item.moved[0][0]) : ids.has(item.by))
+    const retired = retiredFiles(receipt), liveWorkers = workers(inv.inspect())
+    const units = unitsOf([...inv.move, ...inv.there]).filter(rows => rows.some(row => inv.move.includes(row)) &&
+      !rows.flatMap(row => row.members ?? [row]).every(member => retired.has(member.file) || heldFiles.has(member.file) || retained.has(member.file)))
+    if (units.length) {
+      receipt.localRecovery = { rollback: randomUUID() }
+      await save()
+    }
+    const failedDirectory = path.join(paths.state, 'quarantine', at, 'failed', receipt.localRecovery?.rollback ?? '')
+    for (const rows of units) {
+      const ids = new Set(rows.map(row => row.id)), unitFiles = new Set(rows.flatMap(row => row.members ?? [row]).map(member => member.file))
+      const items = receipt.superseded.slice(previousSuperseded).filter(item => item.source ? unitFiles.has(item.moved[0][0]) : ids.has(item.by))
       await restore(items, path.join(paths.state, 'quarantine'))
       receipt.superseded = receipt.superseded.filter(item => !items.includes(item))
+      const kept = new Set()
       for (const row of receipt.sessions.slice(previousCount).filter(row => ids.has(row.id))) {
         const changes = await rollbackTarget(row, failedDirectory, liveWorkers, () => restoreBridge(row, save, inv.inspect))
-        if (changes.length) throw new Error(`${row.title} changed after placement: ${changes.join(', ')}`)
-        receipt.sessions = receipt.sessions.filter(session => session !== row)
+        if (changes.length) {
+          kept.add(row.id)
+          receipt.failed.push({ id: row.id, title: row.title, error: `changed after placement, left in place: ${changes.join(', ')}` })
+        } else receipt.sessions = receipt.sessions.filter(session => session !== row)
+        await save()
       }
+      const members = rows.filter(row => !kept.has(row.id)).flatMap(row => row.members ?? [row]), files = new Set(members.map(member => member.file))
       const checks = receipt.verification.problems.filter(problem => ids.has(problem.id)).map(problem => problem.check)
       receipt.verification.problems = receipt.verification.problems.filter(problem => !ids.has(problem.id))
       const error = receipt.failed.findLast(row => row.sources?.some(source => files.has(source.file)))?.error ?? (checks.length ? `${checks.join(', ')} changed during the move` : 'the move did not complete')
-      receipt.failed.push({ id: rows[0].id, title: rows[0].title, error, ...failureIdentity({ members }) })
+      const covered = new Set(receipt.failed.flatMap(row => row.sources ?? []).map(source => source.file))
+      const rest = members.filter(member => !covered.has(member.file))
+      if (rest.length) receipt.failed.push({ id: rest[0].id, title: rest[0].title, error, ...failureIdentity({ members: rest }) })
       unwound.push(...files)
+      await save()
     }
+    if (units.length) delete receipt.localRecovery
     if (unwound.length) receipt.verification.ok = !receipt.verification.problems.length && receipt.appendCheckpoint?.verification?.ok !== false
   }
   const done = receipt.sessions.length
@@ -4438,7 +4462,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   if (pendingCloud) report('pending', quantity(pendingCloud, 'source cloud check'))
   if (!done && !unwound.length && !receipt.superseded.length && !receipt.remote.length && !receipt.remotePending && !pendingCloud && !receipt.held?.length && !receipt.failed.some(row => row.blockedByLocal?.length)) {
     await rm(file, { force: true })
-    return receipt.failed.length ? { file: null, receipt, summary: receiptSummary(receipt), checks: [], problems, ok: false, validationOnly: true } : null
+    return receipt.failed.length ? { file: null, receipt, summary: receiptSummary(receipt), checks: [], problems, ok: receiptOkay(receipt), validationOnly: true } : null
   }
   await save()
   if (receipt.sessions.length) {
@@ -4497,7 +4521,8 @@ export function finishPending(paths, options = {}) {
     const retryRows = options.automatic ? budgetRetryRows(check, memory) : []
     const budgetRetry = retryRows.length ? [...new Set(retryRows.map(row => remoteId(row.id)).filter(Boolean))] : null
     const serial = Boolean(budgetRetry)
-    const preserved = new Set(options.automatic ? receipt.failed.filter(row => cloudTagged(row, check) && limitedFailure(check, row, memory)) : [])
+    const kept = keptCopy(receipt)
+    const preserved = new Set(receipt.failed.filter(row => cloudTagged(row, check) && (kept(row) || options.automatic && limitedFailure(check, row, memory))))
     if (active.at && check.loginAt !== active.at) check.authRetries = 0
     check.loginAt = active.at ?? null
     receipt.cloudAttempts = { ...receipt.cloudAttempts, [`${check.account}/${check.org}`]: now }
@@ -4656,7 +4681,7 @@ export function executeMove(from, to, paths, options = {}) {
     let chosen = saved?.selection ?? selection
     const sessionFiles = new Set(receiptSummary(existing?.receipt ?? {}).notMoved.map(row => row.file).filter(Boolean))
     const sessionProgress = receipt => {
-      const retired = new Set((receipt?.superseded ?? []).filter(row => row.source).flatMap(row => row.moved.map(([file]) => file)))
+      const retired = retiredFiles(receipt ?? {})
       report('sessions', 'Remaining sessions', { live: true, sessionTotal: sessionFiles.size, remainingCount: [...sessionFiles].filter(file => !retired.has(file)).length })
     }
     const requestedAt = saved?.requestedAt ?? existing?.receipt.startedAt ?? options.requestedAt ?? new Date().toISOString()
@@ -4710,7 +4735,7 @@ export function executeMove(from, to, paths, options = {}) {
           if (prepared?.recoveryRequired || prepared?.deferred || prepared?.receipt && needsRecovery(prepared.receipt)) return prepared
           if (prepared?.file) {
             existing = { file: prepared.file, receipt: prepared.receipt }
-            const retired = new Set(prepared.receipt.superseded.filter(row => row.source).flatMap(row => row.moved.map(([file]) => file)))
+            const retired = retiredFiles(prepared.receipt)
             chosen = { ...chosen, from: chosen.from.map(source => ({ ...source, files: source.files.filter(file => !retired.has(file)) })) }
           }
         }
@@ -5225,11 +5250,14 @@ async function main(argv) {
         retryable: retryableCode(result.code),
         cloudArchived: receipt.remote.length, newerCloud: result.newerCloud, pendingCloud: result.pendingCloud, pendingLabels: result.pendingLabels, held: result.held, waiting: waitingSessions(receipt), superseded: receipt.superseded.length - retired, retired, failed: receipt.failed, problems, checks, note, restart: refresh && !result.restarted, restarted: result.restarted, restartOutcome: result.restartOutcome })
     }
+    const failure = (f) => `${f.title || f.id} | ${f.error}`, kept = keptCopy(receipt)
     const troubles = [
-      ...receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`),
+      ...receipt.failed.filter(f => !kept(f)).map(failure),
       ...problems.map((p) => `${p.title ? `${p.title} | ` : ''}${short(p.id)} | ${p.check} check failed`)
     ]
     if (troubles.length) out.write(`  failed      ${troubles.join('\n              ')}\n`)
+    const copies = receipt.failed.filter(kept).map(failure)
+    if (copies.length) out.write(`  kept        ${copies.join('\n              ')}\n`)
     if (!file) return
     out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
   }
