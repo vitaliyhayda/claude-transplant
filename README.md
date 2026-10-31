@@ -66,7 +66,7 @@ The CLI touches the network and Keychain only when you pass `--cloud`. The menub
 
 - Two columns: FROM on the left, TO on the right. Uncheck accounts to leave behind. With FROM empty, choosing TO selects all other sources. Reset clears both columns for a new move.
 - When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Otherwise pick TO yourself.
-- Open chats offer Restart Claude and move. Finish the move continues pending work. Keep moved sessions and Undo this move sit in a secondary menu while a useful primary action is available, and appear directly after a terminal partial move.
+- Open chats offer Restart Claude and move. Finish the move continues pending work. Keep moved sessions and Undo this move sit in a secondary menu, and appear as buttons only when the remaining work can't move.
 - Held local work retries when its workers stop. Pending cloud cleanup retries across organizations under the signed-in login without switching organizations. Other logins wait until you sign in.
 - Only the source currently being cleaned up shows Clearing. Background verification leaves the move controls and progress indicator alone. Finish undo stays explicit and becomes available under the required login, regardless of the selected organization.
 - The headline counts identified records refused by the move, grouped in Details by history check, waiting on parent or task family, task collision, or other. A source mirror blocked by an unchanged local refusal stays in the receipt for a future Move and does not offer Finish on its own.
@@ -88,7 +88,7 @@ To    ↑↓ move · enter confirm
   ❯ ● you@home.com · Personal       3 | 5d ago | notes
 
   inventory   318 records | 3 already there | 307 to move
-  move        308 ✓ | 307 zero-copy | 1 rescued
+  move        307 ✓ | 307 zero-copy
   verify      chat messages unchanged ✓ | sidecars unchanged ✓ | desktop ✓
 
   receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11-208.json
@@ -123,7 +123,7 @@ Every command may write the tool's own files under `~/Library/Application Suppor
 | `restart` without a token | nothing beyond the recovery above |
 | move, `finish`, `sweep`, `undo` | Desktop session records and scheduled task registries under `claude-code-sessions`, local Remote Control bridge metadata in shared transcripts |
 | `--restart-approved <token>` | quits and reopens Claude Desktop around the requested operation |
-| a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control mirrors archived or restored there, rescued local transcripts when a remote branch diverged |
+| a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control mirrors archived or restored there |
 | `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
 | Move in the menubar | the same as a move with `--cloud`, the panel always passes it |
 | `menubar --snapshot <png>` | that image file |
@@ -180,7 +180,7 @@ A session is three files: the transcript in `~/.claude/projects`, the sidecar di
 
 Eligibility:
 
-- history is a single comparable version
+- a session whose Desktop record is the only one pointing at its transcript, with no fork, parent or rewind lineage, moves by record identity and transcript fingerprints, any other history is a single comparable version
 - record filename and identity are valid
 - no running worker owns it, and any task registrations, generated runs, notification routes, parents, and forks form a complete movable family
 - parent record is already in the target or moves first in the same batch, and stays wherever surviving forks refer to it, including archived forks or forks without history
@@ -193,18 +193,18 @@ Restarts:
 - When an operation needs Desktop to close, the engine emits a plan first. The menubar warns which Code workers, windows, Chat, Cowork, and background commands will close.
 - Restart and move approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or both source and target account/organization pairs to be known inactive. An active or unknown scheduler requires this plan even without a worker. Other cold moves show no dialog.
 - An approved restart moves eligible records before quitting Desktop, then waits for Desktop and its descendants to exit, moves held task families together, and reopens Desktop. Shutdown and reopen have fresh waits of up to 30s and 8s. Moving has no total deadline or predictive capacity veto. Claude stays closed while productive work finishes, and open chats stop. Graceful quit, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
-- At a safe boundary, a minute without useful reads or completed work triggers one automatic retry after safe recovery. In-flight filesystem calls stay awaited, so a call that never returns cannot trigger that check or reopen Claude. Failed writes are always unwound before independent records or complete task families continue, even after the retry is spent. Unchanged failures remain listed with their titles and reasons, with Keep moved sessions and Undo this move. Unresolved ownership or history blocks further writes and keeps the recovery journal.
-- Background retries never start a new shutdown. Continuation stays primary for pending local work, including saved 4.1.6 receipts. Keep and Undo use a secondary menu while a useful primary action is available.
+- A unit is a session, its fork family, or a complete routine family. When a unit fails, or a minute passes at a safe boundary without useful reads or completed work, only unfinished units are unwound, and each is retried once with fresh data. A unit that fails again stays in the source with its dependents while the other units continue. In-flight filesystem calls stay awaited, so a call that never returns cannot trigger that check or reopen Claude. Unchanged failures remain listed with their titles and reasons, with Keep moved sessions and Undo this move. Unresolved ownership or history blocks further writes and keeps the recovery journal.
+- Background retries never start a new shutdown. Continuation stays primary for pending local work, including saved 4.1.6 receipts. Keep and Undo use a secondary menu unless the remaining work can't move.
 - Private, bounded `restart-events.jsonl` logs retain attempt outcomes without prompts or raw errors. Diagnostics never rewrite unfinished receipts or their journals, or recreate discarded receipts. Completed recovery folds matching outcomes into an existing receipt's `restartHistory` once, preserving `receipt.restart`.
 
 Remote Control (`--cloud`):
 
 - Reads selected source organizations under the signed-in login through Claude Desktop's authenticated `claude.ai` session. Cookies are decrypted in memory via Keychain, sent only to `claude.ai`, never stored.
-- After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. Otherwise a same-title target must share eight consecutive exact remote messages to anchor a separate companion named `<original title> · from Remote Control`, with supported payloads copied exactly into a new local transcript.
+- After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. A mirror the engine cannot prove is already on this Mac stays unarchived in its account, is named once in Details, and is not retried until the engine or its local session changes.
 - The source mirror is archived only after the remote worker is disconnected and unchanged and the local target verifies.
 - Consumed queued prompts count once per proven command. Enqueued, cancelled, foreign-session and conflicting copies cannot supply missing history. A declared prior transcript in the same project can cover a mirror through its receipt link or its own matching session, source account and organization bridge record. One complete comparable prior must cover the mirror, and its file and project mapping are checked again before archival.
 - A unique bridge-linked parent can also prove owned subagent messages and absorbed queued prompts, including images. UUID, role, payload, delivery evidence and per-stream order must agree. The receipt records main, subagent and queued event counts. Final archival repeats the proof against fresh files and remote rows.
-- Supplemental reads share 512 MiB per operation, with a 16 MiB relevant-line parse limit. Time hints only prioritize files. Incomplete, unreadable or budget-limited checks remain uncertain and cannot authorize rescue. A complete check that establishes missing history can use the existing guarded rescue path.
+- Supplemental reads share 512 MiB per operation, with a 16 MiB relevant-line parse limit. Time hints only prioritize files. Incomplete, unreadable or budget-limited checks remain uncertain and never archive a mirror.
 - Supplemental reads run one candidate at a time while remote fetching stays concurrent. Candidates deferred by earlier reads receive priority on a later pass. Only failures measured against the full byte allowance, and per-session line limits, suppress unchanged automatic retries. Existing main-only matching and warm history caches remain usable.
 - Known source mirrors retry automatically across organizations under the signed-in login. Other logins stay pending until you sign in. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
 - Login transitions get prompt retries with brief backoff. The panel separates completed work from the next action and shows the next retry. Event limits pause only affected mirrors until an engine change or manual retry.
@@ -214,7 +214,7 @@ Safety:
 
 - One receipt owns the move, held records, cloud checks, failures, and retries. Another move cannot start until it is complete, kept local, or undone.
 - Records are written to a private temp inode, journaled, then exposed by an atomic no-clobber hard link. A record is either absent or complete.
-- Interrupted retirement or undo resumes from the receipt. Finish the move exposes interrupted task recovery and offers restart approval when the scheduler is active. Finish undo continues a staged Undo. Task families preserve reminders, run history, prompts and unrelated settings. Recovery rolls back only unfinished families. Undo restores the whole move. A corrupt newest receipt stops undo.
+- A crash during retirement restores the sources being retired and unwinds their placed copies, so every session keeps exactly one live Desktop record. Interrupted undo resumes from the receipt. A move interrupted under a version before 4.1.6 is left alone, and the CLI and panel say to finish it with `npx claude-transplant@4.1.6 finish`. Finish the move exposes interrupted task recovery and offers restart approval when the scheduler is active. Finish undo continues a staged Undo. Task families preserve reminders, run history, prompts and unrelated settings. Recovery unwinds only unfinished units. Undo restores the whole move. A corrupt newest receipt stops undo.
 - A disabled destination task twin can be replaced only when its definition matches, its notification record and dependencies are absent, every destination record is readable, and its selected state is absent or equal. The receipt saves the twin and its position for undo and recovery. Later unrelated registry edits survive.
 - Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. Undo, retirement, and source archival also ignore branch and PR bookkeeping.
 - Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
@@ -237,8 +237,7 @@ Safety:
 - blocked: needs merging, has a collision or unresolved parent, has an incomplete task family, or is owned by an external CLI worker
 - retired: source entries moved to quarantine after verification
 - cloud mirrors: active or paused Remote Control rows under the signed-in source
-- cloud rescue: one divergent remote branch materialized as a separate local session from exact message payloads
-- cloud blocked: no unambiguous local anchor, unsupported payload, connected worker, changed history, or account mismatch
+- cloud blocked: not proven to be on this Mac, connected worker, changed history, or account mismatch
 - cloud checks pending: inaccessible sources with unreadable or unarchived local records or known source mirrors
 - newer cloud sessions: rows created after Move, left for the next move
 
@@ -252,7 +251,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
 - Chat messages and sidecars stay intact. A move can append Claude Code's native empty Remote Control pointer to avoid stale foreign-owner title and history suppression. A destination-owned pointer stays. New moves leave SSH mirrors unchanged. This does not repair existing damage or migrate older bridge-write receipts. Recovery only appends, completing a proven partial metadata tail before restoring the saved pointer when still owned. Undo of a completed move leaves later transcript edits and newer pointers alone. Unproven interrupted writes stay pending. Existing history suppression stays, and existing cloud sessions are not renamed. Local metadata needs no `--cloud`, which controls network work.
 - Moves with no active worker or affected scheduler need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
-- Remote rescue copies payloads exactly. No model reconstructs history.
+- No model reconstructs history.
 - Remote Control network requests require `--cloud`, with no credential persistence. Local bridge metadata does not.
 - Automatic retries cover the receipt's named work only. They never start a restart, store credentials, or create destination bridges.
 - One JavaScript file, no dependencies, Node 22. The menubar is one Swift file.
@@ -279,9 +278,10 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
 | Require `/usr/bin/lockf` on every macOS version | macOS 14.5 lacks the utility. Bundled Perl takes the same kernel lock when it is absent |
-| Require a deleted task's registration to move its archived runs | Archived runs without notification routes or scheduler state can move through the guarded task-family path without recreating the task |
+| Require a deleted task's registration to move its archived runs | Archived runs of a routine that exists in no registry, without notification routes, forks or scheduler state, move cold like any archived chat, before any restart and without a registry write |
 | Raise each history's memory limit independently | Concurrent reads multiply memory use. Share a process budget and reduce concurrency under pressure |
 | Append the bridge clear to an SSH session's local transcript | Desktop extends that mirror with the remote bytes past the local size, so the next remote write lands short and leaves an unparseable fragment. Leave SSH mirrors untouched |
+| Rescue copies of unproven Remote Control mirrors | Four of four rescue decisions were false positives that only made duplicates. Unproven mirrors now stay in their account |
 
 </details>
 
@@ -291,11 +291,10 @@ Active identity comes from the newest complete initialization entry in Claude De
 - Live Sonoma execution remains unverified. The missing-`lockf` fallback is covered by synthetic checks.
 - Remote Control ownership does not transfer. Re-enable it per session under the destination account.
 - Artifact ownership, versions, comments, and share links stay with the original account.
-- Embedded base64, text, and HTTP(S) images and documents can be rescued. Account-owned file ids and unknown shapes are refused.
 - Remote Control uses private Claude endpoints and fails closed if their shape or auth changes.
 - Remote history reads stop at 1,000,000 events. The whole operation, including local inventory, shares a memory target of up to 20% of RAM with heap headroom and parsing reservations. On macOS, sampled system pressure controls throttling and deferral. Free pages alone do not cap work under normal pressure. The menubar heap setting never reduces Node's existing limit. This remains a cooperative target, not an OS-enforced cap. Incomplete history is never used to authorize cleanup.
 - Subagent artifact coverage from retained histories after a CLI identity change remains unsupported.
-- A large legacy base receipt still needs a full JSON parse before its snapshots can be trimmed. Journal replay bounds temporary parsing memory by the current line, while the reconstructed receipt remains in memory.
+- Journal replay bounds temporary parsing memory by the current line, while the reconstructed receipt remains in memory.
 - File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 - Moving history out of a Team organization is your organization's decision.
 
