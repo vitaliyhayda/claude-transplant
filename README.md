@@ -274,10 +274,11 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.2.0 | 27.0.1 | 4.4212.0 | 2.1.309 | 2026-10-30 |
 | 4.1.6 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-29 |
 | 4.1.5 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.4 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 
-4.1.5 and 4.1.6 were validated with synthetic fixtures and read-only code inspection, without a new live move.
+4.1.5 and 4.1.6 were validated with synthetic fixtures and read-only code inspection, without a new live move. 4.2.0 moved 499 sessions to another account and back through the menubar, and its final panel was checked with state tests and renders of live data.
 
 Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
