@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
 import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
-import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile as readBytes, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -10,6 +11,8 @@ import { fileURLToPath } from 'node:url'
 import { getHeapStatistics } from 'node:v8'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
+const VERSION = JSON.parse(readFileSync(path.join(HERE, 'package.json'), 'utf8')).version
+const OLDER_MOVE = 'An older version started this move. Finish it with npx claude-transplant@4.1.6 finish'
 const TYPES = new Set(['user', 'assistant', 'attachment', 'system', 'progress'])
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 const UUID = new RegExp(`^${UUID_PATTERN}$`, 'i')
@@ -23,18 +26,22 @@ const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
 const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
 const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
-const RESTART_BUDGET = 60_000
+const SHUTDOWN_WAIT = 30_000
 const REOPEN_RESERVE = 8_000
-const restartMoveBudget = (budget = RESTART_BUDGET, reserve = REOPEN_RESERVE) => Math.max(0, Math.min(22_000, (budget - reserve) / 2))
+const STALL_WAIT = 60_000
+const localActivity = new AsyncLocalStorage()
+const productive = () => localActivity.getStore()?.progress()
+const readFile = async (...args) => { const data = await readBytes(...args); productive(); return data }
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 12
+const CACHE_VERSION = 13
 const ARTIFACT_BYTES = 512 * 1024 * 1024
 const ARTIFACT_LINE_BYTES = 16 * 1024 * 1024
 const RESTART_LOG_BYTES = 1024 * 1024
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
-const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
+const ACCOUNT_ERROR_KEYS = ['error', 'errorAt', 'priorErrorMark']
+const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', ...ACCOUNT_ERROR_KEYS, 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
 const DURABLE_RECORD_KEYS = ['title', 'isArchived', 'isStarred']
 const recordSnapshot = record => Object.fromEntries(['sessionId', 'cliSessionId', 'cwd', 'originCwd', ...DURABLE_RECORD_KEYS].filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]))
 const REMOTE_TAGS = new Set(['remote-control-sdk', 'remote-control-repl'])
@@ -148,7 +155,7 @@ const sourceProgress = source => source ? { sourceId: `${source.account}/${sourc
 const retryableCode = code => ['RESTART_PLAN_CHANGED', 'RESTART_APPROVAL_CHANGED', 'QUIT_UNCONFIRMED', 'REOPEN_FAILED'].includes(code)
 const loginLabel = (row) => accountLabel(row).split(' · ')[0]
 const openCloudChecks = (receipt) => (receipt.cloudChecks ?? []).filter((check) => !['complete', 'cancelled', 'blocked-local'].includes(check.status))
-const actionableCloudFailure = (receipt, row) => row.cloudAccount && !row.blockedByLocal?.length && receiptCloudCheck(receipt, { account: row.cloudAccount, org: row.cloudOrg })?.status !== 'cancelled'
+const actionableCloudFailure = (receipt, row) => row.cloudAccount && !keptCopy(receipt)(row) && !row.blockedByLocal?.length && receiptCloudCheck(receipt, { account: row.cloudAccount, org: row.cloudOrg })?.status !== 'cancelled'
 const cloudCheckLabels = (receipt) => [...new Set(openCloudChecks(receipt).map((check) => check.label))]
 const waitingSessions = (receipt) => [...new Map([
   ...(receipt.held ?? []).map(row => ({ id: row.id, title: row.title, localId: row.id, recordId: row.recordId })),
@@ -160,8 +167,9 @@ const cloudCancelToken = (file, check) => sha(stable({ file, account: check.acco
 export function pendingPresentation(receipt, source, account, mode, table = [], scheduler = false, timeouts = new Map(), identity = null) {
   const empty = { pendingState: null, pendingAction: null, pendingCount: null, pendingAutomatic: false }
   if (!source) return empty
+  if (mode === 'partial') return { ...empty, pendingState: 'partial', pendingAction: 'blocked', pendingCount: receiptSummary(receipt).notMoved.filter(row => sameAccount(row, source)).length }
   if (mode === 'recovery') return { ...empty, pendingState: 'interrupted', pendingAction: 'finish' }
-  if (mode === 'undo') return { ...empty, pendingState: 'undo', pendingAction: receipt.remoteUndoing?.length && !account.signedIn ? 'sign-in' : 'finish', pendingPartial: (receipt.remoteUndoing?.length ?? 0) < (receipt.remote?.length ?? 0) }
+  if (mode === 'undo') return { ...empty, pendingState: receipt.remoteUndoing?.length ? 'undo-login' : 'undo', pendingAction: receipt.remoteUndoing?.length && !account.signedIn ? 'sign-in' : 'finish', pendingPartial: (receipt.remoteUndoing?.length ?? 0) < (receipt.remote?.length ?? 0) }
   if (mode === 'local') {
     const held = (receipt.held ?? []).filter(row => row.sources.some(member => sameAccount(member, source)))
     const owned = table.filter(worker => worker.worker && worker.pid !== worker.desktopPid && held.some(row => ownsWorker(new Set(worker.ids), row.id, row.recordId)))
@@ -179,26 +187,22 @@ export function pendingPresentation(receipt, source, account, mode, table = [], 
   const ids = [...new Set(pending.map(row => row.id).filter(Boolean))]
   const archived = new Set((receipt.remote ?? []).filter(row => sameAccount(row, source)).map(row => remoteId(row.id)))
   const count = failures.some(row => !row.id) ? null : ids.length || (source.sessionIds ? source.sessionIds.filter(id => !archived.has(remoteId(id))).length : null)
-  const state = historyLimited(source) ? failures.some(row => row.code === 'CLOUD_BUDGET_LIMIT') ? 'budget-limit' : failures.some(row => row.code === 'CLOUD_PARSER_LIMIT') ? 'parser-limit' : 'limit'
+  const blocked = historyLimited(source)
+  const state = blocked ? failures.some(row => row.code === 'CLOUD_BUDGET_LIMIT') ? 'budget-limit' : failures.some(row => row.code === 'CLOUD_PARSER_LIMIT') ? 'parser-limit' : 'limit'
     : failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING') ? 'login'
     : failures.length && failures.every(row => row.code === 'CLOUD_MEMORY_PRESSURE') ? 'memory'
-    : failures.length && !waiting.length && failures.every(row => row.code === 'CLOUD_CONTENT_UNSUPPORTED') ? 'unsupported'
-    : pending.length && pending.every(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'worker'
-      : failures.length || waiting.some(row => ['CLOUD_RESCUE_WORKER', 'CLOUD_MEMORY_DEFERRED'].includes(row.code)) ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
-  const blocked = ['unsupported', 'limit', 'budget-limit', 'parser-limit'].includes(state)
-  const action = blocked ? 'blocked' : !account.signedIn ? 'sign-in' : state === 'worker' ? 'wait'
-    : waiting.length && canRestartWaiting({ cloudChecks: [source] }, table) ? 'restart' : 'wait'
+    : failures.length || waiting.some(row => row.code === 'CLOUD_MEMORY_DEFERRED') ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
+  const action = blocked ? 'blocked' : !account.signedIn ? 'sign-in' : waiting.length && canRestartWaiting({ cloudChecks: [source] }, table) ? 'restart' : 'wait'
   return { pendingState: state, pendingAction: action, pendingCount: count, pendingAutomatic: !blocked,
-    pendingRetryAt: account.signedIn && !blocked && !['worker', 'cloud-open'].includes(state) ? cloudRetryAt(receipt, source, identity) : null }
+    pendingRetryAt: account.signedIn && !blocked && state !== 'cloud-open' ? cloudRetryAt(receipt, source, identity) : null }
 }
-const legacyLocalFailures = (receipt) => receipt.localCancelledAt ? [] : (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
 const needsRecovery = (receipt) => Boolean(receipt.pending || receipt.retiring || receipt.finalizing || receipt.undoing || receipt.remotePending || receipt.remoteUndoing?.length)
 const recoveryFamilies = (receipt) => {
   const transfers = receipt.taskTransfers ?? [], checkpoint = receipt.appendCheckpoint
   if (!checkpoint) return transfers
   if (['sessions', 'superseded'].some(key => !Number.isSafeInteger(checkpoint[key]) || checkpoint[key] < 0 || checkpoint[key] > (receipt[key]?.length ?? 0)) || !Array.isArray(checkpoint.held)) throw new Error('invalid append checkpoint')
   if (receipt.undoing) return transfers
-  const offset = checkpoint.taskTransfers === undefined && !transfers.length ? 0 : checkpoint.taskTransfers
+  const offset = checkpoint.taskTransfers
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > transfers.length) throw new Error('invalid append checkpoint')
   const committed = (receipt.sessions ?? []).slice(0, checkpoint.sessions).filter(row => row.taskFamily).map(row => [row.taskFamily, row.targetRecordId])
   const expected = transfers.slice(0, offset).flatMap(family => family.recordIds.map(id => [family.key, id]))
@@ -207,7 +211,11 @@ const recoveryFamilies = (receipt) => {
   return transfers.slice(offset)
 }
 const inspector = (paths, options) => options.inspect ?? options.io?.inspect ?? (() => options.processes ?? processTable(paths.claudeApp))
-const receiptOkay = (receipt) => receipt.verification?.ok !== false && !receipt.failed?.length
+const keptCopy = receipt => {
+  const linked = new Set((receipt.failed ?? []).filter(row => !row.cloudAccount).flatMap(row => (row.sources ?? []).flatMap(source => source.remoteIds ?? [])))
+  return row => row.code === 'CLOUD_UNPROVEN' && !row.blockedByLocal?.length && !linked.has(remoteId(row.id))
+}
+const receiptOkay = (receipt) => receipt.verification?.ok !== false && (receipt.failed ?? []).every(keptCopy(receipt))
 const finishOkay = (receipt) => receipt.verification?.ok !== false && !receipt.verification?.problems?.length &&
   !(receipt.failed ?? []).some(row => actionableCloudFailure(receipt, row)) && !(receipt.cloudError && openCloudChecks(receipt).length)
 const problemText = (problem) => `${problem.title ?? problem.id} | ${problem.check} verification failed`
@@ -469,15 +477,14 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const inspect = io.inspect ?? (() => processTable(paths.claudeApp))
   const safeInspect = () => { try { return inspect() } catch { return null } }
   const run = io.command ?? command
-  const budget = io.budget ?? RESTART_BUDGET
   const reserve = io.reserve ?? REOPEN_RESERVE
-  const started = now(), deadline = started + budget
-  const moveBudget = restartMoveBudget(budget, reserve)
-  const shutdownDeadline = started + Math.max(0, Math.min(30_000, budget - reserve - moveBudget))
-  let mutationDeadline = deadline - reserve
+  const started = now()
+  let lastProgress = now()
+  const activity = { progress: () => { lastProgress = now() } }
+  const shutdownWait = io.shutdownWait ?? SHUTDOWN_WAIT
   const file = path.join(paths.state, 'restart.json')
   const state = { at: stamp(), attemptId: randomUUID(), requestedAt: new Date().toISOString(), app: paths.claudeApp, desktop: plan.desktop, held: plan.held,
-    deadline: new Date(Date.now() + budget).toISOString(), outcome: 'closing' }
+    outcome: 'closing' }
   const origin = plan.receiptFile ?? (plan.selection ? path.join(paths.state, `${state.at}.json`) : null)
   const kind = plan.kind === 'undo' ? 'undo' : plan.resume || ['finish', 'recover'].includes(plan.kind) ? 'finish' : plan.kind === 'move' ? 'move' : 'restart'
   const diagnostic = (event, extra = {}) => appendRestartEvent(paths, { event, kind, attemptId: state.attemptId, at: new Date().toISOString(),
@@ -487,12 +494,12 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const save = () => saveJson(file, state)
   let nextInspection = -Infinity
   const check = (force = false) => {
-    if (now() >= mutationDeadline) throw Object.assign(new Error('Restart mutation deadline reached'), { code: 'RESTART_DEADLINE' })
+    if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
     if (!force && now() < nextInspection) return
     const possible = io.inspect || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
     if (possible && appProcess(paths, inspect())) throw Object.assign(new Error('Claude Desktop reopened before the held move finished. Retry the move.'), { code: 'RESTART_REOPENED' })
     nextInspection = now() + 100
-    if (now() >= mutationDeadline) throw Object.assign(new Error('Restart mutation deadline reached'), { code: 'RESTART_DEADLINE' })
+    if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
   }
   await mkdir(paths.state, { recursive: true, mode: 0o700 })
   await save()
@@ -504,19 +511,20 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) throw Object.assign(new Error('Open Claude sessions changed. Review the restart plan again.'), { code: 'RESTART_PLAN_CHANGED' })
     if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw Object.assign(new Error('An external worker now owns a held session. No restart was started.'), { code: 'RESTART_EXTERNAL_WORKER' })
     report('desktop', 'Closing Claude Desktop', { live: true })
+    const shutdownDeadline = now() + shutdownWait
     const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, shutdownDeadline - now()))
     const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), shutdownDeadline, now, wait)
     if (!gone || quit.status !== 0) {
       state.outcome = quit.timedOut ? 'quit-timeout' : 'quit-not-confirmed'
       state.error = 'Claude Desktop did not confirm shutdown. Answer any native quit dialog yourself. Held records were not moved.'
     } else {
-      mutationDeadline = Math.min(deadline - reserve, now() + moveBudget)
+      activity.progress()
       state.exitedAt = new Date().toISOString()
       state.outcome = 'moving'
       await save()
       await diagnostic('exited')
       check(true)
-      result = await work({ at: state.at, restart: state, check })
+      result = await localActivity.run(activity, () => work({ at: state.at, restart: state, check, progress: activity.progress }))
     }
   } catch (error) {
     failure = error
@@ -527,10 +535,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!remaining || !appProcess(paths, remaining)) {
       state.outcomeBeforeReopen = state.outcome
       state.outcome = 'reopening'
-      const reopenDeadline = Math.min(deadline, now() + reserve)
+      const reopenDeadline = now() + reserve
       const remaining = reopenDeadline - now()
-      if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
-      const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining)))()
+      const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1, remaining)))()
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
       const opened = await opening.catch(() => ({ status: null }))
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, reopenDeadline, now, wait)
@@ -548,10 +555,10 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.error = `Restart journal could not be saved: ${error.message}`
       failure ??= error
     }
-    const codes = new Set(['RESTART_DEADLINE', 'RESTART_REOPENED', 'RESTART_PLAN_CHANGED', 'RESTART_EXTERNAL_WORKER'])
+    const codes = new Set(['MOVE_STALLED', 'RESTART_REOPENED', 'RESTART_PLAN_CHANGED', 'RESTART_EXTERNAL_WORKER'])
     stopCode = failure ? codes.has(failure.code) ? failure.code : 'WORK_FAILED'
       : state.outcome === 'reopen-failed' ? 'REOPEN_FAILED' : (state.outcomeBeforeReopen ?? state.outcome).startsWith('quit-') ? 'QUIT_UNCONFIRMED'
-        : state.error ? 'RESTART_DEADLINE' : result?.ok === false ? 'WORK_REFUSED' : result ? 'COMPLETE' : 'NO_WORK'
+        : state.error ? 'WORK_FAILED' : result?.ok === false ? 'WORK_REFUSED' : result ? 'COMPLETE' : 'NO_WORK'
     await diagnostic('outcome', { receiptId: restartReceiptId(paths, origin ?? result?.file), outcome: state.outcome, stopCode,
       receiptCounts: result?.receipt ? { sessions: result.receipt.sessions?.length ?? null, failed: result.receipt.failed?.length ?? null, remote: result.receipt.remote?.length ?? null } : null })
     if (!failure) {
@@ -732,17 +739,20 @@ export async function writeNew(file, text, created = () => {}) {
     await handle.writeFile(text)
     await created(await handle.stat())
     await link(temp, file)
+    productive()
   } finally {
     await handle.close()
     await unlink(temp).catch(() => {})
   }
 }
 
-async function quarantine(items, dest) {
+async function quarantine(items, dest, before = () => {}) {
   for (const p of items) {
     if (!(await exists(p))) continue
     await mkdir(dest, { recursive: true })
+    before()
     await rename(p, path.join(dest, path.basename(p)))
+    productive()
   }
 }
 
@@ -784,6 +794,7 @@ async function folderRecords(dir, snapshots = null, check = () => {}) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error(`unreadable Desktop record: ${file}`)
     if (snapshots && await fingerprint(file) !== signature) throw new Error(`Desktop record changed while reading: ${file}`)
     records.set(file, { signature, record })
+    productive()
   }
   if (snapshots && await fingerprint(dir) !== before) throw new Error(`Desktop folder changed while reading: ${dir}`)
   snapshots?.set(dir, { signature: before, records })
@@ -851,6 +862,8 @@ async function schedulerBusy(paths, namespaces, table = processTable(paths.claud
   return current.state !== 'known' || namespaces.some(row => sameAccount(row, current))
 }
 
+const coldBlocked = (record, owners) => owners.some(owner => owner.taskSessions.has(record.sessionId) || owner.taskSessions.registry?.scheduledTasks?.some(task => task.id === record.scheduledTaskId) ||
+  TASK_STATE_KEYS.some(key => Object.hasOwn(owner.taskSessions.registry?.[key] ?? {}, record.scheduledTaskId)))
 function taskFamilies(from, to, found) {
   const families = []
   for (const account of from) {
@@ -867,9 +880,12 @@ function taskFamilies(from, to, found) {
       seeds.add(`task:${task.id}`)
       connect(`task:${task.id}`, task.notifySessionId ? `record:${task.notifySessionId}` : `task:${task.id}`)
     }
-    for (const { record } of records) {
-      const key = `record:${record.sessionId}`
-      if (record.scheduledTaskId) { seeds.add(key); connect(key, `task:${record.scheduledTaskId}`) }
+    const coldRun = row => row.deletedTask && row.record.isArchived === true && !row.record.notifySessionId && !row.record.forkedFromSessionId &&
+      !records.some(other => [other.record.forkedFromSessionId, other.record.notifySessionId].includes(row.record.sessionId)) && !coldBlocked(row.record, [account, to])
+    for (const row of found) if (sameAccount(row.account, account)) row.coldRun = coldRun(row)
+    for (const row of records) {
+      const { record } = row, key = `record:${record.sessionId}`
+      if (record.scheduledTaskId && !coldRun(row)) { seeds.add(key); connect(key, `task:${record.scheduledTaskId}`) }
       if (record.notifySessionId) { seeds.add(key); connect(key, `record:${record.notifySessionId}`) }
       if (record.forkedFromSessionId) connect(key, `record:${record.forkedFromSessionId}`)
     }
@@ -896,7 +912,7 @@ function taskFamilies(from, to, found) {
         (!historical && ids.some(id => !tasks.some(task => task.id === id))) || recordIds.length !== members.length ? 'scheduled task family member missing' :
         twinProblem ?? ((to.taskSessions.registry?.scheduledTasks ?? []).some(task => !ids.includes(task.id) && recordIds.includes(task.notifySessionId)) ? 'target scheduled task collision' :
         taskStateConflict(taskState(account.taskSessions.registry, ids), taskState(to.taskSessions.registry, ids)) ? 'target scheduled task state collision' : null))
-      for (const row of members) row.taskFamily = family
+      for (const row of members) Object.assign(row, { taskFamily: family, coldRun: false })
       families.push(family)
     }
   }
@@ -1028,6 +1044,7 @@ const plistValue = (file, key) => {
 async function binaryMatch(file, pattern) {
   let carry = ''
   for await (const chunk of createReadStream(file)) {
+    productive()
     const text = carry + chunk.toString('latin1')
     const match = text.match(pattern)
     if (match) return match[1]
@@ -1181,6 +1198,7 @@ export async function cloudClient(paths, expected = null, io = {}) {
   }
 }
 
+const priorSessions = record => Array.isArray(record.priorCliSessionIds) ? record.priorCliSessionIds : []
 const desktopSession = (file, record) => ({
   file,
   id: UUID.test(record.cliSessionId ?? '') ? record.cliSessionId : null,
@@ -1219,6 +1237,12 @@ export async function accounts(paths, processes = null) {
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
     out.push({ account, org, dir, email, orgName, sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
   }
+  const sessions = out.flatMap(account => account.sessions)
+  const claims = Map.groupBy(sessions.flatMap(session => [...new Set([session.id, ...priorSessions(session.record)])]), id => id)
+  const parents = new Set(sessions.map(session => session.record.forkedFromSessionId))
+  const tasks = out.some(account => account.taskError) ? null : new Set(out.flatMap(account => (account.taskSessions.registry?.scheduledTasks ?? []).map(task => task.id)))
+  for (const session of sessions) Object.assign(session, { shared: claims.get(session.id).length > 1 || parents.has(session.record.sessionId),
+    deletedTask: Boolean(tasks && typeof session.record.scheduledTaskId === 'string' && !tasks.has(session.record.scheduledTaskId)) })
   const mine = out.filter((a) => a.account === cur.account)
   const chosen = mine.find((a) => a.org === cur.org)
   if (chosen) Object.assign(chosen, { active: true, stats: `${chosen.stats} | active` })
@@ -1248,6 +1272,7 @@ export async function scan(file) {
   const forked = new Map()
   let invalid = 0
   for (const line of raw.split('\n')) {
+    productive()
     const text = line.trim()
     if (!text) continue
     let e
@@ -1264,6 +1289,7 @@ async function load(file) {
   const entries = []
   let invalid = 0
   for (const line of raw.split('\n')) {
+    productive()
     const text = line.trim()
     if (!text) continue
     try {
@@ -1386,6 +1412,11 @@ export function semantic(entries, sessionId, invalid = 0) {
   return sha(stable({ rows, state: sessionState(entries, sessionId), invalid, conflicts: normalized.conflicts }))
 }
 
+const scanLineage = (ctx, transcript) => {
+  const forked = ctx.scans.get(transcript)?.forked ?? new Map()
+  return { forks: forked.size, lineage: [...new Set([...forked.values()].map(from => from.sessionId))] }
+}
+
 async function scanned(id, ctx, cwd = '', dependencies = null) {
   const file = locate(ctx.index, id, cwd)
   if (!file) return null
@@ -1439,7 +1470,6 @@ const lineageEvent = (entry) => {
 const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && detailIncluded(a.detail, b.detail)
 
 const messageHash = (type, value) => sha(stable({ type, message: without(value, MESSAGE_RUNTIME_KEYS) }))
-const rescueTitle = (title) => `${(title || 'Untitled session').replace(/(?: · from Remote Control)+$/, '')} · from Remote Control`
 const queuedContent = (content, hash = messageHash('user', { role: 'user', content })) => {
   if (typeof content === 'string') return { hash, textHash: hash }
   if (Array.isArray(content) && content.length > 1 && content.every(block => block?.type === 'image' && block.source && typeof block.source === 'object' && !Array.isArray(block.source) ||
@@ -1846,7 +1876,7 @@ async function history(id, transcript, ctx, cwd = '') {
   const bridges = data.entries.filter((entry) => entry.type === 'bridge-session')
   const bridgeIds = [...new Set(bridges.map((entry) => entry.bridgeSessionId ?? entry.bridge_session_id).filter((value) => typeof value === 'string'))]
   const bridgeOwners = uniqueBridgeOwners(bridges.map(entry => ({ id: remoteId(entry.bridgeSessionId ?? entry.bridge_session_id), sessionId: entry.sessionId ?? null, account: entry.ownerAccountUuid ?? null, org: entry.ownerOrganizationUuid ?? null })))
-  const result = { roots, events, conversation: conversation(normalized.entries, id), forks: ctx.scans.get(transcript)?.forked.size ?? 0, state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
+  const result = { roots, events, conversation: conversation(normalized.entries, id), ...scanLineage(ctx, transcript), state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
   if (ctx.cache) {
     const encoded = { ...result, roots: undefined, events: [...events] }
     cacheStore(ctx.cache, 'histories', cacheKey, sha(stable(dependencyRows)), { dependencies: dependencyRows, result: encoded })
@@ -1858,7 +1888,7 @@ const sameEvents = (a, b) => {
   for (const [id, event] of a.events) if (!eventIncluded(event, b.events.get(id))) return false
   return true
 }
-const historyIncluded = (a, b) => a.comparable && b.comparable && a.roots.isSubsetOf(b.roots) && a.state === b.state && sameEvents(a, b)
+const historyIncluded = (a, b) => !a.sole && !b.sole && a.comparable && b.comparable && a.roots.isSubsetOf(b.roots) && a.state === b.state && sameEvents(a, b)
 const carries = (a, b) => Boolean(a.sidecar && b.sidecar && a.sidecar.set.isSubsetOf(b.sidecar.set))
 const desktopRecordOf = (row) => row.session?.record ?? row.record ?? {}
 const canShareRecord = (a, b, requiredParents) => {
@@ -1967,7 +1997,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
     artifactTurn = preceding.then(() => done)
     try {
       const sessionId = wireRemoteId(session.id)
-      const named = candidates.filter((candidate) => candidate.title === session.title || candidate.title === rescueTitle(session.title))
+      const named = candidates.filter((candidate) => candidate.title === session.title)
       const linked = candidates.filter((candidate) => candidate.remoteIds.has(sessionId))
       const detail = await cloud.session(session.id)
       if (REMOTE_OPEN.has(detail?.status) && remoteOpen(detail)) {
@@ -1980,9 +2010,8 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       const signature = sha(stable({ id: session.id, updatedAt: session.updated_at, lastEventAt: detail.last_event_at, status: detail.status }))
       let remote = cacheLookup(cache, 'remote', session.id, signature)
       let remoteConversation = remote?.conversation
-      let rows = null
       const refresh = async () => {
-        rows = (await stableRemoteRows(cloud, session.id)).rows
+        const { rows } = await stableRemoteRows(cloud, session.id)
         const current = conversationFromRows(rows)
         if (remoteConversation && sha(stable(current)) !== sha(stable(remoteConversation))) throw new Error('Remote Control history changed since cached analysis')
         remoteConversation = current
@@ -2006,7 +2035,6 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       const base = anchors.length === 1 ? anchors[0] : null
       const record = base && desktopRecordOf(base.row)
       const anchored = base && (linked.length || conversationAnchored(remoteConversation, base.conversation, 8))
-      if (anchored && base.row.worker) return { waiting: { id: session.id, title: session.title || 'Untitled session', code: 'CLOUD_RESCUE_WORKER', localId: base.id, recordId: record.sessionId } }
       const artifactLinked = base && linked.length && (base.row.artifactBridgeIds ?? remoteIdsOf({ ...base.row, members: [] })).includes(sessionId)
       if (artifactLinked || anchored && (base.row.taskOwned || record.scheduledTaskId || record.notifySessionId)) {
         const selected = base
@@ -2035,14 +2063,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
           return { blocked: { id: session.id, title: session.title, account, code: typed ? error.code : 'CLOUD_ARTIFACT_UNCERTAIN', error: typed ? error.message : 'Supplemental cloud coverage is uncertain: local artifacts could not be verified' } }
         } finally { if (checked) cacheStore(cache, 'remote', session.id, signature, remote); release() }
       }
-      if (remoteConversation.length < 4 && findCovered(candidates.filter((candidate) => !eligible.includes(candidate))).length) return { blocked: { id: session.id, title: session.title, account, error: 'remote history is too short to match a renamed local target' } }
-      if (anchors.length !== 1) return { blocked: { id: session.id, title: session.title, account, error: anchors.length ? 'multiple divergent local targets' : 'no linked or same-title local target' } }
-      if (!anchored) return { blocked: { id: session.id, title: session.title, account, error: 'same-title local target does not share a branch segment' } }
-      if (!rows) {
-        await refresh()
-      }
-      rescuePayloads(rows)
-      return { match: { session, target: { kind: 'rescue', base, id: null, title: rescueTitle(session.title), matchMode: 'rescue' }, conversationSha: sha(stable(remoteConversation)), account } }
+      return { blocked: { id: session.id, title: session.title, account, code: 'CLOUD_UNPROVEN', error: `not proven to be on this Mac, kept in ${account.label}` } }
     } catch (error) {
       return { blocked: { id: session.id, title: session.title, account, code: memoryErrorCode(error), error: `Remote Control history unreadable: ${error.message}` } }
     } finally {
@@ -2067,10 +2088,10 @@ const rehomeReason = (source, to, targetIds, targetNames) => {
   if (source.taskFamily?.error || source.account.taskError || to.taskError) return source.taskFamily?.error ?? source.account.taskError ?? to.taskError
   if (new Set(source.members?.map((member) => member.transcript)).size > 1) return 'multiple compatible source versions require merging'
   if (sameAccount(source.account, to)) return 'source and destination are the same'
-  if (source.invalid) return `${source.invalid} unparseable lines`
-  if (source.conflicts) return `${source.conflicts} conflicting duplicate uuids`
-  if (!source.comparable) return 'history cannot be compared safely'
-  if (!source.taskFamily && source.record.scheduledTaskId) return 'scheduled task owns the Desktop record'
+  if (!source.sole && source.invalid) return `${source.invalid} unparseable lines`
+  if (!source.sole && source.conflicts) return `${source.conflicts} conflicting duplicate uuids`
+  if (!source.sole && !source.comparable) return 'history cannot be compared safely'
+  if (!source.taskFamily && !source.coldRun && source.record.scheduledTaskId) return 'scheduled task owns the Desktop record'
   if (!source.taskFamily && source.record.notifySessionId) return 'notification route owns the Desktop record'
   if (!source.taskFamily && source.taskOwned) return 'scheduled task registry owns the Desktop record'
   if (targetIds.has(source.id)) return 'target session id collision'
@@ -2135,8 +2156,7 @@ function localPlan(pending, to) {
 async function retainedHistories(target, ctx, options, owners, enabled) {
   target.artifactBridgeIds = [...new Set([...remoteIdsOf(target), ...(options.cloudBridgeIds?.get(target.id) ?? []).map(remoteId).filter(Boolean)])]
   if (!enabled) return
-  const prior = desktopRecordOf(target).priorCliSessionIds
-  const priorIds = Array.isArray(prior) ? [...new Set(prior.filter(id => typeof id === 'string' && UUID.test(id) && id !== target.id))] : []
+  const priorIds = [...new Set(priorSessions(desktopRecordOf(target)).filter(id => typeof id === 'string' && UUID.test(id) && id !== target.id))]
   const remembered = [target.id, ...priorIds].flatMap(id => options.cloudBridgeIds?.get(id) ?? [])
   if (remembered.length) target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...remembered.map(remoteId).filter(Boolean)])]
   for (const id of priorIds) {
@@ -2171,6 +2191,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   const cache = await openAnalysisCache(paths, options.writeCache === true)
   const ctx = { index: await index(paths.pool), scans: new Map(), workers: workers(options.processes), cache }
   check()
+  const soleRecord = s => s.shared === false && !s.record.forkedFromSessionId && !priorSessions(s.record).some(id => id !== s.id && ctx.index.has(id))
   const analyzed = new Map()
   const missing = []
   const unreadable = []
@@ -2190,11 +2211,11 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
         try {
           let detail = analyzed.get(transcript)
           if (!detail) {
-            const historyDetail = await history(s.id, transcript, ctx, s.cwd)
-            detail = { ...historyDetail, transcriptFingerprint: await fingerprint(transcript, cache), sidecar: await sidecars(transcript, s.id, cache) }
+            const historyDetail = await history(s.id, transcript, ctx, s.cwd).catch(error => { if (!soleRecord(s)) throw error })
+            detail = { ...historyDetail ?? { roots: new Set(), events: new Map(), conversation: [], ...scanLineage(ctx, transcript) }, transcriptFingerprint: await fingerprint(transcript, cache), sidecar: await sidecars(transcript, s.id, cache) }
             analyzed.set(transcript, detail)
           }
-          if (!detail.roots.size && !detail.invalid) { missing.push(s); continue }
+          if (detail.contentSha && !detail.roots.size && !detail.invalid) { missing.push(s); continue }
           const source = { ...s, account, transcript, ...detail, taskOwned: account.taskSessions.has(s.record.sessionId), worker: ownsWorker(ctx.workers, s.id, s.record.sessionId), recordSha: sha(await readFile(s.file)), recordSemantic: recordSemantic(s.record) }
           if (validDesktopRecord(source)) {
             await retainedHistories(source, ctx, options, [account], cloudRequested)
@@ -2214,23 +2235,6 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   for (const family of families) {
     const busy = await schedulerBusy(paths, [family.from, family.to], ctx.workers.rows)
     for (const row of found.filter(row => row.taskFamily === family)) row.schedulerBusy = busy
-  }
-  const requiredParents = new Set(found.map(row => row.record.forkedFromSessionId).filter(Boolean))
-  const ranked = found.toSorted((a, b) => b.roots.size - a.roots.size || b.activeAt - a.activeAt || a.forks - b.forks || a.createdAt - b.createdAt)
-  const reps = []
-  for (const source of ranked) {
-    const at = reps.findIndex((candidate) => {
-      if (!historyIncluded(source, candidate) && !historyIncluded(candidate, source)) return false
-      return candidate.members.every((member) => canShareRecord(member, source, requiredParents) && sidecarsAgree(member.sidecar, source.sidecar))
-    })
-    if (at >= 0) {
-      const prior = reps[at]
-      const members = [...prior.members, source]
-      const fullest = historyIncluded(prior, source) && !historyIncluded(source, prior) ? source : prior
-      reps[at] = { ...fullest, members }
-    } else {
-      reps.push({ ...source, members: [source] })
-    }
   }
   const targets = []
   for (const s of to.sessions) {
@@ -2253,6 +2257,25 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     } finally {
       progress(report, 'scan', ++completed, workTotal)
       check()
+    }
+  }
+  const forked = new Set([...found, ...targets].flatMap(row => row.lineage ?? []))
+  for (const source of found) source.sole = soleRecord(source) && !source.lineage?.length && !forked.has(source.id)
+  const requiredParents = new Set(found.map(row => row.record.forkedFromSessionId).filter(Boolean))
+  const ranked = found.toSorted((a, b) => b.roots.size - a.roots.size || b.activeAt - a.activeAt || a.forks - b.forks || a.createdAt - b.createdAt)
+  const reps = []
+  for (const source of ranked) {
+    const at = reps.findIndex((candidate) => {
+      if (!historyIncluded(source, candidate) && !historyIncluded(candidate, source)) return false
+      return candidate.members.every((member) => canShareRecord(member, source, requiredParents) && sidecarsAgree(member.sidecar, source.sidecar))
+    })
+    if (at >= 0) {
+      const prior = reps[at]
+      const members = [...prior.members, source]
+      const fullest = historyIncluded(prior, source) && !historyIncluded(source, prior) ? source : prior
+      reps[at] = { ...fullest, members }
+    } else {
+      reps.push({ ...source, members: [source] })
     }
   }
   const covering = (s) => targets.find((target) => target.record && s.members.every((member) => included(member, target) && (!requiredParents.has(member.record.sessionId) || target.record === member.record.sessionId))) ?? null
@@ -2404,6 +2427,7 @@ async function bridgeRead(plan, handle, parse = true) {
   for (let at = 0; at < size;) {
     const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - at), at)
     if (!bytesRead) throw bridgeError('transcript changed while reading')
+    productive()
     memory.check(bytesRead)
     const chunk = buffer.subarray(0, bytesRead)
     hash.update(chunk)
@@ -2442,7 +2466,7 @@ async function bridgeSource(s, to, guard) {
   const base = { transcript: s.transcript, canonical, sessionId: s.id, recordIds, dev: String(detail.dev), ino: String(detail.ino) }
   return bridgeFile(base, false, async handle => {
     const state = await bridgeRead(base, handle, s.bridge !== false && s.contentSha !== s.bridgeAppend?.afterSha)
-    if (s.transcriptFingerprint && state.fingerprint !== s.transcriptFingerprint || !s.contentSha || state.sha !== s.contentSha) throw new Error('source changed since inventory')
+    if (state.fingerprint !== s.transcriptFingerprint || s.contentSha && state.sha !== s.contentSha) throw new Error('source changed since inventory')
     const pointer = state.last?.bridgeSessionId ?? state.last?.bridge_session_id
     const destinationOwned = state.last?.ownerAccountUuid === to.account && state.last?.ownerOrganizationUuid === to.org
     const mirror = records.some(record => record.sshConfig || typeof record.sshRemoteTranscriptPath === 'string' && record.sshRemoteTranscriptPath !== '') ||
@@ -2547,7 +2571,6 @@ async function bridgeIntact(row) {
 
 async function rehomeOne(s, to, journal, guard) {
   const { fingerprint: transcriptFingerprint, append } = await bridgeSource(s, to, guard)
-  if (!s.snapshot) throw new Error('source analysis unavailable')
   const sidecarRoot = path.join(path.dirname(s.transcript), s.id)
   const sidecarTree = await treeFingerprint(sidecarRoot)
   if (!s.sidecar.fingerprint || !sameTree(s.sidecar, sidecarTree)) throw new Error('source sidecars changed since inventory')
@@ -2557,7 +2580,7 @@ async function rehomeOne(s, to, journal, guard) {
   if (current.cliSessionId !== s.id || !validDesktopRecord({ file: s.file, record: current })) throw new Error('source Desktop record changed identity')
   if (recordSemantic(current) !== s.recordSemantic) throw new Error('source Desktop record changed since inventory')
   if (current.forkedFromSessionId !== s.record.forkedFromSessionId) throw new Error('source Desktop lineage changed since inventory')
-  if (!s.taskFamily && (current.scheduledTaskId || current.notifySessionId)) throw new Error('source Desktop ownership changed since inventory')
+  if (!s.taskFamily && (current.notifySessionId || current.scheduledTaskId && (!s.coldRun || coldBlocked(current, [s.account.taskFile, to.taskFile].map(file => ({ taskSessions: guard.taskSessions.get(file) })))))) throw new Error('source Desktop ownership changed since inventory')
   if (guard.taskSessions.get(s.account.taskFile).has(current.sessionId)) throw new Error('source scheduled task ownership changed since inventory')
   if ((guard.taskSessions.get(to.taskFile).registry?.scheduledTasks ?? []).some(task => task.notifySessionId === current.sessionId &&
     !s.taskFamily?.replaced?.some(row => stable(row.task) === stable(task)))) throw new Error('target scheduled task collision')
@@ -2565,7 +2588,7 @@ async function rehomeOne(s, to, journal, guard) {
   const title = (current.title ?? '').trim() || s.title || 'Untitled'
   const record = path.join(to.dir, path.basename(s.file))
   const sourceRecordSha = sha(sourceRecord)
-  const placed = { ...current, bridgeSessionIds: [] }
+  const placed = { ...without(current, ACCOUNT_ERROR_KEYS), bridgeSessionIds: [] }
   const recordText = jsonText(placed)
   const recordSha = sha(recordText)
   await journal({ strategy: 'rehome', recordSha })
@@ -2637,12 +2660,13 @@ const knownOf = (row) => ({
 })
 const artifacts = (row) => row.strategy === 'rehome' ? [row.record] : [row.targetTranscript, row.targetDir, row.record].filter(Boolean)
 const retiredCount = (receipt) => (receipt.superseded ?? []).filter((p) => p.source).length
+const retiredFiles = receipt => new Set((receipt.superseded ?? []).filter(row => row.source).flatMap(row => row.moved.map(([file]) => file)))
 const ownership = (row, liveWorkers, bridges = true) => {
   const record = desktopRecordOf(row)
   return [
     bridges && record.bridgeSessionIds?.length ? 'Remote Control bridge' : null,
     bridges && row.bridge ? 'transcript bridge' : null,
-    record.scheduledTaskId ? 'scheduled task' : null,
+    record.scheduledTaskId && !row.coldRun ? 'scheduled task' : null,
     record.notifySessionId ? 'notification route' : null,
     row.taskOwned ? 'scheduled task registry' : null,
     row.worker || ownsWorker(liveWorkers, row.id, record.sessionId) ? 'running worker' : null
@@ -2676,9 +2700,9 @@ export const receiptSummary = (receipt) => {
   const local = (receipt.failed ?? []).filter(row => !row.cloudAccount)
   const notMoved = [...new Map(local.flatMap(row => (row.sources ?? []).map(source => ({ ...source, error: row.error, cause: failureCause(row.error) })))
     .map(row => [localFailureKey(row), row])).values()]
-  return { moved: receipt.sessions?.length ?? 0, notMoved,
+  return { moved: receipt.finalizing ? receipt.appendCheckpoint?.sessions ?? 0 : receipt.sessions?.length ?? 0, notMoved,
     groups: [...Map.groupBy(notMoved, row => row.cause)].map(([cause, records]) => ({ cause, records })),
-    attention: (receipt.failed ?? []).filter(row => row.cloudAccount ? actionableCloudFailure(receipt, row) : !row.sources?.length) }
+    attention: (receipt.failed ?? []).filter(row => row.cloudAccount ? actionableCloudFailure(receipt, row) : !row.sources?.length), kept: (receipt.failed ?? []).filter(keptCopy(receipt)) }
 }
 
 async function projectLocalFailures(receipt, paths, project = true) {
@@ -2734,9 +2758,10 @@ async function projectLocalFailures(receipt, paths, project = true) {
     if (links.length) failure.blockedByLocal = links
     else delete failure.blockedByLocal
   }
+  const kept = keptCopy(receipt)
   for (const check of receipt.cloudChecks ?? []) {
     if (['complete', 'cancelled'].includes(check.status)) continue
-    const failures = (receipt.failed ?? []).filter(row => cloudTagged(row, check))
+    const failures = (receipt.failed ?? []).filter(row => cloudTagged(row, check) && !kept(row))
     const blocked = failures.length && failures.every(row => row.blockedByLocal?.length) && !check.waiting?.length && check.checkedAt && !receipt.cloudError
     if (blocked) check.status = 'blocked-local'
     else if (check.status === 'blocked-local') check.status = 'failed'
@@ -2776,7 +2801,7 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
       const record = JSON.parse(currentRecord)
       if (allowRecordDrift && row.recordSnapshot) {
         const rewound = row.strategy === 'rehome' && record.cliSessionId !== row.targetId && UUID.test(record.cliSessionId ?? '') &&
-          Array.isArray(record.priorCliSessionIds) && record.priorCliSessionIds.includes(row.targetId) &&
+          priorSessions(record).includes(row.targetId) &&
           (await stat(path.join(path.dirname(row.targetTranscript), `${record.cliSessionId}.jsonl`)).catch(() => null))?.isFile()
         recordChanged = !validDesktopRecord({ file: row.record, record }) ||
           ['sessionId', 'cwd', 'originCwd'].some(key => record[key] !== row.recordSnapshot[key]) ||
@@ -2881,6 +2906,9 @@ async function latestReceipt(paths) {
   const file = path.join(paths.state, name)
   const receipt = await readReceipt(file).catch(() => null)
   if (!receipt) return { name, file, corrupt: true }
+  if (!receipt.writer && (receipt.finalizing && receipt.appendCheckpoint && receipt.appendCheckpoint.taskTransfers === undefined || receipt.pending && !['rehome', 'remote'].includes(receipt.pending.strategy))) {
+    throw Object.assign(new Error(OLDER_MOVE), { code: 'OLDER_MOVE', file })
+  }
   const before = stable(receipt)
   if (!needsRecovery(receipt)) await projectLocalFailures(receipt, paths)
   return { name, file, receipt, projected: stable(receipt) !== before }
@@ -2904,8 +2932,8 @@ async function deferredWorkflow(paths, latest) {
     const sources = [...new Map(receipt.held.flatMap((row) => row.sources).map((row) => [`${row.account}/${row.org}`, { account: row.account, org: row.org, label: accountLabel(row) }])).values()]
     return { ...latest, mode: 'local', sources }
   }
-  if (legacyLocalFailures(receipt).length) return { ...latest, mode: 'local', sources: receipt.fromAccounts }
   const sources = openCloudChecks(receipt)
+  if (!sources.length && receipt.localStopped && !receipt.localCancelledAt) return { ...latest, mode: 'partial', sources: receipt.fromAccounts.filter(source => receiptSummary(receipt).notMoved.some(row => sameAccount(row, source))) }
   return sources.length ? { ...latest, mode: 'cloud', sources } : null
 }
 
@@ -2922,6 +2950,7 @@ const saveText = async (file, text, before = () => {}, durable = false) => {
     await before()
     await rename(temp, file)
     if (durable) await syncPath(path.dirname(file))
+    productive()
     return text
   } finally {
     await unlink(temp).catch(() => {})
@@ -2932,12 +2961,6 @@ const saveJson = (file, value, spacing = 2, durable = false) => saveText(file, j
 
 export async function readReceipt(file) {
   const receipt = await readJson(file)
-  const trim = row => {
-    if (row?.recordSnapshot && typeof row.recordSnapshot === 'object' && !Array.isArray(row.recordSnapshot)) row.recordSnapshot = recordSnapshot(row.recordSnapshot)
-    return row
-  }
-  for (const key of ['sessions', 'failed', 'retained']) if (Array.isArray(receipt[key])) receipt[key].forEach(trim)
-  trim(receipt.pending)
   const handle = await open(`${file}.journal`, 'r').catch((error) => {
     if (error.code === 'ENOENT') return null
     throw error
@@ -2950,14 +2973,15 @@ export async function readReceipt(file) {
     if (patch.sequence !== (receipt.journalSequence ?? 0) + 1) throw new Error('Incomplete move journal')
     for (const key of ['sessions', 'failed', 'retained']) {
       if (!Array.isArray(patch[key])) throw new Error('Invalid move journal entries')
-      for (const row of patch[key]) (receipt[key] ??= []).push(trim(row))
+      for (const row of patch[key]) (receipt[key] ??= []).push(row)
     }
-    receipt.pending = trim(patch.pending)
+    receipt.pending = patch.pending
     receipt.journalSequence = patch.sequence
   }
   try {
     let parts = [], length = 0
     for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      productive()
       let start = 0
       for (let end = chunk.indexOf(10); end >= 0; end = chunk.indexOf(10, start)) {
         const part = chunk.subarray(start, end)
@@ -2989,6 +3013,7 @@ async function placementJournal(file, receipt, check = () => {}) {
       try {
         await handle.writeFile(jsonText(patch, 0))
         if (durable) { await handle.sync(); await syncPath(file); await syncPath(path.dirname(file)) }
+        productive()
       }
       catch (error) { error.code = 'JOURNAL_WRITE'; throw error }
       receipt.journalSequence = patch.sequence
@@ -3026,6 +3051,7 @@ async function park(plan, before = async () => {}) {
       if (LOCAL_RECORD.test(path.basename(original, '.json')) && await exists(`${original}.tmp`)) throw new Error(`Desktop record has a new pending update: ${path.basename(original)}`)
       await mkdir(path.dirname(parked), { recursive: true })
       await rename(original, parked)
+      productive()
     }
   }
 }
@@ -3109,7 +3135,7 @@ async function taskTransferProblems(transfers, paths, inspect, partial = false, 
         }
       }
       if (family.tasks.length && (selected.every(Boolean) || !partial && (selected[0] || !selected[1]))) throw new Error('scheduled task ownership changed')
-    } catch (error) { if (error.code === 'RESTART_CAPACITY') throw error; problems.push(error.message) }
+    } catch (error) { if (['MOVE_STALLED', 'RESTART_REOPENED'].includes(error.code)) throw error; problems.push(error.message) }
   }
   return [...new Set(problems)]
 }
@@ -3281,7 +3307,8 @@ async function reconcile(paths, options = {}) {
       const pending = await recoveryPending(paths)
       if ((!options.receiptFile || pending?.file === options.receiptFile) && (pending?.receipt?.undoing || pending?.receipt?.remoteUndoing?.length)) result = { title: 'Undo pending', error: 'Finish undo to continue', pendingUndo: [...new Set((pending.receipt.remoteUndoing ?? []).map(loginLabel))] }
     }
-    result ??= await reconcileFiles(paths, options)
+    const pending = await recoveryPending(paths)
+    result ??= (options.background || options.automatic) && pending?.receipt?.localRecovery?.blocked ? { title: 'Move recovery blocked', error: pending.receipt.localRecovery.blocked } : await reconcileFiles(paths, options)
   } finally {
     if (interrupted) {
       paths = { ...paths, claudeApp: restart.app ?? paths.claudeApp }
@@ -3311,6 +3338,7 @@ async function reconcileFiles(paths, options = {}) {
     return { title: p.name, error: 'corrupt receipt set aside' }
   }
   const { receipt } = p
+  const failedDirectory = path.join(paths.state, 'quarantine', receipt.at, 'failed', UUID.test(receipt.localRecovery?.rollback ?? '') ? receipt.localRecovery.rollback : '')
   const bridgeRows = receipt.undoing ? receipt.sessions ?? [] : receipt.remotePending ? [] : [
     ...(receipt.pending ? [receipt.pending] : []),
     ...(receipt.finalizing ? (receipt.sessions ?? []).slice(receipt.appendCheckpoint?.sessions ?? 0) : [])
@@ -3359,24 +3387,18 @@ async function reconcileFiles(paths, options = {}) {
       return { title: row.title, error: `Remote Control recovery blocked: ${error.message}` }
     }
   }
+  const recovered = []
   if (receipt.retiring) {
     const plan = receipt.retiring
     const root = path.join(paths.state, 'quarantine')
     const blocked = await restoreProblems(plan, root, true)
     if (blocked.length) return { title: 'retirement recovery blocked', error: blocked.join(', '), problems: blocked }
-    await restore(plan, root)
+    await restore(plan, root, options.check)
     receipt.retiring = null
-    if (!receipt.appendCheckpoint && !receipt.taskTransfers?.length) {
-      receipt.finalizing = false
-      cancelCloudChecks(receipt)
-      await saveJson(p.file, receipt)
-      return { title: `${plan.length} retirement entries`, error: 'interrupted retirement rolled back' }
-    }
+    recovered.push({ title: `${plan.length} retirement entries`, error: 'interrupted retirement rolled back' })
   }
-  const recovered = []
   if (receipt.pending) {
     const { id, title, targetId, made, strategy, creationRequired, created } = receipt.pending
-    if (!['rehome', 'remote'].includes(strategy)) throw new Error('unsupported pending receipt strategy')
     const found = creationRequired ? await stat(made[0]).catch(() => null) : null
     const foreign = creationRequired && found && (!created || found.dev !== created.dev || found.ino !== created.ino)
     try { await restoreBridge(receipt.pending, () => saveJson(p.file, receipt, 2, true), inspect) }
@@ -3385,9 +3407,11 @@ async function reconcileFiles(paths, options = {}) {
       ? await readFile(made[0]).then((raw) => Boolean(receipt.pending.recordSha && sha(raw) !== receipt.pending.recordSha), () => false)
       : await changed(made[0], targetId, knownOf(receipt.pending))
     if ((used || foreign) && taskTransfers.some(family => family.recordIds.includes(path.basename(made[0], '.json')))) return { title: 'scheduled task recovery blocked', error: 'scheduled task target record changed, recovery remains pending' }
-    if (!used && !foreign) await quarantine(made, path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-    const changedCopy = strategy === 'rehome' ? 'target record' : 'remote rescue'
-    const error = foreign ? 'interrupted, independently created target left in place' : used ? `interrupted, ${changedCopy} changed since, left in place` : 'interrupted'
+    if (!used && !foreign) await quarantine(made, failedDirectory, () => {
+      options.check?.(true)
+      if (ownsWorker(workers(inspect()), targetId, path.basename(made[0], '.json'))) throw new Error('A running worker owns the unfinished record. Recovery remains pending.')
+    })
+    const error = foreign ? 'interrupted, independently created target left in place' : used ? 'interrupted, target record changed since, left in place' : 'interrupted'
     receipt.failed.push({ id, title, targetId, artifacts: made, retained: used && !foreign, error })
     if (used && !foreign) receipt.retained = [...(receipt.retained ?? []), { id, title, targetId, artifacts: made }]
     receipt.pending = null
@@ -3404,8 +3428,8 @@ async function reconcileFiles(paths, options = {}) {
     await restore(superseded, root, options.check)
     const kept = []
     let rolledBack = 0
-    const dest = path.join(paths.state, 'quarantine', receipt.at, 'failed')
-    const liveWorkers = workers()
+    const dest = failedDirectory
+    const liveWorkers = workers(inspect())
     for (const row of rollingBack) {
       options.check?.()
       let changes
@@ -3427,7 +3451,7 @@ async function reconcileFiles(paths, options = {}) {
     receipt.superseded = receipt.superseded.slice(0, checkpoint?.superseded ?? 0)
     receipt.finalizing = false
     receipt.verification = checkpoint?.verification ?? {
-      ok: false,
+      ok: !kept.length,
       problems: kept.map((row) => ({ id: row.targetId, title: row.title, check: 'interrupted finalization' }))
     }
     if (checkpoint) receipt.held = checkpoint.held
@@ -3438,6 +3462,7 @@ async function reconcileFiles(paths, options = {}) {
       error: kept.length ? `${kept.length} changed copies left in place` : 'interrupted finalization rolled back'
     })
   }
+  if (receipt.localRecovery) delete receipt.localRecovery.blocked
   await foldRestartHistory(paths, p.file, receipt)
   await saveJson(p.file, receipt)
   await rm(`${p.file}.journal`, { force: true })
@@ -3482,7 +3507,7 @@ const carrying = (inv, landed, gone = new Set()) => [
 const owners = (sources, carried) => {
   const candidates = new Map(sources.filter(row => row.roots.size).map(row => [row.roots.values().next().value, []]))
   for (const carrier of carried) for (const root of carrier.history.roots) candidates.get(root)?.push(carrier)
-  return sources.map(s => ({ s, owner: candidates.get(s.roots.values().next().value)?.find(carrier => included(s, carrier.history)) })).filter(row => row.owner)
+  return sources.map(s => ({ s, owner: s.sole ? carried.find(carrier => carrier.history.members?.includes(s)) : candidates.get(s.roots.values().next().value)?.find(carrier => included(s, carrier.history)) })).filter(row => row.owner)
 }
 
 async function parentReferences(directories, snapshots = null, check = () => {}) {
@@ -3506,6 +3531,7 @@ async function undoParentProblems(receipt) {
 async function retire(inv, to, receipt, paths, at, problems, save, report = () => {}, check = () => {}, snapshots = null) {
   check(true)
   report('retire', 'checking', { live: true })
+  const retained = new Set()
   const bad = new Set(problems.map((p) => p.id))
   const dest = path.join(paths.state, 'quarantine', at)
   let plan = []
@@ -3590,7 +3616,7 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
     if (!valid) invalid.add(item.by)
   }
   if (invalid.size) {
-    for (const id of invalid) receipt.failed.push({ id, title: 'destination', error: 'destination changed before retirement, source kept' })
+    for (const id of invalid) receipt.failed.push({ id, title: 'destination', error: 'destination changed before retirement, source kept', ...failureIdentity({ members: plan.filter(item => item.by === id && item.source).map(item => sourceRows.get(item.moved[0][0])) }) })
     plan = plan.filter((item) => !invalid.has(item.by))
   }
   const readyPlan = []
@@ -3602,7 +3628,14 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
     } else readyPlan.push(await snapshotPlan(item))
   }
   plan = readyPlan
-  if (!plan.length) return
+  if (!plan.length) return retained
+  const root = path.dirname(dest)
+  const retiringRows = items => items.flatMap(item => item.source ? [sourceRows.get(item.moved[0][0])] : [])
+  const restoreItems = async items => {
+    const blocked = await restoreProblems(items, root, true)
+    if (blocked.length) throw new Error(`retirement rollback blocked: ${blocked.join(', ')}`)
+    await restore(items, root)
+  }
   try {
     const directories = new Set(plan.map(item => path.dirname(item.moved[0][0])))
     const parents = await parentReferences(directories, snapshots, check)
@@ -3612,54 +3645,65 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
       const parent = parents.get(file)
       if (retiring.delete(parent)) kept.push(parent)
     }
+    for (const item of plan) if (item.source && !retiring.has(item.moved[0][0])) retained.add(item.moved[0][0])
     plan = plan.filter(item => retiring.has(item.moved[0][0]))
-    if (!plan.length) return
+    if (!plan.length) return retained
     const checkParents = async (parked = false) => {
       for (const [file, parent] of await parentReferences(directories, snapshots, check)) {
         if (retiring.has(parent) && (parked || !retiring.has(file))) throw new Error(`parent reference changed during retirement: ${file}`)
       }
+    }
+    const carrierSafe = async (id, live) => {
+      const carrier = carriers.get(id)
+      return carrier?.targetId ? !(await targetChanges(carrier, live, carrier.strategy !== 'rehome')).length : carrier ? await untouched(carrier, live, carrier.strategy !== 'rehome') : false
+    }
+    const groups = async (items, work) => {
+      const done = []
+      for (const group of Map.groupBy(items, item => item.by).values()) {
+        try { await work(group); done.push(...group) }
+        catch (error) {
+          if (['MOVE_STALLED', 'RESTART_REOPENED'].includes(error.code)) throw error
+          await restoreItems(group)
+          receipt.failed.push({ id: group[0].id, title: group[0].title, error: error.message, ...failureIdentity({ members: retiringRows(group) }) })
+        }
+      }
+      return done
     }
     receipt.retiring = plan
     await save()
     check(true)
     await checkParents()
     const parkWorkers = workers()
-    await park(plan, async (item) => {
+    const parked = await groups(plan, group => park(group, async (item) => {
       check()
-      const carrier = carriers.get(item.by)
-      const carrierSafe = carrier?.targetId ? !(await targetChanges(carrier, parkWorkers, carrier.strategy !== 'rehome')).length : carrier ? await untouched(carrier, parkWorkers, carrier.strategy !== 'rehome') : false
-      if (!carrierSafe) throw new Error(`destination changed during retirement: ${item.by}`)
-      const carrierId = carrier?.targetId ?? carrier?.id
+      if (!await carrierSafe(item.by, parkWorkers)) throw new Error(`destination changed during retirement: ${item.by}`)
+      const carrier = carriers.get(item.by), carrierId = carrier?.targetId ?? carrier?.id
       if (carrierId && parkWorkers.has(carrierId.toLowerCase())) throw new Error(`running worker changed during retirement: ${item.id}`)
       const row = (item.source ? sourceRows : targetRows).get(item.moved[0][0])
       if (!row || !(await untouched(row, parkWorkers, row.strategy !== 'rehome'))) throw new Error(`${item.source ? 'source' : 'destination'} changed during retirement: ${item.id}`)
-    })
+    }))
     check(true)
     const postWorkers = workers()
-    for (const id of new Set(plan.map((item) => item.by))) {
-      const carrier = carriers.get(id)
-      const carrierSafe = carrier?.targetId ? !(await targetChanges(carrier, postWorkers, carrier.strategy !== 'rehome')).length : carrier ? await untouched(carrier, postWorkers, carrier.strategy !== 'rehome') : false
-      if (!carrierSafe) throw new Error(`destination changed after retirement: ${id}`)
-    }
-    for (const item of plan.filter((entry) => entry.source)) {
-      const row = sourceRows.get(item.moved[0][0])
-      if (!row || !(await witnessed(row, postWorkers, row.strategy !== 'rehome'))) throw new Error(`source changed after retirement: ${item.id}`)
-    }
+    plan = await groups(parked, async group => {
+      if (!await carrierSafe(group[0].by, postWorkers)) throw new Error(`destination changed after retirement: ${group[0].by}`)
+      for (const item of group.filter((entry) => entry.source)) {
+        const row = sourceRows.get(item.moved[0][0])
+        if (!row || !(await witnessed(row, postWorkers, row.strategy !== 'rehome'))) throw new Error(`source changed after retirement: ${item.id}`)
+      }
+    })
     await checkParents(true)
   } catch (error) {
-    if (error.code === 'RESTART_CAPACITY') throw error
-    const root = path.dirname(dest)
-    const blocked = await restoreProblems(plan, root, true)
-    if (blocked.length) throw new Error(`${error.message}; retirement rollback blocked: ${blocked.join(', ')}`)
-    await restore(plan, root)
+    if (['MOVE_STALLED', 'RESTART_REOPENED'].includes(error.code)) throw error
+    await restoreItems(plan)
     receipt.retiring = null
-    receipt.failed.push({ id: null, title: 'retirement', error: error.message })
+    receipt.failed.push({ id: null, title: 'retirement', error: error.message, ...failureIdentity({ members: retiringRows(plan) }) })
     await save()
-    return
+    return retained
   }
   receipt.superseded = [...receipt.superseded, ...plan]
   receipt.retiring = null
   await save()
+  return retained
 }
 
 const REMOTE_OPEN = new Set(['active', 'paused'])
@@ -3706,158 +3750,6 @@ async function stableRemoteRows(cloud, id) {
   assertRemoteIdle(after)
   if (after.last_event_at !== marker) throw new Error('Remote Control history changed while reading')
   return { rows, marker, stateSha: remoteStateSha(rows), session: after }
-}
-
-const REMOTE_BLOCKS = new Set(['text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'tool_reference', 'image', 'document'])
-const REMOTE_RESULT_BLOCKS = new Set(['text', 'tool_reference', 'image', 'document'])
-const RESCUE_RECORD_KEYS = [
-  'classifierSummaryEnabled', 'effort', 'model', 'originCwd', 'remoteMcpServersConfig', 'sessionSettings'
-]
-const jsonLine = (value) => JSON.stringify(value).replace(/\u0085/g, '\\u0085').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
-
-const supportedRemoteSource = (source, blockType) => {
-  if (!source || typeof source !== 'object' || Array.isArray(source)) return false
-  if (source.type === 'base64') {
-    const media = typeof source.media_type === 'string' && (blockType === 'image' ? source.media_type.startsWith('image/') : source.media_type === 'application/pdf')
-    return media && typeof source.data === 'string' && source.data.length > 0 && source.data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(source.data)
-  }
-  if (source.type === 'url') {
-    try { return ['http:', 'https:'].includes(new URL(source.url).protocol) } catch { return false }
-  }
-  if (source.type === 'text') return blockType === 'document' && source.media_type === 'text/plain' && typeof source.data === 'string'
-  return false
-}
-
-const supportedRemoteBlock = (block) => {
-  if (!block || typeof block !== 'object' || !REMOTE_BLOCKS.has(block.type)) return false
-  if (block.type === 'text') return typeof block.text === 'string'
-  if (block.type === 'thinking') return typeof block.thinking === 'string'
-  if (block.type === 'redacted_thinking') return typeof block.data === 'string'
-  if (block.type === 'tool_use') return typeof block.id === 'string' && typeof block.name === 'string' && block.input && typeof block.input === 'object' && !Array.isArray(block.input)
-  if (block.type === 'tool_reference') return typeof block.tool_name === 'string'
-  if (block.type === 'image' || block.type === 'document') return supportedRemoteSource(block.source, block.type)
-  if (typeof block.tool_use_id !== 'string') return false
-  if (typeof block.content === 'string') return true
-  return Array.isArray(block.content) && block.content.every((nested) => REMOTE_RESULT_BLOCKS.has(nested?.type) && supportedRemoteBlock(nested))
-}
-
-const unsupportedRemoteBlock = block => Boolean(block && typeof block.type === 'string' && (!REMOTE_BLOCKS.has(block.type) ||
-  ['image', 'document'].includes(block.type) && typeof block.source?.type === 'string' && !(block.type === 'image' ? ['base64', 'url'] : ['base64', 'url', 'text']).includes(block.source.type) ||
-  block.type === 'tool_result' && Array.isArray(block.content) && block.content.some(row => typeof row?.type === 'string' && (!REMOTE_RESULT_BLOCKS.has(row.type) || unsupportedRemoteBlock(row)))))
-
-function rescuePayloads(rows) {
-  const messages = rows.filter((row) => ['user', 'assistant'].includes(row.event_type))
-  if (!messages.length) throw new Error('Remote Control history has no messages to rescue')
-  for (const row of messages) {
-    const payload = row.payload
-    if (payload.type !== row.event_type || !payload.message || typeof payload.message !== 'object' || payload.message.role !== row.event_type) throw Object.assign(new Error('Remote Control message response changed'), { code: 'CLOUD_HISTORY_UNREADABLE' })
-    const content = payload.message.content
-    if (typeof content !== 'string' && !Array.isArray(content)) throw Object.assign(new Error('Remote Control message content changed'), { code: 'CLOUD_HISTORY_UNREADABLE' })
-    if (Array.isArray(content) && content.some((block) => !supportedRemoteBlock(block))) {
-      const unsupported = content.some(unsupportedRemoteBlock)
-      throw Object.assign(new Error(unsupported ? 'Remote Control history contains an unsupported content block' : 'Remote Control message content is unreadable'), { code: unsupported ? 'CLOUD_CONTENT_UNSUPPORTED' : 'CLOUD_HISTORY_UNREADABLE' })
-    }
-  }
-  return messages
-}
-
-async function rescueRemote(match, to, cloud, journal) {
-  const base = match.target.base.row, title = match.target.title
-  const checkAnchor = async (when) => {
-    const live = workers(), recordId = desktopRecordOf(base).sessionId
-    if (ownsWorker(live, base.id, recordId)) throw Object.assign(new Error('Local rescue anchor is still running'), { code: 'CLOUD_RESCUE_WORKER', localId: base.id, recordId })
-    if (!(await untouched(base, live))) throw new Error(`local rescue anchor changed ${when}`)
-  }
-  await checkAnchor('since inventory')
-  const { rows, session: after } = await stableRemoteRows(cloud, match.session.id)
-  await checkAnchor('while reading remote history')
-  const messages = rescuePayloads(rows)
-  const remoteHistory = conversationFromRows(messages)
-  const remoteMessageSha = sha(stable(messages.map((row) => row.payload.message)))
-  if (sha(stable(remoteHistory)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
-
-  const baseRecordFile = base.session?.file ?? base.file
-  const baseRecord = await readJson(baseRecordFile)
-  if (recordSemantic(baseRecord) !== base.recordSemantic) throw new Error('local rescue target changed since inventory')
-  const baseEntries = (await load(base.transcript)).entries
-  const template = baseEntries.findLast((entry) => entry.version) ?? {}
-  const targetId = randomUUID()
-  const targetTranscript = path.join(path.dirname(base.transcript), `${targetId}.jsonl`)
-  const record = path.join(to.dir, `local_${targetId}.json`)
-  const common = {
-    cwd: baseRecord.cwd,
-    entrypoint: template.entrypoint,
-    gitBranch: template.gitBranch ?? null,
-    isSidechain: false,
-    sessionId: targetId,
-    userType: template.userType ?? 'external',
-    version: template.version
-  }
-  const entries = []
-  let parentUuid = null
-  for (const row of messages) {
-    const payload = row.payload
-    const uuid = randomUUID()
-    const entry = {
-      ...common,
-      type: row.event_type,
-      uuid,
-      parentUuid,
-      timestamp: payload.timestamp ?? row.created_at ?? after.last_event_at
-    }
-    if (payload.message) entry.message = structuredClone(payload.message)
-    if (payload.origin !== undefined) entry.origin = payload.origin
-    if (payload.request_id !== undefined) entry.requestId = payload.request_id
-    if (payload.tool_use_result !== undefined) entry.toolUseResult = structuredClone(payload.tool_use_result)
-    if (payload.tool_use_meta !== undefined) entry.toolUseMeta = structuredClone(payload.tool_use_meta)
-    entries.push(entry)
-    parentUuid = uuid
-  }
-  if (sha(stable(entries.filter((entry) => ['user', 'assistant'].includes(entry.type)).map((entry) => entry.message))) !== remoteMessageSha) throw new Error('rescued transcript does not preserve exact remote message payloads')
-  if (sha(stable(conversation(entries))) !== match.conversationSha) throw new Error('rescued transcript does not contain the remote message history')
-  const now = new Date().toISOString()
-  entries.push({ type: 'custom-title', customTitle: title, sessionId: targetId, uuid: randomUUID(), timestamp: now })
-  const transcriptText = `${entries.map(jsonLine).join('\n')}\n`
-  const createdAt = milliseconds(match.session.created_at)
-  const lastActivityAt = milliseconds(after.last_event_at)
-  const settings = Object.fromEntries(RESCUE_RECORD_KEYS.filter((key) => baseRecord[key] !== undefined).map((key) => [key, structuredClone(baseRecord[key])]))
-  const placed = { ...settings, sessionId: `local_${targetId}`, cliSessionId: targetId, cwd: baseRecord.cwd, title, titleSource: 'user', permissionMode: 'default', alwaysAllowedReasons: [], sessionPermissionUpdates: [], isArchived: false, bridgeSessionIds: [], createdAt: createdAt >= 0 ? createdAt : Date.now(), lastActivityAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), lastFocusedAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), completedTurns: rows.reduce((turns, row) => Math.max(turns, Number(row.payload?.num_turns) || 0), 0) }
-  const recordText = jsonText(placed)
-  const made = [targetTranscript, record]
-  const targetSemantic = semantic(entries, targetId)
-  await journal({ strategy: 'remote', id: targetId, targetId, made, targetSemantic, targetSemanticVersion: SEMANTIC_VERSION })
-  await writeNew(targetTranscript, transcriptText)
-  await writeNew(record, recordText)
-  const sidecarRoot = path.join(path.dirname(targetTranscript), targetId)
-  const sidecarTree = await treeFingerprint(sidecarRoot)
-  const remoteEventSha = sha(stable(rows.map((row) => ({ eventType: row.event_type, payload: row.payload, sequence: row.sequence_num }))))
-  return {
-    strategy: 'remote',
-    id: targetId,
-    remoteId: match.session.id,
-    rescueAnchorId: base.id,
-    remoteMessageSha,
-    targetId,
-    title,
-    archived: false,
-    transcript: targetTranscript,
-    targetTranscript,
-    targetDir: null,
-    record,
-    recordSha: sha(recordText),
-    recordSnapshot: recordSnapshot(placed),
-    recordSemantic: recordSemantic(placed),
-    targetRecordId: placed.sessionId,
-    taskFile: to.taskFile,
-    taskOwned: false,
-    transcriptFingerprint: await fingerprint(targetTranscript),
-    targetSemantic,
-    targetSemanticVersion: SEMANTIC_VERSION,
-    sidecars: { count: 0, bytes: 0, sha: sha(stable([])), fingerprint: sidecarTree.fingerprint, canonicalRoot: sidecarTree.canonicalRoot },
-    events: remoteHistory.length,
-    remoteEvents: rows.length,
-    remoteEventSha
-  }
 }
 
 async function waitRemote(cloud, id, statuses) {
@@ -3986,10 +3878,8 @@ function clearCloudAttempt(receipt, cloud, retain = () => false) {
 
 function addCloudFailure(receipt, cloud, failure) {
   const check = receiptCloudCheck(receipt, cloud)
-  if (['REMOTE_OPEN', 'CLOUD_RESCUE_WORKER'].includes(failure.code) && check) {
-    check.waiting = [...(check.waiting ?? []), { id: failure.id, title: failure.title, localId: failure.localId ?? null,
-      ...(failure.code === 'CLOUD_RESCUE_WORKER' ? { code: failure.code, recordId: failure.recordId ?? null } : {}) }]
-  } else receipt.failed.push(taggedCloudFailure(cloud, failure))
+  if (failure.code === 'REMOTE_OPEN' && check) check.waiting = [...(check.waiting ?? []), { id: failure.id, title: failure.title, localId: failure.localId ?? null }]
+  else receipt.failed.push(taggedCloudFailure(cloud, failure))
 }
 
 function finishCloudAttempt(receipt, cloud, later = [], waiting = [], options = {}) {
@@ -4005,14 +3895,15 @@ function finishCloudAttempt(receipt, cloud, later = [], waiting = [], options = 
       if (failure.code !== 'CLOUD_HISTORY_LIMIT') failure.limitBudget ??= budget
     }
   }
+  const kept = keptCopy(receipt), open = failures.filter(row => !kept(row))
   check.attemptEngine = artifactEngine()
   check.attemptBudget = budget
-  if (failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING')) check.authRetries = (check.authRetries ?? 0) + 1
+  if (open.length && open.every(row => row.code === 'CLOUD_AUTH_PENDING')) check.authRetries = (check.authRetries ?? 0) + 1
   else delete check.authRetries
   check.waiting = [...new Map([...(check.waiting ?? []), ...waiting].map(row => [row.id, row])).values()]
-  check.status = failures.length ? failures.every(row => row.blockedByLocal?.length) && !check.waiting.length ? 'blocked-local' : 'failed' : check.waiting.length ? 'waiting' : 'complete'
+  check.status = open.length ? open.every(row => row.blockedByLocal?.length) && !check.waiting.length ? 'blocked-local' : 'failed' : check.waiting.length ? 'waiting' : 'complete'
   check.checkedAt = new Date().toISOString()
-  if (failures.length) check.failures = failures.map(({ id, title, error, code, limitEngine, limitBudget }) => ({ id, title, error, ...(code ? { code } : {}), ...(limitEngine ? { limitEngine } : {}), ...(limitBudget ? { limitBudget } : {}) }))
+  if (open.length) check.failures = open.map(({ id, title, error, code, limitEngine, limitBudget }) => ({ id, title, error, ...(code ? { code } : {}), ...(limitEngine ? { limitEngine } : {}), ...(limitBudget ? { limitBudget } : {}) }))
   else delete check.failures
   if (later.length) check.later = later
   else delete check.later
@@ -4122,40 +4013,13 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
   if (receipt.remote?.length) report('cloud', `${count(receipt.remote.length)} source mirrors archived`)
 }
 
-async function rescueCloud(inv, receipt, to, paths, save, report = () => {}) {
-  const rescues = inv.cloud?.matches.filter((match) => match.target.kind === 'rescue') ?? []
-  const rows = []
-  let events = 0
-  progress(report, 'rescue', 0, rescues.length, cloudProgress(receipt, inv.cloud))
-  for (const [i, match] of rescues.entries()) {
-    report('rescue', `Bringing over ${match.session.title || 'Untitled session'}`, { live: true, completed: i, total: rescues.length, title: match.target.title, ...cloudProgress(receipt, inv.cloud) })
-    receipt.pending = { strategy: 'remote', id: match.session.id, title: match.target.title, targetId: null, made: [] }
-    await save()
-    try {
-      const row = await rescueRemote(match, to, inv.cloud.client, async (journal) => { Object.assign(receipt.pending, journal); await save() })
-      receipt.sessions.push(row)
-      rows.push(row)
-      match.target.id = row.targetId
-      events += row.events
-    } catch (error) {
-      await quarantine(receipt.pending.made ?? [], path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: memoryErrorCode(error), localId: error.localId, recordId: error.recordId })
-      match.target.failed = true
-    }
-    receipt.pending = null
-    await save()
-    progress(report, 'rescue', i + 1, rescues.length, cloudProgress(receipt, inv.cloud))
-  }
-  return { rows, events }
-}
-
 const cloudIdentity = async (paths, options) => {
   const active = options.active ?? await signedIn(paths, options.processes)
   return !options.active && active.state === 'unknown' && options.cloud && typeof options.cloud !== 'function' ? options.cloud : active
 }
 const cloudScope = (supplied, source) => !supplied || typeof supplied === 'function' || sameAccount(supplied, source)
 const cloudAttemptAt = (receipt, source) => {
-  const key = `${source.account}/${source.org}`, at = receipt.cloudAttempts?.[key] ?? (receipt.automaticCloudAttempt?.key === key ? receipt.automaticCloudAttempt.at : 0)
+  const key = `${source.account}/${source.org}`, at = receipt.cloudAttempts?.[key] ?? 0
   return Number.isFinite(at) && at >= 0 ? at : 0
 }
 const unchangedLimit = (source, row, memory) => source.attemptEngine === artifactEngine() && (row.limitEngine ?? source.attemptEngine) === artifactEngine() &&
@@ -4219,8 +4083,20 @@ async function restoreRemote(receipt, file, paths, options = {}) {
   }
 }
 
+const unitsOf = rows => {
+  const keys = new Map(rows.flatMap(row => (row.members ?? [row]).map(member => [`${member.account.account}/${member.account.org}/${member.record.sessionId}`, row])))
+  const root = new Map(rows.map(row => [row, row]))
+  const find = row => root.get(row) === row ? row : find(root.get(row))
+  for (const row of rows) for (const member of row.members ?? [row]) {
+    const parent = keys.get(`${member.account.account}/${member.account.org}/${member.record.forkedFromSessionId}`)
+    if (parent) root.set(find(row), find(parent))
+  }
+  return [...Map.groupBy(rows, find).values()]
+}
+
 async function transfer(inv, to, paths, report, context = {}) {
-  context = { ...context, sources: [...new Set([...inv.sources, ...inv.move, ...inv.move.flatMap(s => s.members ?? [])])], snapshots: context.restart ? new Map() : null }
+  context = { ...context, at: context.existing?.receipt.at ?? context.at ?? stamp(), snapshots: new Map(), sources: inv.sources }
+  const file = context.existing?.file ?? path.join(paths.state, `${context.at}.json`)
   if (context.restart) {
     const batches = new Map(), grouped = new Map()
     for (const family of new Set(inv.move.map(row => row.taskFamily).filter(Boolean))) {
@@ -4236,88 +4112,135 @@ async function transfer(inv, to, paths, report, context = {}) {
     for (const row of new Set([...inv.move, ...inv.sources])) if (grouped.has(row.taskFamily)) row.taskFamily = grouped.get(row.taskFamily)
   }
   const families = [...new Set(inv.move.map(row => row.taskFamily).filter(Boolean))]
-  if (!families.length) return transferRecords(inv, to, paths, report, context)
   const firstCount = context.existing?.receipt.sessions.length ?? 0
   const firstSuperseded = context.existing?.receipt.superseded.length ?? 0
-  context = { ...context, at: context.existing?.receipt.at ?? context.at ?? stamp() }
-  const file = context.existing?.file ?? path.join(paths.state, `${context.at}.json`)
   const emptyCloud = { checked: false, matches: [], blocked: [], waiting: [], later: [] }
   const held = [...(inv.held ?? []), ...families.map(family => {
     const members = inv.sources.filter(row => row.taskFamily === family), row = members[0]
     return { id: row.id, record: row.file, recordId: row.record.sessionId, title: row.title, ...family.from, release: 'scheduler', workers: [],
       sources: members.map(member => ({ id: member.id, file: member.file, ...family.from })) }
   })]
-  const regular = { ...inv, held, cloud: emptyCloud, move: inv.move.filter(row => !row.taskFamily), sources: inv.sources.filter(row => !row.taskFamily) }
-  const total = inv.move.length + (inv.cloud?.matches.filter(match => match.target.kind === 'rescue').length ?? 0)
-  const totals = { move: total, verify: total, retire: regular.sources.length + families.reduce((n, family) => n + family.files.length, 0) }
+  const totals = { move: inv.move.length, verify: inv.move.length, retire: inv.sources.length }
   const completed = { move: 0, verify: 0, retire: 0 }, details = new Map()
   const unitReport = (final = false) => {
     const before = { ...completed }
     return (stage, text, extra) => {
       if (!extra?.live) { details.set(stage, text); return }
-      const phase = stage === 'rescue' ? 'move' : stage
-      if (Object.hasOwn(totals, phase)) {
-        if (extra.total > 0) completed[phase] = before[phase] + extra.completed
-        if (extra.completed !== undefined && (phase === 'move' ? extra.total > 0 : final)) progress(report, phase, completed[phase], totals[phase], { activity: stage, sourceId: extra.sourceId, sourceLabel: extra.sourceLabel, moved: extra.moved })
+      if (Object.hasOwn(totals, stage)) {
+        if (extra.total > 0) completed[stage] = before[stage] + extra.completed
+        if (extra.completed !== undefined && (stage === 'move' ? extra.total > 0 : final)) progress(report, stage, completed[stage], totals[stage], { activity: stage, sourceId: extra.sourceId, sourceLabel: extra.sourceLabel, moved: extra.moved })
       } else if (final) report(stage, text, extra)
     }
   }
-  let result = context.existing && !regular.move.length && !regular.sources.length && !regular.blocked.length && !regular.unreadable.length && !regular.rejected.length
-    ? context.existing : await transferRecords(regular, to, paths, unitReport(), context)
-  if (result?.deferred) return result
-  for (const family of families) {
-    context.check?.(true)
-    const unit = { ...inv, move: inv.move.filter(row => row.taskFamily === family), sources: inv.sources.filter(row => row.taskFamily === family),
-      there: [], blocked: [], unreadable: [], rejected: [], cloud: emptyCloud, cloudRequested: false }
+  const blocked = async reason => {
+    const receipt = await readReceipt(file)
+    receipt.localRecovery = { ...receipt.localRecovery, blocked: reason }
+    receipt.failed.push({ id: null, title: 'Unfinished move', error: reason, ...failureIdentity({ members: inv.sources.filter(row => !retiredFiles(receipt).has(row.file)) }) })
+    await saveJson(file, receipt)
+    return { file, receipt, summary: receiptSummary(receipt), code: 'LOCAL_RECOVERY_BLOCKED', recoveryRequired: true, ok: false, complete: false,
+      reconciled: { title: 'Move recovery blocked', error: reason }, reason }
+  }
+  let result = context.existing
+  const failed = [], orphans = []
+  const attempt = async (unit, family, last, unitHeld, unitReporter = unitReport()) => {
     const existing = result?.file ? { file: result.file, receipt: result.receipt } : context.existing
-    unit.held = (existing?.receipt.held ?? held).filter(row => !row.sources.some(source => family.files.includes(source.file)))
-    if (!existing) Object.assign(unit, { blocked: inv.blocked, unreadable: inv.unreadable, rejected: inv.rejected })
+    const files = unit.sources.map(row => row.file)
+    unit.held = unitHeld ?? existing.receipt.held.filter(row => !row.sources.some(source => files.includes(source.file)))
     try {
-      result = await transferRecords(unit, to, paths, unitReport(), { ...context, existing, taskFamily: family })
-    } catch (error) {
-      if (error.code === 'RESTART_CAPACITY') throw error
-      const failure = { id: null, title: 'Scheduled task family', error: error.message, ...failureIdentity({ members: unit.sources.flatMap(row => row.members ?? [row]) }) }
-      const receipt = await readReceipt(file).catch(error => { if (error.code !== 'ENOENT') throw error; return null })
-      if (!receipt || !receipt.finalizing) {
-        if (!receipt) {
-          const refused = { failed: [failure], sessions: [], superseded: [], verification: { ok: true, problems: [] } }
-          return { receipt: refused, summary: receiptSummary(refused), file: null, ok: false, validationOnly: true }
-        }
-        receipt.failed.push(failure)
-        await saveJson(file, receipt)
-        result = { file, receipt, ok: false }
-        continue
-      }
       context.check?.(true)
-      const recovered = await reconcileFiles(paths, { receiptFile: file, inspect: inv.inspect, check: context.check })
-      const after = await readReceipt(file)
-      if (needsRecovery(after)) return { file, receipt: after, reconciled: recovered, recoveryRequired: true, ok: false }
+      const next = await transferRecords(unit, to, paths, unitReporter, { ...context, existing, taskFamily: family })
+      if (!last) failed.push(...next?.unwound ?? [])
+      return next?.deferred || next?.file || !result?.file ? next : result
+    } catch (error) {
+      if (error.code === 'RESTART_REOPENED' || !context.restart && !family) throw error
+      context.progress?.()
+      const receipt = await readReceipt(file).catch(error => { if (error.code !== 'ENOENT') throw error; return null })
+      if (!last) failed.push(...files)
+      const failure = { id: null, title: family ? 'Scheduled task family' : 'Unfinished move', error: error.message, ...failureIdentity({ members: unit.sources }) }
+      if (!receipt) {
+        orphans.push(...inventoryFailures(unit), failure)
+        return result
+      }
+      const failures = [...receipt.failed], cloudChecks = structuredClone(receipt.cloudChecks), checkpoint = receipt.appendCheckpoint ?? { sessions: 0, superseded: 0 }
+      let after = receipt
+      if (needsRecovery(receipt)) {
+        report('rollback', 'Restoring unfinished work before continuing', { live: true })
+        receipt.localRecovery = { rollback: receipt.localRecovery?.rollback ?? randomUUID() }
+        await saveJson(file, receipt)
+        let recovered
+        try { recovered = await reconcileFiles(paths, { receiptFile: file, inspect: inv.inspect, check: context.check }) }
+        catch (recovery) { return blocked(recovery.message) }
+        after = await readReceipt(file)
+        if (needsRecovery(after) || (after.retained?.length ?? 0) > (receipt.retained?.length ?? 0)) return blocked(needsRecovery(after) && recovered?.error || 'Unfinished work could not be restored consistently')
+        if (after.sessions.length !== checkpoint.sessions || after.superseded.length !== checkpoint.superseded) return blocked('Unfinished placement was not fully restored')
+        Object.assign(after, { failed: failures, cloudChecks, held: (after.held ?? []).flatMap(row => {
+          const sources = row.sources.filter(source => !files.includes(source.file))
+          return sources.length ? [{ ...row, sources }] : []
+        }) })
+        delete after.localRecovery
+      }
       after.failed.push(failure)
       await saveJson(file, after)
-      result = { file, receipt: after, ok: false }
+      return { file, receipt: after, ok: false }
     }
   }
-  const cloud = { ...inv.cloud, matches: (inv.cloud?.matches ?? []).map(match => {
-    const base = match.target.kind === 'rescue' && match.target.base
-    if (!base) return match
-    const parked = result.receipt.superseded.flatMap(row => row.moved).find(([file]) => file === desktopFileOf(base.row))?.[1]
-    if (!parked) return match
-    const row = { ...base.row, file: parked, ...(base.row.session ? { session: { ...base.row.session, file: parked } } : {}) }
-    return { ...match, target: { ...match.target, base: { ...base, row } } }
-  }) }
-  if (cloud.checked) {
-    result = await transferRecords({ ...inv, cloud, move: [], sources: [], targets: [], there: [], blocked: [], unreadable: [], rejected: [], held: result.receipt.held },
-      to, paths, unitReport(true), { ...context, existing: { file, receipt: result.receipt }, wholeOperation: true })
-  } else for (const phase of ['verify', 'retire']) progress(report, phase, completed[phase], totals[phase])
+  const regular = { ...inv, cloud: families.length ? emptyCloud : inv.cloud, move: inv.move.filter(row => !row.taskFamily), sources: inv.sources.filter(row => !row.taskFamily) }
+  if (!families.length || !context.existing || regular.move.length || regular.sources.length || regular.blocked.length || regular.unreadable.length || regular.rejected.length) {
+    result = await attempt(regular, null, false, held, families.length ? unitReport() : report)
+  }
+  if (result?.deferred || result?.recoveryRequired) return result
+  for (const family of families) {
+    const unit = { ...inv, move: inv.move.filter(row => row.taskFamily === family), sources: inv.sources.filter(row => row.taskFamily === family),
+      there: [], blocked: [], unreadable: [], rejected: [], cloud: emptyCloud, cloudRequested: false }
+    if (!result?.file && !context.existing) Object.assign(unit, { blocked: inv.blocked, unreadable: inv.unreadable, rejected: inv.rejected })
+    result = await attempt(unit, family, false, result?.file || context.existing ? null : held.filter(row => !row.sources.some(source => family.files.includes(source.file))))
+    if (result?.deferred || result?.recoveryRequired) return result
+  }
+  if (failed.length && result?.file) {
+    report('recovery', 'Retrying unfinished sessions once', { live: true })
+    const all = await accounts(paths), target = all.find(row => sameAccount(row, to))
+    if (!target) return blocked('The destination account disappeared during recovery')
+    const retrying = new Set(failed)
+    const sources = all.filter(row => inv.fromAccounts.some(source => sameAccount(row, source))).map(row => ({ ...row,
+      sessions: row.sessions.filter(session => retrying.has(session.file)), unreadable: row.unreadable.filter(file => retrying.has(file)) }))
+    const next = await inventory(sources, target, paths, report, { inspect: inv.inspect, processes: inv.inspect(), check: context.check })
+    context = { ...context, sources: next.sources }
+    const covered = new Set([...next.sources, ...next.rejected, ...next.unreadable].map(row => desktopFileOf(row)).filter(file => retrying.has(file)))
+    result.receipt.failed = [...result.receipt.failed.filter(row => row.cloudAccount || !row.sources?.length || row.sources.some(source => !covered.has(source.file))), ...inventoryFailures(next)]
+    const units = [...unitsOf([...next.move, ...next.there].filter(row => !row.taskFamily)).map(rows => [rows, null]),
+      ...[...new Set(next.move.map(row => row.taskFamily).filter(Boolean))].map(family => [next.move.filter(row => row.taskFamily === family), family])]
+    for (const [rows, family] of units) {
+      const members = rows.flatMap(row => row.members ?? [row])
+      result = await attempt({ ...next, move: rows.filter(row => next.move.includes(row)), there: rows.filter(row => next.there.includes(row)),
+        sources: next.sources.filter(row => family ? row.taskFamily === family : members.includes(row)), blocked: [], unreadable: [], rejected: [], cloud: emptyCloud, cloudRequested: false }, family, true)
+      if (result?.deferred || result?.recoveryRequired) return result
+    }
+    if (receiptSummary(result.receipt).notMoved.some(row => retrying.has(row.file))) result.receipt.localStopped = true
+    await saveJson(result.file, result.receipt)
+  }
+  const receipt = result?.receipt
+  if (receipt && !context.existing && !receipt.sessions.length && !receipt.superseded.length && !receipt.remote.length && !receipt.held?.length && !openCloudChecks(receipt).length &&
+    !await exists(path.join(paths.state, 'quarantine', context.at, 'failed'))) {
+    if (result.file) await rm(result.file, { force: true })
+    return { file: null, receipt, summary: receiptSummary(receipt), ok: receiptOkay(receipt), validationOnly: true }
+  }
+  if (!result?.file) {
+    const refused = { failed: orphans, sessions: [], superseded: [], verification: { ok: true, problems: [] } }
+    return orphans.length ? { receipt: refused, summary: receiptSummary(refused), file: null, ok: false, validationOnly: true } : result
+  }
+  if (!families.length && !failed.length) return result
+  if (inv.cloud?.checked && families.length) {
+    result = await transferRecords({ ...inv, move: [], sources: [], targets: [], there: [], blocked: [], unreadable: [], rejected: [], held: result.receipt.held },
+      to, paths, unitReport(true), { ...context, existing: { file, receipt }, wholeOperation: true })
+  } else if (families.length) for (const phase of ['verify', 'retire']) progress(report, phase, completed[phase], totals[phase])
   for (const [stage, text] of details) report(stage, text)
-  const receipt = result.receipt
   if (inv.cloudRequested && (!context.existing || context.refreshCloudChecks)) {
     const current = await accounts(paths)
     receipt.cloudChecks = retainedCloudChecks(receipt, inv, current)
     await saveJson(result.file, receipt)
   }
   const pendingCloud = openCloudChecks(receipt).length
-  return { ...result, summary: receiptSummary(receipt), ok: receiptOkay(receipt), complete: !pendingCloud && !receipt.held?.length, pendingCloud,
+  return { ...result, summary: receiptSummary(receipt), ok: receiptOkay(receipt), complete: !pendingCloud && !receipt.held?.length && !receipt.localStopped, pendingCloud,
     pendingLabels: cloudCheckLabels(receipt), held: receipt.held, added: receipt.sessions.length - firstCount,
     targetChanged: receipt.sessions.length > firstCount || receipt.superseded.slice(firstSuperseded).some(row => !row.source), problems: receipt.verification?.problems ?? [] }
 }
@@ -4340,6 +4263,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   const initialFailures = inventoryFailures(inv).flatMap(unheldFailures)
   const receipt = context.existing?.receipt ?? {
     at,
+    writer: VERSION,
     startedAt,
     from: inv.from,
     to: to.label,
@@ -4403,7 +4327,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     await writeTaskRegistrations([transfer], 'source', false, paths, inv.inspect, context.check, context.snapshots)
     for (const row of inv.sources) row.taskOwned = false
   }
-  const rehomeGuard = { workers: workers(inv.inspect()), inspect: inv.inspect, sources: context.sources, targets: inv.targets, taskSessions: new Map(), created: new Map(), check: context.check }
+  const rehomeGuard = { workers: workers(inv.inspect()), inspect: inv.inspect, sources: [...new Set([...context.sources ?? inv.sources, ...inv.move, ...inv.move.flatMap(s => s.members ?? [])])], targets: inv.targets, taskSessions: new Map(), created: new Map(), check: context.check }
   for (const file of new Set([...inv.move.map((row) => row.account.taskFile), to.taskFile])) {
     rehomeGuard.taskSessions.set(file, await taskSessions(file))
   }
@@ -4423,7 +4347,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
         receipt.sessions.push(row)
         if (row.targetRecordId) landedRecordIds.add(row.targetRecordId)
       } catch (error) {
-        if (error.code === 'JOURNAL_WRITE' || error.code === 'RESTART_CAPACITY') throw error
+        if (error.code === 'JOURNAL_WRITE' || ['MOVE_STALLED', 'RESTART_REOPENED'].includes(error.code)) throw error
         if (receipt.pending.bridgeAppend) {
           try { await restoreBridge(receipt.pending, () => journal.save(true), inv.inspect, false, false) }
           catch (recovery) { throw bridgeError(`${error.message}. ${recovery.message}`) }
@@ -4431,12 +4355,11 @@ async function transferRecords(inv, to, paths, report, context = {}) {
         const raw = await readFile(made[0]).catch(() => null)
         const created = rehomeGuard.created.get(made[0])
         const found = await stat(made[0]).catch(() => null)
-        const ours = created && found?.dev === created.dev && found?.ino === created.ino
-        const unchanged = ours && raw && receipt.pending.recordSha && sha(raw) === receipt.pending.recordSha
-        if (unchanged) await quarantine(made, path.join(paths.state, 'quarantine', at, 'failed'))
-        const retained = Boolean(ours && raw && !unchanged)
-        if (retained) receipt.retained = [...(receipt.retained ?? []), { id: s.id, title: s.title, targetId, artifacts: made }]
-        receipt.failed.push({ id: s.id, title: s.title, error: error.message, ...failureIdentity(s), ...(retained ? { retained, targetId, artifacts: made } : {}) })
+        if (raw && created && found?.dev === created.dev && found?.ino === created.ino) {
+          if (sha(raw) !== receipt.pending.recordSha) throw error
+          await quarantine(made, path.join(paths.state, 'quarantine', at, 'failed'))
+        }
+        receipt.failed.push({ id: s.id, title: s.title, error: error.message, ...failureIdentity(s) })
       }
       receipt.pending = null
       await journal.save()
@@ -4445,22 +4368,19 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   } finally { await journal?.close() }
   await journal?.compact()
   context.check?.(true)
-  const rescues = inv.cloud?.matches.filter((match) => match.target.kind === 'rescue') ?? []
-  const rescued = await rescueCloud(inv, receipt, to, paths, save, report)
-  const done = receipt.sessions.length
   const { ok, lines, problems } = await verify(receipt.sessions.slice(previousCount), report, context.check)
-  const rescueIds = new Set(rescued.rows.map((row) => row.targetId))
-  const recordedProblems = problems.map((problem) => rescueIds.has(problem.id) ? taggedCloudFailure(inv.cloud, problem) : problem)
   const priorProblems = context.existing ? receipt.appendCheckpoint.verification?.problems ?? [] : []
-  receipt.verification = { ok: ok && receipt.appendCheckpoint?.verification?.ok !== false && !priorProblems.length, problems: [...priorProblems, ...recordedProblems] }
+  receipt.verification = { ok: ok && receipt.appendCheckpoint?.verification?.ok !== false && !priorProblems.length, problems: [...priorProblems, ...problems] }
   await save()
   if (family) {
     const problems = await taskTransferProblems(recoveryFamilies(receipt), paths, inv.inspect, true, context.check, context.snapshots)
     if (problems.length) throw new Error(problems.join(', '))
   }
-  await retire(inv, to, receipt, paths, at, problems, save, report, context.check, context.snapshots)
+  const retained = await retire(inv, to, receipt, paths, at, problems, save, report, context.check, context.snapshots)
+  const unwound = []
   if (family) {
-    if (!ok || inv.sources.some(source => !receipt.superseded.some(row => row.source && row.moved.some(([file]) => file === source.file)))) throw new Error('scheduled task family did not move completely')
+    const retired = retiredFiles(receipt)
+    if (!ok || inv.sources.some(source => !retired.has(source.file))) throw new Error('scheduled task family did not move completely')
     const transfers = receipt.taskTransfers.filter(row => row.key === family.key)
     await writeTaskRegistrations(transfers, 'target', true, paths, inv.inspect, context.check, context.snapshots)
     const tasks = transfers[0].tasks
@@ -4472,7 +4392,43 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     }
     const taskProblems = await taskTransferProblems(transfers, paths, inv.inspect, false, context.check, context.snapshots)
     if (taskProblems.length) throw new Error(taskProblems.join(', '))
+  } else {
+    const retired = retiredFiles(receipt), liveWorkers = workers(inv.inspect())
+    const units = unitsOf([...inv.move, ...inv.there]).filter(rows => rows.some(row => inv.move.includes(row)) &&
+      !rows.flatMap(row => row.members ?? [row]).every(member => retired.has(member.file) || heldFiles.has(member.file) || retained.has(member.file)))
+    if (units.length) {
+      receipt.localRecovery = { rollback: randomUUID() }
+      await save()
+    }
+    const failedDirectory = path.join(paths.state, 'quarantine', at, 'failed', receipt.localRecovery?.rollback ?? '')
+    for (const rows of units) {
+      const ids = new Set(rows.map(row => row.id)), unitFiles = new Set(rows.flatMap(row => row.members ?? [row]).map(member => member.file))
+      const items = receipt.superseded.slice(previousSuperseded).filter(item => item.source ? unitFiles.has(item.moved[0][0]) : ids.has(item.by))
+      await restore(items, path.join(paths.state, 'quarantine'))
+      receipt.superseded = receipt.superseded.filter(item => !items.includes(item))
+      const kept = new Set()
+      for (const row of receipt.sessions.slice(previousCount).filter(row => ids.has(row.id))) {
+        const changes = await rollbackTarget(row, failedDirectory, liveWorkers, () => restoreBridge(row, save, inv.inspect))
+        if (changes.length) {
+          kept.add(row.id)
+          receipt.failed.push({ id: row.id, title: row.title, error: `changed after placement, left in place: ${changes.join(', ')}` })
+        } else receipt.sessions = receipt.sessions.filter(session => session !== row)
+        await save()
+      }
+      const members = rows.filter(row => !kept.has(row.id)).flatMap(row => row.members ?? [row]), files = new Set(members.map(member => member.file))
+      const checks = receipt.verification.problems.filter(problem => ids.has(problem.id)).map(problem => problem.check)
+      receipt.verification.problems = receipt.verification.problems.filter(problem => !ids.has(problem.id))
+      const error = receipt.failed.findLast(row => row.sources?.some(source => files.has(source.file)))?.error ?? (checks.length ? `${checks.join(', ')} changed during the move` : 'the move did not complete')
+      const covered = new Set(receipt.failed.flatMap(row => row.sources ?? []).map(source => source.file))
+      const rest = members.filter(member => !covered.has(member.file))
+      if (rest.length) receipt.failed.push({ id: rest[0].id, title: rest[0].title, error, ...failureIdentity({ members: rest }) })
+      unwound.push(...files)
+      await save()
+    }
+    if (units.length) delete receipt.localRecovery
+    if (unwound.length) receipt.verification.ok = !receipt.verification.problems.length && receipt.appendCheckpoint?.verification?.ok !== false
   }
+  const done = receipt.sessions.length
   if (inv.cloudRequested) {
     const current = await accounts(paths)
     const actual = receipt.fromAccounts.filter((source) => localCloudPending(current.find((account) => sameAccount(account, source))))
@@ -4482,18 +4438,16 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   context.check?.(true)
   receipt.finalizing = false
   delete receipt.appendCheckpoint
-  delete receipt.automaticCloudAttempt
   delete receipt.cloudAttempts
   receipt.failed = receipt.failed.flatMap(unheldFailures)
   await save()
-  if (inv.move.length || rescues.length || context.wholeOperation) {
+  context.sessionProgress?.(receipt)
+  if (inv.move.length || context.wholeOperation) {
     const rehomed = receipt.sessions.filter((row) => row.strategy === 'rehome').length
-    const rescuedCount = receipt.sessions.filter((row) => row.strategy === 'remote').length
     report('move', [
       `${count(done)} ${receipt.verification.ok ? '✓' : 'need verification'}`,
       `${count(receipt.sessions.reduce((n, row) => n + row.events, 0))} events`,
       rehomed ? `${count(rehomed)} zero-copy` : null,
-      rescuedCount ? `${count(rescuedCount)} rescued` : null,
       receipt.failed.length ? `${receipt.failed.length} failed` : null
     ].filter(Boolean).join(' | '))
     if (receipt.verification.ok) report('sidecars', `${count(receipt.sessions.reduce((n, r) => n + r.sidecars.count, 0))} files | unchanged ✓`)
@@ -4506,9 +4460,9 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   const superseded = receipt.superseded.length - retired
   const pendingCloud = openCloudChecks(receipt).length
   if (pendingCloud) report('pending', quantity(pendingCloud, 'source cloud check'))
-  if (!done && !receipt.superseded.length && !receipt.remote.length && !receipt.remotePending && !pendingCloud && !receipt.held?.length && !receipt.failed.some(row => row.blockedByLocal?.length)) {
+  if (!done && !unwound.length && !receipt.superseded.length && !receipt.remote.length && !receipt.remotePending && !pendingCloud && !receipt.held?.length && !receipt.failed.some(row => row.blockedByLocal?.length)) {
     await rm(file, { force: true })
-    return receipt.failed.length ? { file: null, receipt, summary: receiptSummary(receipt), checks: [], problems, ok: false, validationOnly: true } : null
+    return receipt.failed.length ? { file: null, receipt, summary: receiptSummary(receipt), checks: [], problems, ok: receiptOkay(receipt), validationOnly: true } : null
   }
   await save()
   if (receipt.sessions.length) {
@@ -4524,7 +4478,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
   if (retired) report('retired', `${count(retired)} source records → quarantine | chat messages unchanged`)
   const resultOkay = receiptOkay(receipt)
   const newerCloud = receipt.cloudChecks.reduce((total, check) => total + (check.later?.length ?? 0), 0)
-  return { file, receipt, summary: receiptSummary(receipt), checks: lines, problems: receipt.verification.problems, ok: resultOkay, complete: pendingCloud === 0 && !receipt.held.length, added: receipt.sessions.length - previousCount, rescuedTitles: rescued.rows.map(row => row.title), targetChanged: receipt.sessions.length > previousCount || receipt.superseded.slice(previousSuperseded).some((row) => !row.source), held: receipt.held, pendingCloud, pendingLabels: cloudCheckLabels(receipt), newerCloud, cloudChecked: inv.cloud?.checked ? 1 : 0 }
+  return { file, receipt, unwound, summary: receiptSummary(receipt), checks: lines, problems: receipt.verification.problems, ok: resultOkay, complete: pendingCloud === 0 && !receipt.held.length && !receipt.localStopped, added: receipt.sessions.length - previousCount, targetChanged: receipt.sessions.length > previousCount || receipt.superseded.slice(previousSuperseded).some((row) => !row.source), held: receipt.held, pendingCloud, pendingLabels: cloudCheckLabels(receipt), newerCloud, cloudChecked: inv.cloud?.checked ? 1 : 0 }
 }
 
 export function finishPending(paths, options = {}) {
@@ -4546,7 +4500,7 @@ export function finishPending(paths, options = {}) {
     const outstanding = openCloudChecks(receipt)
     if (!outstanding.length) {
       if (latest.projected) await saveJson(file, receipt)
-      const ok = finishOkay(receipt), complete = !receipt.held?.length && !legacyLocalFailures(receipt).length
+      const ok = finishOkay(receipt), complete = !receipt.held?.length && (!receipt.localStopped || Boolean(receipt.localCancelledAt))
       const nothing = ok && complete
       return { nothing, receipt, file, summary: receiptSummary(receipt), ok, complete, pendingCloud: 0, failed: (receipt.failed ?? []).filter(row => row.cloudAccount ? actionableCloudFailure(receipt, row) : nothing),
         notMoved: nothing ? [] : (receipt.failed ?? []).filter(row => !row.cloudAccount), problems: receipt.verification?.problems ?? [],
@@ -4567,7 +4521,8 @@ export function finishPending(paths, options = {}) {
     const retryRows = options.automatic ? budgetRetryRows(check, memory) : []
     const budgetRetry = retryRows.length ? [...new Set(retryRows.map(row => remoteId(row.id)).filter(Boolean))] : null
     const serial = Boolean(budgetRetry)
-    const preserved = new Set(options.automatic ? receipt.failed.filter(row => cloudTagged(row, check) && limitedFailure(check, row, memory)) : [])
+    const kept = keptCopy(receipt)
+    const preserved = new Set(receipt.failed.filter(row => cloudTagged(row, check) && (kept(row) || options.automatic && limitedFailure(check, row, memory))))
     if (active.at && check.loginAt !== active.at) check.authRetries = 0
     check.loginAt = active.at ?? null
     receipt.cloudAttempts = { ...receipt.cloudAttempts, [`${check.account}/${check.org}`]: now }
@@ -4600,12 +4555,6 @@ export function finishPending(paths, options = {}) {
     if (inv.cloud?.later.length) report('later', inv.cloud.later.map((row) => row.title).join('\n'))
     const save = () => saveJson(file, receipt)
     const beforeRemote = receipt.remote.length
-    const rescued = await rescueCloud(inv, receipt, to, paths, save, report)
-    const verification = await verify(rescued.rows, report)
-    receipt.verification ??= { ok: true, problems: [] }
-    receipt.verification.ok = receipt.verification.ok && verification.ok
-    receipt.verification.problems = [...(receipt.verification.problems ?? []), ...verification.problems.map((problem) => taggedCloudFailure(inv.cloud, problem))]
-    await save()
     await archiveCloud(inv, receipt, save, report)
     finishCloudAttempt(receipt, cloud, inv.cloud.later, inv.cloud.waiting, { memory, isolatedId: inv.cloud.isolatedId })
     await projectLocalFailures(receipt, paths)
@@ -4619,73 +4568,19 @@ export function finishPending(paths, options = {}) {
       receipt,
       summary: receiptSummary(receipt),
       ok,
-      complete: pendingCloud === 0 && !receipt.held?.length && !legacyLocalFailures(receipt).length,
+      complete: pendingCloud === 0 && !receipt.held?.length && (!receipt.localStopped || Boolean(receipt.localCancelledAt)),
       pendingCloud,
       pendingLabels: cloudCheckLabels(receipt),
-      rescued: rescued.rows.length,
-      rescuedTitles: rescued.rows.map(row => row.title),
       cloudArchived: completedRemote.length,
       cloudChecked: 1,
       checkedAccount: accountRef(check),
       newerCloud: inv.cloud.later.length,
       failed,
       notMoved: receipt.failed.filter(failure => !failure.cloudAccount),
-      problems: receipt.verification.problems,
-      reason: receipt.verification.ok === false && !receipt.verification.problems.length ? 'The previous move failed verification' : undefined,
-      checks: verification.lines,
-      restart: rescued.rows.length > 0 || completedRemote.length > 0
+      problems: receipt.verification?.problems ?? [],
+      reason: receipt.verification?.ok === false && !receipt.verification.problems?.length ? 'The previous move failed verification' : undefined,
+      restart: completedRemote.length > 0
     }
-  })
-}
-
-export function resumeLast(paths, options = {}) {
-  return locked(paths, async () => {
-    const latest = await latestReceipt(paths)
-    if (!latest || latest.corrupt) throw new Error('The previous move receipt is unavailable')
-    if (options.receiptFile && latest.file !== options.receiptFile) throw new Error('The previous move changed before resuming')
-    const { receipt, file } = latest
-    if (await recoveryPending(paths)) throw new Error('Recover the interrupted move before resuming')
-    if (receipt.localCancelledAt && !options.includeCancelled) return latest
-    const all = await accounts(paths), table = options.processes ?? processTable(paths.claudeApp)
-    const failures = (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
-    const held = [...(receipt.held ?? [])], converted = new Set()
-    for (const failure of failures) {
-      let matches = all.filter(account => receipt.fromAccounts.some(ref => sameAccount(account, ref)))
-        .flatMap(account => account.sessions.filter(row => row.id === failure.id).map(row => ({ ...row, account })))
-      if (failure.sources?.length) matches = matches.filter(row => failure.sources.some(source => sameAccount(source, row.account) && source.sessionId === row.record.sessionId))
-      if (matches.length !== 1) throw new Error(`Cannot identify the original source for ${failure.title || failure.id}`)
-      const row = matches[0]
-      if (!held.some(item => item.record === row.file)) held.push({ id: row.id, record: row.file, recordId: row.record.sessionId, title: row.title,
-        account: row.account.account, org: row.account.org, cwd: row.cwd,
-        sources: [{ id: row.id, file: row.file, account: row.account.account, org: row.account.org }],
-        workers: table.filter(worker => worker.worker && worker.desktopPid && processOwns(worker, row)).map(({ pid, started, desktopPid }) => ({ pid, started, desktopPid })) })
-      converted.add(failure)
-    }
-    let changed = converted.size > 0
-    for (const check of receipt.cloudChecks ?? []) {
-      if (['complete', 'blocked-local'].includes(check.status) || check.status === 'cancelled' && !options.includeCancelled) continue
-      const busy = (check.failures ?? []).filter(row => /not proven disconnected and idle/.test(row.error))
-      if (!busy.length && check.status !== 'cancelled') continue
-      if (check.status === 'cancelled') {
-        const ids = (check.failures ?? []).map(row => remoteId(row.id)).filter(Boolean)
-        if (ids.length) check.sessionIds = ids
-      }
-      check.waiting = []
-      check.status = 'pending'
-      receipt.failed = receipt.failed.filter(row => row.blockedByLocal?.length || !(cloudTagged(row, check) && busy.some(item => item.id === row.id)))
-      delete check.cancelledAt
-      delete check.failures
-      changed = true
-    }
-    if (changed) {
-      receipt.held = held
-      receipt.failed = receipt.failed.filter(row => !converted.has(row))
-      delete receipt.localCancelledAt
-      delete receipt.automaticCloudAttempt
-      delete receipt.cloudAttempts
-      await saveJson(file, receipt)
-    }
-    return latest
   })
 }
 
@@ -4699,8 +4594,8 @@ export function keepLocal(paths, options = {}) {
     const available = openCloudChecks(receipt)
     const checks = options.checks?.length ? available.filter(check => options.checks.includes(cloudCancelToken(file, check))) : available
     if (options.checks?.length && checks.length !== new Set(options.checks).size) return { refused: [], code: 'PENDING_CHANGED', reason: 'The pending source checks changed. Review them again.' }
-    const heldCancelled = options.checks?.length ? 0 : heldCount(receipt.held) + legacyLocalFailures(receipt).length
-    if (!checks.length && !heldCancelled) return { nothing: true, file, receipt }
+    const heldCancelled = options.checks?.length ? 0 : heldCount(receipt.held)
+    if (!checks.length && !heldCancelled && !receipt.localStopped) return { nothing: true, file, receipt }
     const unsafe = (receipt.verification?.problems ?? []).filter((problem) => checks.some((check) => cloudTagged(problem, check)))
     const refused = unsafe.map(problemText)
     const liveWorkers = workers()
@@ -4735,9 +4630,7 @@ export function keepLocal(paths, options = {}) {
       receipt.held = []
       receipt.localCancelledAt = new Date().toISOString()
     }
-    const blockedKeys = new Set(receipt.failed.flatMap(row => row.blockedByLocal ?? []))
-    receipt.failed = (receipt.failed ?? []).filter(row => options.checks?.length || row.error !== WORKER_OWNS || row.cloudAccount || row.sources?.some(source => blockedKeys.has(localFailureKey(source))))
-      .filter((failure) => failure.blockedByLocal?.length || !checks.some((check) => cloudTagged(failure, check)))
+    receipt.failed = (receipt.failed ?? []).filter((failure) => failure.blockedByLocal?.length || !checks.some((check) => cloudTagged(failure, check)))
     if (!openCloudChecks(receipt).length) receipt.cloudError = null
     await saveJson(file, receipt)
     return { file, receipt, summary: receiptSummary(receipt), cancelled: checks.length, heldCancelled, labels: checks.map((check) => check.label), ok: finishOkay(receipt), complete: !openCloudChecks(receipt).length && !receipt.held?.length,
@@ -4750,28 +4643,10 @@ export const move = (inv, to, paths, report = () => {}) => locked(paths, async (
   return reconciled ? { reconciled, recoveryRequired: true, ok: false } : transfer(inv, to, paths, report)
 })
 
-function restartCapacity(inv, plan, preparationMs, availableMs, sample = null) {
-  const held = new Set(plan.held.flatMap(row => row.sources.map(source => source.file)))
-  const rows = inv.sources.filter(row => held.has(row.file))
-  const recordBytes = rows.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row.record)), 0)
-  const transferMs = sample?.records ? rows.length ? sample.elapsedMs * Math.max(1, rows.length / sample.records, recordBytes / Math.max(1, sample.recordBytes)) : 0 : null
-  const estimatedMs = transferMs === null || preparationMs === null ? null : Math.ceil(preparationMs + transferMs)
-  const fits = (preparationMs ?? 0) + (transferMs ?? 0) >= availableMs ? false : estimatedMs === null ? null : true
-  return { records: rows.length, recordBytes, preparationMs: preparationMs === null ? null : Math.ceil(preparationMs), sample, estimatedMs,
-    availableMs: Math.max(0, Math.floor(availableMs)), fits, code: fits === false ? 'RESTART_CAPACITY' : null }
-}
-
 export function executeMove(from, to, paths, options = {}) {
   options = { ...options, cloudRequested: options.cloudRequested === true || Boolean(options.cloud) }
   const report = options.report ?? (() => {})
-  const now = options.io?.now ?? (() => performance.now())
   const approving = options.approve != null
-  const approvedAt = approving ? options.approvalStartedAt ?? now() : null
-  const preQuitCheck = () => {
-    if (approving && now() - approvedAt >= (options.io?.budget ?? RESTART_BUDGET) - (options.io?.reserve ?? REOPEN_RESERVE)) {
-      throw Object.assign(new Error('The restart budget was reached before shutdown. Claude was left running.'), { code: 'RESTART_CAPACITY' })
-    }
-  }
   return locked(paths, async () => {
     const inspect = () => options.io?.inspect?.() ?? options.processes ?? processTable(paths.claudeApp)
     const kind = options.recover ? 'recover' : options.undo ? 'undo' : from ? 'move' : options.finish ? 'finish' : 'refresh'
@@ -4804,14 +4679,12 @@ export function executeMove(from, to, paths, options = {}) {
     if (drift.changed.length) report('changed', `${quantity(drift.changed.length, 'moved session')} now has different metadata. Evidence saved with the receipt.`)
     if (options.finish && deferred?.file !== options.receiptFile) return { ok: false, reason: 'The pending move changed before its restart' }
     let chosen = saved?.selection ?? selection
-    const requestedAt = saved?.requestedAt ?? existing?.receipt.startedAt ?? options.requestedAt ?? new Date().toISOString()
-    const refuseExpired = (error, file = null, receipt = null) => {
-      if (error.code !== 'RESTART_CAPACITY') throw error
-      const recoveryRequired = Boolean(receipt && needsRecovery(receipt))
-      return { ok: false, code: error.code, reason: error.message, file, receipt,
-        capacity: { ...saved?.capacity, availableMs: 0, fits: false, code: error.code },
-        ...(recoveryRequired ? { recoveryRequired, reconciled: { title: 'Interrupted move', error: error.message } } : {}) }
+    const sessionFiles = new Set(receiptSummary(existing?.receipt ?? {}).notMoved.map(row => row.file).filter(Boolean))
+    const sessionProgress = receipt => {
+      const retired = retiredFiles(receipt ?? {})
+      report('sessions', 'Remaining sessions', { live: true, sessionTotal: sessionFiles.size, remainingCount: [...sessionFiles].filter(file => !retired.has(file)).length })
     }
+    const requestedAt = saved?.requestedAt ?? existing?.receipt.startedAt ?? options.requestedAt ?? new Date().toISOString()
     const prepareReport = (stage, text, extra = {}) => report(stage, text, extra.live ? { ...extra, preparatory: true } : extra)
     const replan = async (cloud = null, check = () => {}, preparatory = false) => {
       check()
@@ -4826,28 +4699,25 @@ export function executeMove(from, to, paths, options = {}) {
       const target = latest.find((account) => sameAccount(account, chosen.to))
       if (!target) throw new Error('Destination account is no longer available')
       const inv = await inventory(sources, target, paths, preparatory ? prepareReport : report, { cloud, cloudRequested: options.cloudRequested, cloudError: options.cloudError, requestedAt, writeCache: true, processes: inspect(), inspect, check })
+      for (const file of [...inv.sources.map(row => row.file), ...receiptSummary({ failed: inventoryFailures(inv) }).notMoved.map(row => row.file)]) sessionFiles.add(file)
+      sessionProgress(existing?.receipt)
       return { inv, target }
     }
-    const preparationStarted = now()
     const initialCloud = saved || existing ? null : options.cloud
-    let initial
-    try { initial = chosen ? await replan(initialCloud, preQuitCheck, approving) : null }
-    catch (error) { return refuseExpired(error, existing?.file, existing?.receipt) }
-    const preparationMs = initial && !initialCloud && !initial.inv.cacheStats.historyMisses && !initial.inv.cacheStats.manifestMisses ? now() - preparationStarted : null
+    const initial = chosen ? await replan(initialCloud, undefined, approving) : null
     if (options.finish && !canRestartWaiting({ cloudChecks: deferred.receipt.cloudChecks.filter(check => sameAccount(check, saved?.finishAccount ?? options.finishAccount)) }, inspect())) return { nothing: true, ok: true }
     const plan = saved ?? await restartPlan(initial?.inv ?? null, paths, inspect())
     if (plan && options.background) return { pendingLocal: true, ok: true }
     if (plan && !options.moveOnly) {
       if (!saved || saved.fingerprint !== plan.fingerprint) {
         const active = options.cloud ?? await signedIn(paths)
-        const proposal = { version: 1, ...plan, kind, resume: Boolean(existing), receiptFile, finishAccount: options.finishAccount ?? null, selection: chosen, requestedAt, createdAt: new Date().toISOString(), nonce: randomUUID(),
+        const proposal = { version: 1, ...plan, kind, resume: Boolean(existing), receiptFile, finishAccount: options.finishAccount ?? null, selection: chosen, remainingCount: chosen ? sessionFiles.size : null, requestedAt, createdAt: new Date().toISOString(), nonce: randomUUID(),
           deferredCloudSources: options.cloudRequested ? chosen?.from.filter((source) => (!active.account || source.account === active.account) && (!active.org || source.org === active.org)).map(accountRef) ?? [] : [] }
-        if (initial) proposal.capacity = restartCapacity(initial.inv, plan, preparationMs, restartMoveBudget(options.io?.budget, options.io?.reserve))
         proposal.token = sha(stable(proposal))
         await saveJson(planFile, proposal)
-        return { plan: proposal, ok: proposal.capacity?.fits !== false, code: proposal.capacity?.code ?? undefined }
+        return { plan: proposal, ok: true }
       }
-      let prepared = null, sample = null, pendingPlan = plan
+      let prepared = null, pendingPlan = plan
       if (initial) {
         const live = inspect(), desktop = appProcess(paths, live)
         if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) return { ok: false, code: 'RESTART_PLAN_CHANGED', reason: 'Open Claude sessions changed. Review the restart plan again.' }
@@ -4860,26 +4730,16 @@ export function executeMove(from, to, paths, options = {}) {
         const regular = { ...initial.inv, held, cloud: { checked: false, matches: [], blocked: [], waiting: [], later: [] },
           move: initial.inv.move.filter(row => !(row.members ?? [row]).some(source => heldFiles.has(source.file))) }
         if (regular.move.length || regular.there.length) {
-          const began = now()
           const at = existing?.receipt.at ?? stamp(), file = existing?.file ?? path.join(paths.state, `${at}.json`)
-          try { prepared = await transfer(regular, initial.target, paths, prepareReport, { existing, at, check: preQuitCheck }) }
-          catch (error) {
-            if (error.code !== 'RESTART_CAPACITY') throw error
-            const receipt = await readReceipt(file).catch(error => { if (error.code === 'ENOENT') return null; throw error })
-            return refuseExpired(error, receipt ? file : null, receipt)
-          }
+          prepared = await transfer(regular, initial.target, paths, prepareReport, { existing, at, sessionProgress })
           if (prepared?.recoveryRequired || prepared?.deferred || prepared?.receipt && needsRecovery(prepared.receipt)) return prepared
           if (prepared?.file) {
-            sample = { elapsedMs: now() - began, records: regular.move.length, recordBytes: regular.move.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row.record)), 0) }
             existing = { file: prepared.file, receipt: prepared.receipt }
-            const retired = new Set(prepared.receipt.superseded.filter(row => row.source).flatMap(row => row.moved.map(([file]) => file)))
+            const retired = retiredFiles(prepared.receipt)
             chosen = { ...chosen, from: chosen.from.map(source => ({ ...source, files: source.files.filter(file => !retired.has(file)) })) }
           }
         }
       }
-      const budget = (options.io?.budget ?? RESTART_BUDGET) - (now() - approvedAt)
-      const capacity = plan.capacity?.fits === false ? plan.capacity : initial ? restartCapacity(initial.inv, pendingPlan, preparationMs, restartMoveBudget(budget, options.io?.reserve), sample) : null
-      if (budget <= (options.io?.reserve ?? REOPEN_RESERVE) || capacity?.fits === false) return { ...prepared, ok: false, capacity, code: 'RESTART_CAPACITY', reason: 'The remaining move is not expected to fit this restart budget. Claude was left running.' }
       const restarted = await withDesktopRestart({ ...pendingPlan, receiptFile: existing?.file ?? plan.receiptFile }, paths, async (context) => {
         await unlink(planFile)
         if (options.recover) {
@@ -4897,11 +4757,11 @@ export function executeMove(from, to, paths, options = {}) {
         inv.held = pendingPlan.held.filter(row => row.sources.some(source => !ready.has(source.file)))
         inv.deferredCloudSources = saved.deferredCloudSources
         options.summary?.(inv)
-        const result = await transfer(inv, target, paths, report, { ...context, existing, refreshCloudChecks: prepared && !options.resume })
+        const result = await transfer(inv, target, paths, report, { ...context, existing, sessionProgress, refreshCloudChecks: prepared && !options.resume })
         return prepared && result ? { ...result, added: (prepared.added ?? 0) + (result.added ?? 0), targetChanged: prepared.targetChanged || result.targetChanged } : result
-      }, report, { ...options.io, budget })
-      return { ...(restarted.result ?? prepared ?? {}), capacity, ok: restarted.ok && restarted.result?.ok !== false,
-        restartOutcome: restarted.restart, restarted: restarted.restart.outcome === 'reopened', code: restarted.code, reason: restarted.error }
+      }, report, options.io)
+      return { ...(restarted.result ?? prepared ?? {}), ok: restarted.ok && restarted.result?.ok !== false,
+        restartOutcome: restarted.restart, restarted: restarted.restart.outcome === 'reopened', code: restarted.code === 'WORK_REFUSED' ? restarted.result?.code ?? restarted.code : restarted.code, reason: restarted.error ?? restarted.result?.reason }
     }
     if (!chosen && options.recover) return { reconciled: await reconcileFiles(paths, { ...options, inspect }), recoveryRequired: true, ok: false }
     if (!chosen && options.undo) return undoFiles(paths, { ...options, inspect })
@@ -4913,7 +4773,7 @@ export function executeMove(from, to, paths, options = {}) {
     const heldFiles = new Set(inv.held.flatMap((row) => row.sources.map((source) => source.file)))
     inv.move = inv.move.filter((row) => !(row.members ?? [row]).some((source) => heldFiles.has(source.file)))
     options.summary?.(inv)
-    const result = await transfer(inv, target, paths, report, { existing })
+    const result = await transfer(inv, target, paths, report, { existing, sessionProgress })
     return result ?? { nothing: true, ok: true }
   })
 }
@@ -4954,7 +4814,7 @@ async function completeActiveCloud(result, paths, options = {}) {
     if (!openCloudChecks(result.receipt).some(check => sameLogin(check, active) && cloudScope(options.cloud, check))) return result
     const finished = await finishPending(paths, { ...options, active, receiptFile: result.file })
     return { ...result, ...finished, restarted: result.restarted, restartOutcome: result.restartOutcome,
-      added: (result.added ?? 0) + (finished.rescued ?? 0), rescuedTitles: [...(result.rescuedTitles ?? []), ...(finished.rescuedTitles ?? [])], targetChanged: result.targetChanged || finished.restart, reason: finished.reason }
+      added: result.added ?? 0, targetChanged: result.targetChanged || finished.restart, reason: finished.reason }
   } catch (error) {
     return { ...result, ok: false, complete: false, code: error.code, reason: error.message }
   }
@@ -4965,6 +4825,8 @@ export async function finishWorkflow(paths, options = {}) {
   if (approving && (typeof options.approve !== 'string' || !/^[a-f0-9]{64}$/.test(options.approve))) return { ok: false, code: 'RESTART_APPROVAL_CHANGED', reason: 'Restart approval is missing or does not match the saved plan' }
   const recovery = await recoveryPending(paths)
   if (recovery) {
+    if (options.background && recovery.receipt?.localRecovery?.blocked) return { ...recovery, summary: receiptSummary(recovery.receipt), code: 'LOCAL_RECOVERY_BLOCKED', recoveryRequired: true, ok: false,
+      reconciled: { title: 'Move recovery blocked', error: recovery.receipt.localRecovery.blocked } }
     const taskTransfers = recovery.receipt ? recoveryFamilies(recovery.receipt) : []
     if (!options.background && taskTransfers.length && !recovery.receipt.remotePending && !recovery.receipt.remoteUndoing?.length &&
       (approving || await schedulerBusy(paths, taskTransfers.flatMap(row => [row.from, row.to]), options.io?.inspect?.() ?? options.processes))) {
@@ -4973,10 +4835,10 @@ export async function finishWorkflow(paths, options = {}) {
     return finishPending(paths, options)
   }
   if (!(await latestReceipt(paths))) return { nothing: true, ok: true }
-  await resumeLast(paths, { processes: options.processes, receiptFile: options.receiptFile })
   const deferred = await deferredWorkflow(paths)
   if (deferred?.mode === 'local') return completeActiveCloud(await finishHeld(paths, options), paths, options)
   if (deferred?.mode === 'undo') return finishPending(paths, options)
+  if (deferred?.mode === 'partial') return { ...deferred, summary: receiptSummary(deferred.receipt), ok: false, complete: false }
   if (approving) {
     if (!deferred || deferred.mode !== 'cloud') return { ok: false, reason: 'The pending move changed before its restart' }
     const restarted = await executeMove(null, null, paths, { ...options, finish: true, receiptFile: deferred.file })
@@ -5185,7 +5047,7 @@ function reporter(json) {
   let lastLive = 0
   return (stage, text, extra = {}) => {
     const now = Date.now()
-    const edge = extra.completed === 0 || extra.completed === extra.total
+    const edge = stage === 'sessions' || extra.completed === 0 || extra.completed === extra.total
     if (extra.live && !edge && now - lastLive < 100) return
     if (extra.live) lastLive = now
     const fields = {
@@ -5196,6 +5058,8 @@ function reporter(json) {
       ...(typeof extra.activity === 'string' ? { activity: extra.activity } : {}),
       ...(typeof extra.sourceId === 'string' ? { sourceId: extra.sourceId } : {}),
       ...(typeof extra.sourceLabel === 'string' ? { sourceLabel: extra.sourceLabel } : {}),
+      ...(Number.isSafeInteger(extra.sessionTotal) && extra.sessionTotal >= 0 && Number.isSafeInteger(extra.remainingCount) && extra.remainingCount >= 0 && extra.remainingCount <= extra.sessionTotal
+        ? { sessionTotal: extra.sessionTotal, remainingCount: extra.remainingCount } : {}),
       ...(Number.isInteger(extra.moved) ? { moved: extra.moved } : {}),
       ...(Number.isInteger(extra.completed) ? { completed: extra.completed } : {}),
       ...(Number.isInteger(extra.total) ? { total: extra.total } : {})
@@ -5261,20 +5125,19 @@ async function menubar(paths, remove, snapshot) {
     }
     return `snapshot written | ${output}`
   }
-  const key = sha((await readFile(source, 'utf8')) + (await readJson(path.join(HERE, 'package.json'))).version)
+  const key = sha((await readFile(source, 'utf8')) + VERSION)
   const built = path.join(app, 'Contents/Resources/build.sha256')
   if ((await readFile(built, 'utf8').catch(() => '')) !== key) {
     const fresh = `${app}.building`
     await rm(fresh, { recursive: true, force: true })
     await mkdir(path.join(fresh, 'Contents/MacOS'), { recursive: true })
     await mkdir(path.join(fresh, 'Contents/Resources'), { recursive: true })
-    const { version } = await readJson(path.join(HERE, 'package.json'))
     const info = {
       CFBundleIdentifier: LABEL,
       CFBundleName: 'Claude Transplant',
       CFBundleExecutable: 'Claude Transplant',
       CFBundlePackageType: 'APPL',
-      CFBundleShortVersionString: version,
+      CFBundleShortVersionString: VERSION,
       LSMinimumSystemVersion: '13.0',
       LSUIElement: true,
       NSHighResolutionCapable: true
@@ -5288,7 +5151,7 @@ async function menubar(paths, remove, snapshot) {
   }
   const script = path.join(app, 'Contents/Resources/transplant.js')
   await copyFile(path.join(HERE, 'transplant.js'), script)
-  await writeFile(path.join(app, 'Contents/Resources/package.json'), jsonText({ type: 'module', version: (await readJson(path.join(HERE, 'package.json'))).version }))
+  await writeFile(path.join(app, 'Contents/Resources/package.json'), jsonText({ type: 'module', version: VERSION }))
   const config = jsonText({ node: process.execPath, script, nodeArgs: [`--max-old-space-size=${menubarHeapMiB()}`] })
   await writeFile(path.join(paths.state, 'menubar.json'), config)
   await writeFile(path.join(app, 'Contents/Resources/menubar.json'), config)
@@ -5336,40 +5199,27 @@ function parse(argv) {
 }
 
 async function main(argv) {
-  const began = performance.now()
   const requestedAt = new Date().toISOString()
   const args = parse(argv)
   if (args.help) return process.stdout.write(HELP)
-  if (args.version) return process.stdout.write(`${(await readJson(path.join(HERE, 'package.json'))).version}\n`)
+  if (args.version) return process.stdout.write(`${VERSION}\n`)
   if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('Node 22 or newer is required')
   const paths = layout()
   const out = process.stdout
   const emit = (o) => out.write(`${JSON.stringify(o)}\n`)
-  const showCapacity = result => {
-    process.exitCode = 1
-    const receipt = result.receipt, recoveryRequired = Boolean(result.recoveryRequired || receipt && needsRecovery(receipt))
-    const moved = recoveryRequired ? receipt?.appendCheckpoint?.sessions ?? 0 : receipt?.sessions.length ?? 0
-    return args.json ? emit({ done: true, ok: false, complete: false, code: result.code, capacity: result.capacity, retryable: false,
-      receipt: result.file, moved, summary: receipt ? { ...receiptSummary(receipt), moved } : undefined, recoveryRequired,
-      heldCount: heldCount(receipt?.held), waiting: receipt ? waitingSessions(receipt) : [], pendingCloud: receipt ? openCloudChecks(receipt).length : 0,
-      sourceLabels: receipt?.fromAccounts.map(source => source.label), reason: result.reason }) : out.write(`${moved ? `${quantity(moved, 'session moved', 'sessions moved')}. ` : ''}${result.reason}\n`)
-  }
   const showPlan = async (plan) => {
     const prior = plan.receiptFile ? await readReceipt(plan.receiptFile).catch(() => null) : null
-    if (plan.capacity?.fits === false) process.exitCode = 1
-    if (args.json) return emit({ plan: true, ...plan, ...(plan.capacity?.fits === false ? { ok: false, code: 'RESTART_CAPACITY' } : {}), heldCount: heldCount(plan.held), remainingCount: plan.selection?.from.reduce((sum, source) => sum + source.files.length, 0) ?? null,
+    if (args.json) return emit({ plan: true, ...plan, heldCount: heldCount(plan.held), remainingCount: plan.remainingCount ?? plan.selection?.from.reduce((sum, source) => sum + source.files.length, 0) ?? null,
       moved: prior?.sessions.length ?? 0, undoRecovery: Boolean(prior?.undoing), sourceLabels: plan.selection?.from.map(source => source.label) ?? prior?.fromAccounts?.map(source => source.label) ?? [] })
-    if (plan.capacity?.fits === false) return out.write('  capacity    This move is not expected to fit the restart budget. Claude will stay running.\n')
     const selection = plan.kind === 'undo' ? 'undo' : plan.kind === 'recover' ? 'finish' : plan.resume ? 'finish' : plan.selection ? `${plan.selection.from.map((a) => `--from "${a.account} ${a.org}"`).join(' ')} --to "${plan.selection.to.account} ${plan.selection.to.org}"` : 'restart'
     out.write(`  restart     Claude Desktop must close before this operation\n  affected    ${[...new Set(plan.affected.map((row) => row.title))].join(', ') || 'no Code workers'}\n  approve     claude-transplant ${selection} --restart-approved ${plan.token}${args.cloud ? ' --cloud' : ''}\n`)
   }
   const showMove = async (result) => {
     const report = reporter(args.json)
     if (result?.plan) return showPlan(result.plan)
-    if (result?.code === 'RESTART_CAPACITY') return showCapacity(result)
     if (result?.reason && !result.receipt) {
       process.exitCode = 1
-      return args.json ? emit({ done: true, ok: false, code: result.code, retryable: retryableCode(result.code), reason: result.reason, note: result.reason, restartOutcome: result.restartOutcome, capacity: result.capacity }) : out.write(`${result.reason}\n`)
+      return args.json ? emit({ done: true, ok: false, code: result.code, retryable: retryableCode(result.code), reason: result.reason, note: result.reason, restartOutcome: result.restartOutcome }) : out.write(`${result.reason}\n`)
     }
     if (result?.deferred) {
       const labels = result.deferred.sources.map((source) => source.label)
@@ -5382,7 +5232,7 @@ async function main(argv) {
       process.exitCode = 1
       report('reconciled', `${result.reconciled.title} | ${result.reconciled.error}`)
       return args.json
-        ? emit({ done: true, ok: false, code: result.code, recoveryRequired: true, reconciled: result.reconciled })
+        ? emit({ done: true, ok: false, code: result.code, recoveryRequired: true, reconciled: result.reconciled, reason: result.reason ?? result.reconciled?.error, receipt: result.file, summary: result.receipt ? receiptSummary(result.receipt) : undefined })
         : out.write('  move        not run, run it again after reviewing the recovery\n')
     }
     if (!result || result.nothing || !result.receipt) return args.json ? emit({ done: true, ok: result?.ok ?? true, moved: 0, restarted: result?.restarted }) : out.write('  nothing to move\n')
@@ -5393,18 +5243,21 @@ async function main(argv) {
     const refresh = !receipt.held?.length && sameAccount(active, receipt.toAccount) && result.targetChanged === true
     const note = result.reason ?? (result.restarted ? 'Claude Desktop reopened after the move' : refresh ? NOTE : null)
     if (args.json) {
-      return emit({ done: true, ok, complete: result.complete, receipt: file, summary: receiptSummary(receipt), moved: receipt.sessions.length,
+      return emit({ done: true, ok, complete: result.complete, partial: Boolean(receipt.localStopped && !receipt.localCancelledAt), receipt: file, summary: receiptSummary(receipt), moved: receipt.sessions.length,
         destinationLabel: receipt.to, heldCount: heldCount(receipt.held), heldAutomatic: Boolean(receipt.held?.length) && receipt.held.every(row => row.release === 'worker'),
-        sourceLabels: receipt.fromAccounts.map(source => source.label), rescuedTitles: receipt.sessions.filter(row => row.strategy === 'remote' && typeof row.title === 'string').map(row => row.title),
+        sourceLabels: receipt.fromAccounts.map(source => source.label),
         code: result.code ?? (!ok ? problems.length ? 'LOCAL_VERIFICATION_FAILED' : 'MOVE_BLOCKED' : null),
         retryable: retryableCode(result.code),
-        rescued: receipt.sessions.filter((row) => row.strategy === 'remote').length, cloudArchived: receipt.remote.length, newerCloud: result.newerCloud, pendingCloud: result.pendingCloud, pendingLabels: result.pendingLabels, held: result.held, waiting: waitingSessions(receipt), superseded: receipt.superseded.length - retired, retired, failed: receipt.failed, problems, checks, note, restart: refresh && !result.restarted, restarted: result.restarted, restartOutcome: result.restartOutcome, capacity: result.capacity })
+        cloudArchived: receipt.remote.length, newerCloud: result.newerCloud, pendingCloud: result.pendingCloud, pendingLabels: result.pendingLabels, held: result.held, waiting: waitingSessions(receipt), superseded: receipt.superseded.length - retired, retired, failed: receipt.failed, problems, checks, note, restart: refresh && !result.restarted, restarted: result.restarted, restartOutcome: result.restartOutcome })
     }
+    const failure = (f) => `${f.title || f.id} | ${f.error}`, kept = keptCopy(receipt)
     const troubles = [
-      ...receipt.failed.map((f) => `${f.title || f.id} | ${f.error}`),
+      ...receipt.failed.filter(f => !kept(f)).map(failure),
       ...problems.map((p) => `${p.title ? `${p.title} | ` : ''}${short(p.id)} | ${p.check} check failed`)
     ]
     if (troubles.length) out.write(`  failed      ${troubles.join('\n              ')}\n`)
+    const copies = receipt.failed.filter(kept).map(failure)
+    if (copies.length) out.write(`  kept        ${copies.join('\n              ')}\n`)
     if (!file) return
     out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
   }
@@ -5418,12 +5271,12 @@ async function main(argv) {
     if (!result.ok || error) process.exitCode = 1
     if (args.json) return emit({ swept: true, ok: result.ok && !error, error, code: result.code ?? result.result?.code, retryable: retryableCode(result.code ?? result.result?.code), changed: result.verification?.changed ?? [], recovered: result.recovered,
       receipt: result.result?.file ?? result.verification?.receipt, summary: result.result?.summary ?? result.verification?.summary, failed, notMoved, problems,
-      moved: result.result?.added ?? result.result?.rescued ?? 0, rescuedTitles: result.result?.rescuedTitles, destinationLabel: result.result?.receipt?.to,
+      moved: result.result?.added ?? 0, destinationLabel: result.result?.receipt?.to,
       pendingLocal: result.result?.pendingLocal, restart: result.refreshRequired, cloudChecked: result.result?.cloudChecked ?? 0, cloudArchived: result.result?.cloudArchived ?? 0, complete: result.result?.complete ?? result.complete })
     return out.write(error ? `${error}\n` : `${quantity(result.verification?.changed.length ?? 0, 'metadata change')} detected\n`)
   }
   if (args.cmd === 'restart') {
-    const result = await executeMove(null, null, paths, { approve: args.restartApproved, approvalStartedAt: began, report: reporter(args.json) })
+    const result = await executeMove(null, null, paths, { approve: args.restartApproved, report: reporter(args.json) })
     if (result.plan) return showPlan(result.plan)
     if (!result.ok) process.exitCode = 1
     const note = result.reason ?? (result.restarted ? 'Claude Desktop restarted' : 'Claude Desktop is not running')
@@ -5435,7 +5288,7 @@ async function main(argv) {
     if (args.json) {
       if (result.nothing) return emit({ nothing: true })
       if (result.recoveryRequired) return emit({ done: true, ok: false, recoveryRequired: true, reason: 'Recovery must finish before cloud checks can be cancelled' })
-      if (result.refused) return emit({ refused: result.refused, code: result.code ?? 'LOCAL_VERIFICATION_FAILED', reason: result.reason ?? 'Keep local refused because a rescued target failed verification' })
+      if (result.refused) return emit({ refused: result.refused, code: result.code ?? 'LOCAL_VERIFICATION_FAILED', reason: result.reason ?? 'Moved sessions changed since the move' })
       return emit({ done: true, ok: result.ok, complete: result.complete, keptLocal: result.cancelled, heldCancelled: result.heldCancelled, labels: result.labels, sourceLabels: result.labels, summary: result.summary, failed: result.failed, notMoved: result.notMoved, problems: result.receipt.verification?.problems ?? [] })
     }
     if (result.nothing) return out.write('nothing pending\n')
@@ -5446,34 +5299,31 @@ async function main(argv) {
   if (args.cmd === 'finish') {
     const report = reporter(args.json)
     const deferred = await deferredWorkflow(paths)
-    const result = await finishWorkflow(paths, { approve: args.restartApproved, approvalStartedAt: began, moveOnly: args.moveOnly, report })
+    const result = await finishWorkflow(paths, { approve: args.restartApproved, moveOnly: args.moveOnly, report })
     if (result.plan) return showPlan(result.plan)
-    if (result.code === 'RESTART_CAPACITY') return showCapacity(result)
     if (result.ok === false || result.recoveryRequired || result.restoreProblems?.length || (!result.nothing && result.failed?.length) || result.problems?.length || result.pendingUndo?.length) process.exitCode = 1
     if (args.json) {
       if (result.nothing) return emit({ nothing: true, summary: result.summary, failed: result.failed ?? [], problems: result.problems ?? [] })
-      if (result.reconciled) return emit({ done: true, ok: false, recoveryRequired: true, reconciled: result.reconciled })
+      if (result.reconciled) return emit({ done: true, ok: false, code: result.code, recoveryRequired: true, reconciled: result.reconciled, reason: result.reason ?? result.reconciled?.error, receipt: result.file, summary: result.receipt ? receiptSummary(result.receipt) : undefined })
       if (result.recoveryRequired) return emit({ done: true, ok: false, recoveryRequired: true, reason: 'Recovery remains pending' })
       if (result.dest) return emit({ undone: result.receipt.at, sessions: result.receipt.sessions.length, restored: retiredCount(result.receipt), cloudRestored: result.receipt.remote?.length ?? 0, restart: Boolean(result.receipt.sessions.length || result.receipt.superseded?.length || result.receipt.remote?.length) })
       return emit({
         done: true,
         ok: result.ok,
         complete: result.complete,
+        partial: Boolean(result.receipt?.localStopped && !result.receipt.localCancelledAt),
         receipt: result.file,
         summary: result.summary,
         moved: result.receipt?.sessions.length ?? 0,
         destinationLabel: result.receipt?.to,
         heldCount: heldCount(result.receipt?.held),
         heldAutomatic: Boolean(result.receipt?.held?.length) && result.receipt.held.every(row => row.release === 'worker'),
-        rescuedTitles: result.receipt?.sessions.filter(row => row.strategy === 'remote' && typeof row.title === 'string').map(row => row.title),
         code: result.code ?? (result.restoreProblems?.length ? 'UNDO_BLOCKED' : null),
-        capacity: result.capacity,
         retryable: retryableCode(result.code),
         held: result.receipt?.held ?? [],
         waiting: result.receipt ? waitingSessions(result.receipt) : [],
         reason: result.reason,
         restarted: result.restarted,
-        rescued: result.rescued ?? 0,
         cloudArchived: result.cloudArchived ?? 0,
         cloudRestored: result.remoteRestored ?? 0,
         undoPartial: (result.remoteRestored ?? 0) > 0,
@@ -5502,7 +5352,7 @@ async function main(argv) {
     return out.write(result.complete ? '  cloud       all source checks complete\n' : `  pending     ${result.pendingCloud} cloud checks${pending}\n`)
   }
   if (args.cmd === 'undo') {
-    const result = await undo(paths, { approve: args.restartApproved, approvalStartedAt: began, report: reporter(args.json) })
+    const result = await undo(paths, { approve: args.restartApproved, report: reporter(args.json) })
     if (result.plan) return showPlan(result.plan)
     if (result.reason && !result.receipt) {
       process.exitCode = 1
@@ -5541,13 +5391,10 @@ async function main(argv) {
     if (result.restoreProblems) {
       return out.write(`  refused | source recovery is incomplete | nothing changed\n${result.restoreProblems.map((t) => `    ${t}`).join('\n')}\n`)
     }
-    const rescued = receipt.sessions.filter((row) => row.strategy === 'remote')
-    const rehomed = receipt.sessions.length - rescued.length
     const back = retiredCount(receipt)
     const cloudBack = receipt.remote?.length ?? 0
     return out.write([
-      rehomed ? `  ${count(rehomed)} desktop records → quarantine` : null,
-      rescued.length ? `  ${count(rescued.length)} rescued remote transcripts | ${count(rescued.length)} desktop records → quarantine` : null,
+      receipt.sessions.length ? `  ${count(receipt.sessions.length)} desktop records → quarantine` : null,
       back ? `  ${count(back)} source records put back` : null,
       cloudBack ? `  ${count(cloudBack)} cloud mirrors restored` : null,
       `  chat messages preserved ✓${receipt.sessions.some(row => row.bridgeAppend) ? ' | local bridge metadata preserved or restored' : ''}`,
@@ -5559,8 +5406,13 @@ async function main(argv) {
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
     if (args.json) {
-      const latest = await latestReceipt(paths)
-      let recoveryProblem = latest?.corrupt ? { receipt: latest.file, error: 'The move record is unreadable' } : null
+      let recoveryProblem = null
+      const latest = await latestReceipt(paths).catch(error => {
+        if (error.code !== 'OLDER_MOVE') throw error
+        recoveryProblem = { receipt: error.file, error: error.message, code: error.code }
+        return null
+      })
+      recoveryProblem ??= latest?.corrupt ? { receipt: latest.file, error: 'The move record is unreadable' } : latest?.receipt?.localRecovery?.blocked ? { receipt: latest.file, error: latest.receipt.localRecovery.blocked } : null
       const deferred = await deferredWorkflow(paths, latest).catch(error => {
         recoveryProblem = { receipt: latest.file, error: error.message }
         return null
@@ -5569,6 +5421,7 @@ async function main(argv) {
       const identity = deferred ? await signedIn(paths, table) : null
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
+      const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? latest.receipt.to : null
       return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
@@ -5598,6 +5451,7 @@ async function main(argv) {
           kept: Boolean(latest?.receipt?.cloudChecks?.some(check => sameAccount(check, { account, org }) && check.status === 'cancelled')),
           receiptMoved: summary?.moved ?? null,
           receiptSummary: summary,
+          receiptDone: done,
           receiptDestination: source ? `${deferred.receipt.toAccount.account}/${deferred.receipt.toAccount.org}` : null,
           pendingFailures: source?.failures ?? [],
           receipt: latest?.file ?? null,
@@ -5656,7 +5510,6 @@ async function main(argv) {
       inv.there.length ? `${count(inv.there.length)} already there` : null,
       inv.blocked.length ? `${count(inv.blocked.length)} blocked` : null,
       inv.cloud?.matches.length ? `${count(inv.cloud.matches.length)} cloud mirrors` : null,
-      inv.cloud?.matches.some((match) => match.target.kind === 'rescue') ? `${count(inv.cloud.matches.filter((match) => match.target.kind === 'rescue').length)} cloud rescue` : null,
       inv.cloud?.blocked.length ? `${count(inv.cloud.blocked.length)} cloud blocked` : null,
       inv.cloud?.waiting?.length ? `${count(inv.cloud.waiting.length)} remote sessions open` : null,
       inv.cloud?.later.length ? `${count(inv.cloud.later.length)} newer cloud sessions left for next move` : null,
@@ -5670,7 +5523,7 @@ async function main(argv) {
     if (p) {
       let text = `${p.receipt?.sessions?.length ?? 0} sessions | interrupted finalization, reconciled on the next move`
       if (p.corrupt) text = `${p.name} | corrupt receipt, set aside on the next move`
-      else if (p.receipt.pending) text = `${p.receipt.pending.title} | interrupted ${p.receipt.pending.strategy === 'rehome' ? 'record placement' : 'remote rescue'}, reconciled on the next move`
+      else if (p.receipt.pending) text = `${p.receipt.pending.title} | interrupted record placement, reconciled on the next move`
       else if (p.receipt.retiring) text = `${p.receipt.retiring.length} entries | interrupted retirement, reconciled on the next move`
       else if (p.receipt.undoing) text = `${p.receipt.undoing.length} sessions | interrupted undo, reconciled on the next move`
       report('pending', text)
@@ -5684,10 +5537,10 @@ async function main(argv) {
     const failures = inventoryFailures(inv)
     if (failures.length) process.exitCode = 1
     return args.json
-      ? emit({ done: true, ok: !failures.length, dry: true, moved: 0, planned: inv.move.length, cloudPlanned: inv.cloud.matches.length, cloudRescues: inv.cloud.matches.filter((match) => match.target.kind === 'rescue').length, pendingCloud: inv.pendingCloud, retiring, failed: failures })
+      ? emit({ done: true, ok: !failures.length, dry: true, moved: 0, planned: inv.move.length, cloudPlanned: inv.cloud.matches.length, pendingCloud: inv.pendingCloud, retiring, failed: failures })
       : out.write(inv.move.length || retiring ? '  dry run     nothing written\n' : failures.length ? '  dry run     blocked records must be resolved\n' : '  nothing to move\n')
   }
-  const result = await executeMove(from, to, paths, { report, cloud, cloudRequested: args.cloud, cloudError, requestedAt, approve: args.restartApproved, approvalStartedAt: began, moveOnly: args.moveOnly, summary })
+  const result = await executeMove(from, to, paths, { report, cloud, cloudRequested: args.cloud, cloudError, requestedAt, approve: args.restartApproved, moveOnly: args.moveOnly, summary })
   return showMove(await completeActiveCloud(result, paths, { cloud, report }))
 }
 
