@@ -57,7 +57,7 @@ From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (appe
 
 - When the active account is known, TO defaults to the most recently used other account and every other account starts as a source. Accounts with no sessions and no email stay hidden. Uncheck accounts to leave behind, Reset clears both columns.
 - The last move's result stays until the next move or Reset, even after a restart.
-- Open chats offer Restart Claude and move, and Finish the move continues pending work. Small links offer Undo last move, Keep moved sessions while work remains, and Show restart warnings when they are off. When the remaining work can't move, Keep and Undo are buttons.
+- Open chats offer Restart Claude and move, and Finish the move continues pending work. Small links offer Undo last move, Keep moved sessions while work remains, Show restart warnings when they are off, and Update to X when npm has a newer version. When the remaining work can't move, Keep and Undo are buttons.
 - Held sessions move once their workers stop. Cloud cleanup retries under the signed-in login, and cleanup for another login waits for that sign-in unless Leave old copies and move skips it. While Claude starts, the panel says Waiting for Claude instead of asking you to sign in.
 - Starts at login, shows percent and sessions left while moving, and notifies when done.
 - Bundles its own CLI, so rerun `menubar` after upgrading.
@@ -109,6 +109,7 @@ Every command may write the tool's own folder, `~/Library/Application Support/cl
 | a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control copies archived or restored there |
 | `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
 | Move in the menubar | the same as a move with `--cloud` |
+| Update in the menubar | a version request to `registry.npmjs.org` at launch and every 6 hours, and on click the same as `npx claude-transplant@X menubar` |
 | `menubar --snapshot <png>` | that image file |
 
 Command and flag names are stable. Renames get a deprecation release first.
