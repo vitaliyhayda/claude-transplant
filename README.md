@@ -60,7 +60,7 @@ From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (appe
 - Open chats offer Restart Claude and move, and Finish the move continues pending work. Small links offer Undo last move, Keep moved sessions while work remains, and Show restart warnings when they are off. When the remaining work can't move, Keep and Undo are buttons.
 - Held sessions move once their workers stop. Cloud cleanup retries under the signed-in login, and cleanup for another login waits for that sign-in unless Leave old copies and move skips it. While Claude starts, the panel says Waiting for Claude instead of asking you to sign in.
 - Starts at login, shows percent and sessions left while moving, and notifies when done.
-- Bundles its own CLI, so rerun `menubar` after upgrading.
+- Bundles its own CLI, so rerun `menubar` after upgrading, or click Update to X when npm has a newer version, checked every 6 hours.
 - The app binary's `--demo <dir>` renders the frames of the animation above.
 
 ## CLI
@@ -107,7 +107,7 @@ Every command may write the tool's own folder, `~/Library/Application Support/cl
 | move, `finish`, `sweep`, `undo` | Desktop session records and scheduled task registries under `claude-code-sessions`, local Remote Control bridge metadata in shared transcripts |
 | `--restart-approved <token>` | quits and reopens Claude Desktop around the operation |
 | a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control copies archived or restored there |
-| `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
+| `menubar`, `menubar --remove` | the app bundle in the tool's folder, a LaunchAgent under `~/Library/LaunchAgents`, and the app's version request to `registry.npmjs.org` every 6 hours |
 | Move in the menubar | the same as a move with `--cloud` |
 | `menubar --snapshot <png>` | that image file |
 

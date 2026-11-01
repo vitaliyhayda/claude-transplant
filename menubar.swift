@@ -316,6 +316,9 @@ final class Model: ObservableObject {
     private var dismissed = UserDefaults.standard.string(forKey: "dismissedReceipt") ?? ""
     private var undone = UserDefaults.standard.string(forKey: "undoneReceipt") ?? ""
     private var notifyWhenDone = false
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    @Published var newer: String?
+    @Published private(set) var updating = false
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var moveProgress = MoveProgress()
@@ -361,9 +364,11 @@ final class Model: ObservableObject {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         refresh()
+        checkForUpdate()
         poller = Timer.publish(every: 15, on: .main, in: .common).autoconnect().sink { [weak self] _ in
             guard let self, !self.running, !self.sweeping else { return }
             self.refresh()
+            self.checkForUpdate()
         }
         progressTimer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect().sink { [weak self] _ in
             guard let self, self.running else { return }
@@ -402,14 +407,48 @@ final class Model: ObservableObject {
     }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
     var recoveryProblem: RecoveryProblem? { accounts.compactMap(\.recoveryProblem).first }
-    var canMutate: Bool { !running && recoveryProblem == nil && !recoveryBlocked }
+    var canMutate: Bool { !running && !updating && recoveryProblem == nil && !recoveryBlocked }
     var undoPending: Bool { pendingAccounts.contains { $0.pending == "undo" } }
     var directActions: Bool { screen == .blocked }
     var canKeepLocal: Bool { canMutate && (partialResult || pendingAccounts.contains { ["cloud", "local", "partial"].contains($0.pending ?? "") }) }
     var links: [(title: String, action: @MainActor () -> Void)] {
         let all: [(Bool, String, @MainActor () -> Void)] = [(canMutate && !undoPending && !directActions && max(latestReceipt ?? "", retryReceipt ?? "") > undone, "Undo last move", undo),
-            (canKeepLocal && !directActions, "Keep moved sessions", stopHere), (skipRestartWarning, "Show restart warnings", restoreRestartWarning)]
+            (canKeepLocal && !directActions, "Keep moved sessions", stopHere), (skipRestartWarning, "Show restart warnings", restoreRestartWarning),
+            (canUpdate, "Update to \(newer ?? "")", update)]
         return all.filter { $0.0 }.map { ($0.1, $0.2) }
+    }
+    private var canUpdate: Bool { Model.release(newer) != nil && canMutate && pendingAccounts.isEmpty && !directActions }
+    static func release(_ version: String?) -> [Int]? {
+        let parts = (version ?? "").split(separator: ".", omittingEmptySubsequences: false)
+        let numbers = parts.compactMap { $0.allSatisfy { $0.isASCII && $0.isNumber } ? Int($0) : nil }
+        return parts.count == 3 && numbers.count == 3 ? numbers : nil
+    }
+
+    func checkForUpdate(at now: Date = Date()) {
+        let time = now.timeIntervalSince1970
+        guard abs(time - UserDefaults.standard.double(forKey: "updateCheckedAt")) >= 6 * 3600 else { return }
+        UserDefaults.standard.set(time, forKey: "updateCheckedAt")
+        latest { [weak self] version in
+            guard let self, let version else { return }
+            newer = Model.release(version).flatMap { latest in Model.release(Model.version)?.lexicographicallyPrecedes(latest) } == true ? version : nil
+        }
+    }
+
+    func update() {
+        guard canUpdate, let version = newer, let config else { return }
+        let folder = (node(config.node) as NSString).deletingLastPathComponent
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: folder + "/npx")
+        process.arguments = ["-y", "claude-transplant@" + version, "menubar"]
+        process.environment = ProcessInfo.processInfo.environment.merging(["PATH": folder + ":" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")]) { $1 }
+        updating = true
+        note = "Updating to \(version)."
+        launch(process) { [weak self] status, error in
+            guard let self else { return }
+            updating = false
+            note = status == 0 ? "" : "Update to \(version) failed."
+            if status != 0 { lines.append(("reason", error)) }
+        }
     }
     var pendingReady: Bool { canMutate && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.pending == "recovery" || $0.pending == "undo" && $0.signedIn == true ? "finish" : "wait")) } && (config != nil || demo) }
     var pendingButtonTitle: String {
@@ -1137,6 +1176,10 @@ final class Model: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node(config.node))
         process.arguments = config.arguments(args)
+        launch(process, timeout: args.first == "accounts", line: line, done: done)
+    }
+
+    private func launch(_ process: Process, timeout: Bool = false, line: @escaping (String) -> Void = { _ in }, done: @escaping (Int32, String) -> Void) {
         let pipe = Pipe()
         let errorURL = FileManager.default.temporaryDirectory.appendingPathComponent("claude-transplant-\(UUID().uuidString).err")
         FileManager.default.createFile(atPath: errorURL.path, contents: nil)
@@ -1149,7 +1192,7 @@ final class Model: ObservableObject {
             done(1, error.localizedDescription)
             return
         }
-        if args.first == "accounts" {
+        if timeout {
             DispatchQueue.global().asyncAfter(deadline: .now() + 60) { if process.isRunning { process.terminate() } }
         }
         DispatchQueue.global().async {
@@ -1172,6 +1215,19 @@ final class Model: ObservableObject {
             let status = process.terminationStatus
             DispatchQueue.main.async { done(status, error) }
         }
+    }
+
+    private func latest(_ done: @escaping (String?) -> Void) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 10
+        configuration.httpShouldSetCookies = false
+        configuration.httpAdditionalHeaders = ["User-Agent": "claude-transplant", "Accept-Language": "en"]
+        let session = URLSession(configuration: configuration)
+        session.dataTask(with: URL(string: "https://registry.npmjs.org/claude-transplant/latest")!) { data, _, _ in
+            let version = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["version"] as? String
+            DispatchQueue.main.async { done(version) }
+        }.resume()
+        session.finishTasksAndInvalidate()
     }
 }
 
@@ -1421,7 +1477,7 @@ struct Panel: View {
                     Button(link.title) { link.action() }.buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+                if let version = Model.version {
                     Text("v\(version)").font(.system(size: 10)).foregroundStyle(.secondary)
                         .accessibilityLabel("Version \(version)")
                 }
