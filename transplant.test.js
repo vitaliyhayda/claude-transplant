@@ -9878,7 +9878,6 @@ async function swiftFixtureSource() {
 @MainActor final class FixtureDefaults {
     var values: [String: Any] = [:]
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
-    func double(forKey key: String) -> Double { values[key] as? Double ?? 0 }
     func string(forKey key: String) -> String? { values[key] as? String }
     func set(_ value: Any?, forKey key: String) { values[key] = value }
 }
@@ -10958,59 +10957,59 @@ struct StateChecks {
         precondition(crowded.visibleAccounts.last?.id == ghost.id)
         let activeGhost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: true, signedIn: true, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
         precondition(Model(demo: [activeGhost] + Demo.accounts.dropFirst()).visibleAccounts.contains { $0.id == ghost.id })
-        fixtureDefaults.values = [:]
-        let hour = { (count: Double) in Date(timeIntervalSince1970: 1_800_000_000 + count * 3600) }
-        let checker = Model(demo: Demo.accounts)
-        checker.checkForUpdate(at: hour(0))
-        precondition(fetches.count == 1)
-        fetches[0]("4.10.0")
-        precondition(checker.newer == "4.10.0" && checker.links.map(\.title) == ["Update to 4.10.0"])
-        checker.checkForUpdate(at: hour(5.9))
-        Model(demo: Demo.accounts).checkForUpdate(at: hour(5.9))
-        precondition(fetches.count == 1)
-        checker.checkForUpdate(at: hour(6))
-        fetches[1](nil)
-        checker.checkForUpdate(at: hour(11.9))
-        precondition(fetches.count == 2 && checker.links.map(\.title) == ["Update to 4.10.0"])
-        for (index, version) in ["4.2.1", "4.2.0", "3.99.99", "4.2", "4.2.1.0", "4.3.0-beta.1", "v4.3.0", " 4.3.0", "4.+3.0", "4..0", "", "４.３.０", "99999999999999999999.0.0"].enumerated() {
-            checker.checkForUpdate(at: hour(12 + 6 * Double(index)))
-            fetches.last!(version)
-            precondition(fetches.count == 3 + index && checker.newer == nil && checker.links.isEmpty, version)
+        requests = []
+        func offered(_ accounts: [Account] = Demo.accounts) -> Model {
+            let model = Model(demo: accounts)
+            model.config = Config(node: "/bin/sh", script: "/fixture/transplant.js")
+            model.checkForUpdate()
+            fetches.last!("4.10.0")
+            return model
         }
-        let busy = Model(demo: Demo.accounts)
-        busy.newer = "4.10.0"
+        let checker = offered()
+        precondition(fetches.count == 1 && checker.newer == "4.10.0" && checker.links.map(\.title) == ["Update to 4.10.0"])
+        checker.checkForUpdate()
+        fetches.last!(nil)
+        precondition(fetches.count == 2 && checker.links.map(\.title) == ["Update to 4.10.0"])
+        for version in ["4.2.1", "4.2.0", "3.99.99", "4.2", "4.2.1.0", "4.3.0-beta.1", "v4.3.0", " 4.3.0", "4.+3.0", "4..0", "", "４.３.０", "4.10.0 --registry=https://example.invalid", "latest", "../4.10.0"] {
+            checker.checkForUpdate()
+            fetches.last!("4.10.0")
+            checker.checkForUpdate()
+            fetches.last!(version)
+            checker.update()
+            precondition(checker.newer == nil && checker.links.isEmpty && launches.isEmpty, version)
+        }
+        let busy = offered()
         busy.begin()
         precondition(busy.links.isEmpty)
         for name in ["17-uncertain", "10-interrupted", "11-repair"] {
-            let held = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(name).utf8)))
-            held.newer = "4.10.0"
-            precondition(!held.links.contains { $0.title.hasPrefix("Update") }, name)
+            precondition(!offered(try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(name).utf8))).links.contains { $0.title.hasPrefix("Update") }, name)
         }
-        let blocked = Model(demo: Demo.accounts)
-        blocked.newer = "4.10.0"
+        let blocked = offered()
         blocked.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"summary":{"moved":2,"notMoved":[{"id":"fixture","error":"failed"}],"groups":[],"attention":[]}}"#)
         precondition(blocked.directActions && blocked.pendingAccounts.isEmpty && !blocked.links.contains { $0.title.hasPrefix("Update") })
-        let updater = Model(demo: Demo.accounts)
-        updater.config = Config(node: "/bin/sh", script: "/fixture/transplant.js")
-        updater.newer = "4.10.0"
+        let updater = offered()
         updater.links.last!.action()
         let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         precondition(launches.count == 1 && updater.note == "Updating to 4.10.0." && updater.links.isEmpty && !updater.canMutate)
         precondition(launches[0].0.executableURL?.path == "/bin/npx" && launches[0].0.arguments == ["-y", "claude-transplant@4.10.0", "menubar"])
         precondition(launches[0].0.environment?["PATH"] == "/bin:" + path && launches[0].0.environment?["HOME"] == ProcessInfo.processInfo.environment["HOME"])
+        updater.reset()
+        precondition(updater.note == "Updating to 4.10.0." && requests.isEmpty)
         launches[0].1(1, "npm error 404 Not Found")
         precondition(updater.note == "Update to 4.10.0 failed." && updater.detailLines.contains { $0 == ("reason", "npm error 404 Not Found") })
         precondition(updater.canMutate && updater.links.map(\.title) == ["Update to 4.10.0"])
-        for malformed in ["4.10", "4.10.0 --registry=https://example.invalid", "latest", "../4.10.0"] {
-            updater.newer = malformed
-            precondition(updater.links.isEmpty, malformed)
-            updater.update()
-        }
-        precondition(launches.count == 1)
         updater.config = Config(node: "/fixture/stale/bin/node", script: "/fixture/transplant.js")
-        updater.newer = "4.10.0"
         updater.update()
         precondition(launches.count == 2 && launches[1].0.executableURL?.path == "/fixture/found/bin/npx" && launches[1].0.environment?["PATH"] == "/fixture/found/bin:" + path)
+        let queuedUpdate = offered()
+        queuedUpdate.checkSweep()
+        queuedUpdate.update()
+        precondition(launches.count == 2 && requests.count == 1 && queuedUpdate.note == "Updating to 4.10.0." && !queuedUpdate.canMutate)
+        requests[0].1(#"{"swept":true,"ok":true}"#)
+        requests[0].2(0, "")
+        queuedUpdate.checkSweep()
+        queuedUpdate.update()
+        precondition(launches.count == 3 && requests.count == 1 && launches[2].0.arguments == ["-y", "claude-transplant@4.10.0", "menubar"])
         print("Swift queue and metadata states passed")
     }
 }

@@ -310,14 +310,14 @@ final class Model: ObservableObject {
     @Published var running = false
     @Published private(set) var sweeping = false
     @Published private(set) var sourceActivity: Event?
-    private var queued: [String]?
+    private var queued: (() -> Void)?
     private var followUp: (() -> Void)?
     private var left: [(String, String)] = []
     private var dismissed = UserDefaults.standard.string(forKey: "dismissedReceipt") ?? ""
     private var undone = UserDefaults.standard.string(forKey: "undoneReceipt") ?? ""
     private var notifyWhenDone = false
     static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-    @Published var newer: String?
+    @Published private(set) var newer: String?
     @Published private(set) var updating = false
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
@@ -336,6 +336,7 @@ final class Model: ObservableObject {
     private var approvalAttempted = false
     private var poller: AnyCancellable?
     private var progressTimer: AnyCancellable?
+    private var updateTimer: AnyCancellable?
     private var activeIdentity = ""
     private var targetChosen = false
     private var selectionComplete = false
@@ -368,8 +369,8 @@ final class Model: ObservableObject {
         poller = Timer.publish(every: 15, on: .main, in: .common).autoconnect().sink { [weak self] _ in
             guard let self, !self.running, !self.sweeping else { return }
             self.refresh()
-            self.checkForUpdate()
         }
+        updateTimer = Timer.publish(every: 6 * 3600, on: .main, in: .common).autoconnect().sink { [weak self] _ in self?.checkForUpdate() }
         progressTimer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect().sink { [weak self] _ in
             guard let self, self.running else { return }
             self.moveProgress.refresh()
@@ -417,20 +418,12 @@ final class Model: ObservableObject {
             (canUpdate, "Update to \(newer ?? "")", update)]
         return all.filter { $0.0 }.map { ($0.1, $0.2) }
     }
-    private var canUpdate: Bool { Model.release(newer) != nil && canMutate && pendingAccounts.isEmpty && !directActions }
-    static func release(_ version: String?) -> [Int]? {
-        let parts = (version ?? "").split(separator: ".", omittingEmptySubsequences: false)
-        let numbers = parts.compactMap { $0.allSatisfy { $0.isASCII && $0.isNumber } ? Int($0) : nil }
-        return parts.count == 3 && numbers.count == 3 ? numbers : nil
-    }
+    private var canUpdate: Bool { newer != nil && canMutate && pendingAccounts.isEmpty && !directActions }
 
-    func checkForUpdate(at now: Date = Date()) {
-        let time = now.timeIntervalSince1970
-        guard abs(time - UserDefaults.standard.double(forKey: "updateCheckedAt")) >= 6 * 3600 else { return }
-        UserDefaults.standard.set(time, forKey: "updateCheckedAt")
+    func checkForUpdate() {
         latest { [weak self] version in
             guard let self, let version else { return }
-            newer = Model.release(version).flatMap { latest in Model.release(Model.version)?.lexicographicallyPrecedes(latest) } == true ? version : nil
+            newer = version.wholeMatch(of: #/[0-9]+\.[0-9]+\.[0-9]+/#) != nil && Model.version.map({ version.compare($0, options: .numeric) == .orderedDescending }) == true ? version : nil
         }
     }
 
@@ -443,12 +436,15 @@ final class Model: ObservableObject {
         process.environment = ProcessInfo.processInfo.environment.merging(["PATH": folder + ":" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")]) { $1 }
         updating = true
         note = "Updating to \(version)."
-        launch(process) { [weak self] status, error in
-            guard let self else { return }
-            updating = false
-            note = status == 0 ? "" : "Update to \(version) failed."
-            if status != 0 { lines.append(("reason", error)) }
+        let install: () -> Void = { [weak self] in
+            self?.launch(process) { [weak self] status, error in
+                guard let self else { return }
+                updating = false
+                note = status == 0 ? "" : "Update to \(version) failed."
+                if status != 0 { lines.append(("reason", error)) }
+            }
         }
+        if sweeping { queued = install } else { install() }
     }
     var pendingReady: Bool { canMutate && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.pending == "recovery" || $0.pending == "undo" && $0.signedIn == true ? "finish" : "wait")) } && (config != nil || demo) }
     var pendingButtonTitle: String {
@@ -629,7 +625,7 @@ final class Model: ObservableObject {
     }
 
     func reset() {
-        guard !running, movable else { return }
+        guard !running, !updating, movable else { return }
         dismiss()
         clearResult()
         completion = nil
@@ -957,7 +953,7 @@ final class Model: ObservableObject {
     private func start(_ args: [String]) {
         begin()
         if sweeping {
-            queued = args
+            queued = { [weak self] in self?.moveProgress.resume(); self?.runOperation(args) }
             moveProgress.paused = ProcessInfo.processInfo.systemUptime
         } else {
             runOperation(args)
@@ -1024,10 +1020,9 @@ final class Model: ObservableObject {
             sweeping = false
             sourceActivity = nil
             defer {
-                if let args = queued {
+                if let next = queued {
                     queued = nil
-                    moveProgress.resume()
-                    runOperation(args)
+                    next()
                 }
             }
             if result?.code == "LOCK_BUSY" { return }
@@ -1220,7 +1215,6 @@ final class Model: ObservableObject {
     private func latest(_ done: @escaping (String?) -> Void) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
-        configuration.httpShouldSetCookies = false
         configuration.httpAdditionalHeaders = ["User-Agent": "claude-transplant", "Accept-Language": "en"]
         let session = URLSession(configuration: configuration)
         session.dataTask(with: URL(string: "https://registry.npmjs.org/claude-transplant/latest")!) { data, _, _ in
@@ -1429,7 +1423,7 @@ struct Panel: View {
                 if let label = model.identityLabel { Text(label).font(.caption).foregroundStyle(.secondary) }
                 Spacer()
                 Button(action: { model.reset() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
-                    .accessibilityLabel("Reset").help("Clear account selections").disabled(model.running || !model.movable)
+                    .accessibilityLabel("Reset").help("Clear account selections").disabled(model.running || model.updating || !model.movable)
             }
             accountBoard.disabled(!model.canMutate || !model.movable)
             if !model.displaySummary.isEmpty || model.visibleCompletion != nil { Divider() }
