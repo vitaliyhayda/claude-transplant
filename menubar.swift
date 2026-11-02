@@ -150,6 +150,7 @@ struct Event: Decodable {
     let sessions: Int?
     let restored: Int?
     let refused: [String]?
+    let retained: Bool?
     let reason: String?
     let nothing: Bool?
     let code: String?
@@ -432,7 +433,7 @@ final class Model: ObservableObject {
         let folder = (node(config.node) as NSString).deletingLastPathComponent
         let process = Process()
         process.executableURL = URL(fileURLWithPath: folder + "/npx")
-        process.arguments = ["-y", "claude-transplant@" + version, "menubar"]
+        process.arguments = ["-y", "--prefer-online", "claude-transplant@" + version, "menubar"]
         process.environment = ProcessInfo.processInfo.environment.merging(["PATH": folder + ":" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")]) { $1 }
         updating = true
         note = "Updating to \(version)."
@@ -850,7 +851,9 @@ final class Model: ObservableObject {
             pendingResult = false
             notify(cloudRestored > 0 ? quantity(cloudRestored, "cloud mirror restored", "cloud mirrors restored") : restored > 0 ? quantity(restored, "source entry restored", "source entries restored") : quantity(event.sessions ?? 0, "session undone", "sessions undone"), event.note ?? "")
         } else if let refused = event.refused {
-            note = operationArgs.first == "keep-local" ? "Remaining work could not be cancelled. Check Details." : "Undo stopped. The move's records need checking."
+            note = operationArgs.first == "keep-local" ? "Remaining work could not be cancelled. Check Details." :
+                event.reason == nil && event.retained != true ? "Undo stopped: \(quantity(refused.count, "moved session changed", "moved sessions changed")) since the move. Nothing was changed." :
+                "Undo stopped. The move's records need checking."
             restartAvailable = false
             lines = refused.map { ("kept", $0) }
             if let reason = event.reason { lines.append(("reason", reason)) }
@@ -1050,16 +1053,11 @@ final class Model: ObservableObject {
                     operationArgs = ["finish", "--json"]
                     reopenFailure()
                 }
-            } else if let changed = result?.changed, !changed.isEmpty {
-                let unavailable = changed.filter { $0.fields.contains("record unavailable") }
-                if !unavailable.isEmpty { sweepFailureReceipt = nil }
-                let names = ["title": "title", "isArchived": "archive state", "isStarred": "starred state"]
-                let fields = Set(changed.flatMap(\.fields)).sorted().map { names[$0] ?? $0 }.joined(separator: ", ")
-                note = unavailable.isEmpty
-                    ? quantity(changed.count, "moved session changed", "moved sessions changed") + " " + fields + ". Snapshots are in the receipt."
-                    : quantity(unavailable.count, "moved session record cannot be read", "moved session records cannot be read") + ". Check Details."
-                symbol = unavailable.isEmpty ? "info.circle" : "exclamationmark.triangle"
-                lines.append(("metadata", changed.map { self.identity($0.title, $0.id) + " | " + $0.fields.map { names[$0] ?? $0 }.joined(separator: ", ") }.joined(separator: "\n")))
+            } else if let unavailable = result?.changed?.filter({ $0.fields.contains("record unavailable") }), !unavailable.isEmpty {
+                sweepFailureReceipt = nil
+                note = quantity(unavailable.count, "moved session record cannot be read", "moved session records cannot be read") + ". Check Details."
+                symbol = "exclamationmark.triangle"
+                lines.append(("metadata", unavailable.map { self.identity($0.title, $0.id) + " | " + $0.fields.joined(separator: ", ") }.joined(separator: "\n")))
             }
             if resolvedRestartError {
                 sweepFailureReceipt = nil

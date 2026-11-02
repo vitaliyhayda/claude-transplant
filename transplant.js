@@ -4675,8 +4675,7 @@ export function executeMove(from, to, paths, options = {}) {
     if (options.resume && (deferred?.mode !== 'local' || deferred.file !== options.resumeFile)) return { ok: false, reason: 'The pending move changed. No stale continuation was run.' }
     let existing = options.resume ? deferred : null
     if (from && deferred && !existing) return { deferred, ok: false, complete: false, pendingCloud: deferred.mode === 'cloud' ? deferred.sources.length : 0 }
-    const drift = await inspectPlaced(paths)
-    if (drift.changed.length) report('changed', `${quantity(drift.changed.length, 'moved session')} now has different metadata. Evidence saved with the receipt.`)
+    await inspectPlaced(paths)
     if (options.finish && deferred?.file !== options.receiptFile) return { ok: false, reason: 'The pending move changed before its restart' }
     let chosen = saved?.selection ?? selection
     const sessionFiles = new Set(receiptSummary(existing?.receipt ?? {}).notMoved.map(row => row.file).filter(Boolean))
@@ -5261,7 +5260,10 @@ async function main(argv) {
     if (!file) return
     out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
   }
-  if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
+  if (args.cmd === 'menubar') {
+    out.on('error', () => {})
+    return out.write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
+  }
   if (args.cmd === 'sweep') {
     const result = await sweep(paths, { report: args.json ? reporter(true) : undefined })
     const failed = result.result?.failed ?? result.result?.receipt?.failed ?? result.verification?.failed ?? []

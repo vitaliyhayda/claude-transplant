@@ -684,6 +684,27 @@ test('placed verification ignores activity and bridge registration but records t
   assert.equal((await verifyPlaced(h.paths)).changed[0].found, changed.changed[0].found)
 })
 
+test('the next move quietly saves metadata evidence before superseding the receipt', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await executeMove([from], to, h.paths, { processes: [] })
+  assert.equal(moved.ok, true)
+  const row = moved.receipt.sessions[0], record = { ...JSON.parse(await readFile(row.record)), title: 'Renamed session', isArchived: true, isStarred: true }
+  await writeFile(row.record, JSON.stringify(record))
+  const current = await accounts(h.paths, []), reports = []
+  const next = await executeMove([current.find(account => account.account === h.acct.T)], current.find(account => account.account === h.acct.Z), h.paths, { processes: [], report: stage => reports.push(stage) })
+  assert.equal(next.ok, true)
+  assert.notEqual(next.file, moved.file)
+  assert.equal(reports.includes('changed'), false)
+  const drift = (await readReceipt(moved.file)).metadataDrift
+  assert.equal(drift.length, 1)
+  assert.deepEqual(drift[0].fields, ['title', 'isArchived', 'isStarred'])
+  assert.deepEqual(JSON.parse(await readFile(drift[0].placed)), row.recordSnapshot)
+  assert.deepEqual(JSON.parse(await readFile(drift[0].found)), record)
+})
+
 test('automatic retries never request a restart and leave held workers alone', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
@@ -10261,9 +10282,35 @@ struct StateChecks {
             requests[0].1("{\"swept\":true,\"ok\":true,\"changed\":[{\"id\":\"fixture\",\"title\":\"Fixture\",\"fields\":[\"" + field + "\"]}]}")
             requests[0].2(0, "")
             let unavailable = field == "record unavailable"
-            precondition(item.symbol == (unavailable ? "exclamationmark.triangle" : "info.circle"))
-            precondition(item.note.contains(unavailable ? "cannot be read" : ["isStarred": "starred state", "isArchived": "archive state", "title": "title"][field]!))
-            precondition(item.detailLines.contains { $0.1.contains("Fixture") })
+            precondition(item.symbol == (unavailable ? "exclamationmark.triangle" : "arrow.left.arrow.right"), field)
+            precondition(item.note == (unavailable ? "1 moved session record cannot be read. Check Details." : ""), field)
+            precondition(item.detailLines.map(\.1) == (unavailable ? ["Fixture | fixture | record unavailable"] : []), field)
+        }
+        requests = []
+        let metadata = Model(demo: Demo.accounts)
+        metadata.checkSweep()
+        requests[0].1(#"{"swept":true,"ok":true,"complete":true,"changed":[{"id":"renamed","title":"Renamed","fields":["title","isArchived","isStarred"]},{"id":"missing","title":"Missing","fields":["record unavailable"]},{"id":"unreadable","title":"Unreadable","fields":["record unavailable"]}]}"#)
+        requests[0].2(0, "")
+        precondition(metadata.symbol == "exclamationmark.triangle" && metadata.note == "2 moved session records cannot be read. Check Details.")
+        precondition(metadata.detailLines.map(\.1) == ["Missing | missing | record unavailable\nUnreadable | unreadab | record unavailable"])
+        metadata.checkSweep()
+        requests[1].1(#"{"swept":true,"ok":true,"complete":true,"changed":[{"id":"renamed","title":"Renamed","fields":["title","isArchived","isStarred"]}]}"#)
+        requests[1].2(0, "")
+        precondition(metadata.symbol == "arrow.left.arrow.right" && metadata.note.isEmpty && metadata.detailLines.isEmpty)
+        for (event, expected) in [
+            (#"{"refused":["First | desktop record changed"]}"#, "Undo stopped: 1 moved session changed since the move. Nothing was changed."),
+            (#"{"refused":["First | desktop record changed","Second | transcript changed"]}"#, "Undo stopped: 2 moved sessions changed since the move. Nothing was changed."),
+            (#"{"refused":["First | changed"],"retained":true}"#, "Undo stopped. The move's records need checking."),
+            (#"{"refused":["First | missing"],"reason":"Undo refused, recovery artifacts are missing or blocked"}"#, "Undo stopped. The move's records need checking.")
+        ] {
+            let item = Model(demo: Demo.accounts)
+            item.checkOperation(["undo", "--json"])
+            item.handle(event)
+            item.checkFinish(1)
+            let decoded = try! JSONDecoder().decode(Event.self, from: Data(event.utf8))
+            precondition(item.note == expected && !item.restartAvailable)
+            precondition(item.detailLines.filter { $0.0 == "kept" }.map(\.1) == decoded.refused!)
+            if let reason = decoded.reason { precondition(item.detailLines.contains { $0 == ("reason", reason) }) }
         }
         func accountResponse(_ pending: Bool) -> String {
             String(data: try! JSONSerialization.data(withJSONObject: Demo.accounts.enumerated().map { index, account -> [String: Any] in
@@ -10991,7 +11038,7 @@ struct StateChecks {
         updater.links.last!.action()
         let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         precondition(launches.count == 1 && updater.note == "Updating to 4.10.0." && updater.links.isEmpty && !updater.canMutate)
-        precondition(launches[0].0.executableURL?.path == "/bin/npx" && launches[0].0.arguments == ["-y", "claude-transplant@4.10.0", "menubar"])
+        precondition(launches[0].0.executableURL?.path == "/bin/npx" && launches[0].0.arguments == ["-y", "--prefer-online", "claude-transplant@4.10.0", "menubar"])
         precondition(launches[0].0.environment?["PATH"] == "/bin:" + path && launches[0].0.environment?["HOME"] == ProcessInfo.processInfo.environment["HOME"])
         updater.reset()
         precondition(updater.note == "Updating to 4.10.0." && requests.isEmpty)
@@ -11009,7 +11056,7 @@ struct StateChecks {
         requests[0].2(0, "")
         queuedUpdate.checkSweep()
         queuedUpdate.update()
-        precondition(launches.count == 3 && requests.count == 1 && launches[2].0.arguments == ["-y", "claude-transplant@4.10.0", "menubar"])
+        precondition(launches.count == 3 && requests.count == 1 && launches[2].0.arguments == ["-y", "--prefer-online", "claude-transplant@4.10.0", "menubar"])
         print("Swift queue and metadata states passed")
     }
 }
@@ -11498,8 +11545,12 @@ test('synthetic menubar installation reports the package version without invokin
     }
   `
   for (let attempt = 0; attempt < 2; attempt++) {
-    const result = await cli(h.root, ['menubar'], setup)
+    const result = await cli(h.root, ['menubar'], setup + (attempt ? `
+      process.stdout._write = (_chunk, _encoding, callback) => callback(Object.assign(new Error('synthetic closed stdout'), { code: 'EPIPE' }))
+    ` : ''))
     assert.equal(result.code, 0, result.stderr)
+    assert.equal(result.stderr, '')
+    if (attempt === 0) assert.match(result.stdout, /menubar installed/)
     const script = path.join(h.paths.state, 'Claude Transplant.app/Contents/Resources/transplant.js')
     const { stdout } = await promisify(execFile)(process.execPath, [script, '--version'], { env: { ...process.env, HOME: h.root } })
     assert.equal(stdout.trim(), JSON.parse(await readFile(path.join(here, 'package.json'))).version)
