@@ -703,6 +703,20 @@ test('the next move quietly saves metadata evidence before superseding the recei
   assert.deepEqual(drift[0].fields, ['title', 'isArchived', 'isStarred'])
   assert.deepEqual(JSON.parse(await readFile(drift[0].placed)), row.recordSnapshot)
   assert.deepEqual(JSON.parse(await readFile(drift[0].found)), record)
+  await writeFile(next.receipt.sessions[0].record, '{')
+  await h.write(id(2), [entry('user', 2, null, id(2))])
+  await h.record('P', id(2), rehomeRecord())
+  const later = await accounts(h.paths, []), warnings = []
+  const third = await executeMove([later.find(account => account.account === h.acct.P)], later.find(account => account.account === h.acct.T), h.paths, {
+    processes: [], report: (stage, text) => { if (stage === 'changed') warnings.push(text) }
+  })
+  assert.equal(third.ok, true)
+  assert.deepEqual(warnings, ['1 moved session record cannot be read. Evidence saved with the receipt.'])
+  const unavailable = (await readReceipt(next.file)).metadataDrift
+  assert.equal(unavailable.length, 1)
+  assert.deepEqual(unavailable[0].fields, ['record unavailable'])
+  assert.deepEqual(JSON.parse(await readFile(unavailable[0].placed)), next.receipt.sessions[0].recordSnapshot)
+  assert.equal(await readFile(unavailable[0].found, 'utf8'), '{')
 })
 
 test('automatic retries never request a restart and leave held workers alone', async () => {
@@ -10275,42 +10289,38 @@ struct StateChecks {
         precondition(command[command.firstIndex(of: "--to")! + 1] == Demo.accounts[2].selector)
         precondition(!command.contains("undo"))
         precondition(!model.sweeping && model.running)
-        for field in ["record unavailable", "isStarred", "title", "isArchived"] {
+        for field in ["record unavailable", "isStarred", "title", "isArchived", "mixed"] {
             requests = []
             let item = Model(demo: Demo.accounts)
             item.checkSweep()
-            requests[0].1("{\"swept\":true,\"ok\":true,\"changed\":[{\"id\":\"fixture\",\"title\":\"Fixture\",\"fields\":[\"" + field + "\"]}]}")
+            let changed = field == "mixed"
+                ? #"{"id":"renamed","title":"Renamed","fields":["title","isArchived","isStarred"]},{"id":"missing","title":"Missing","fields":["record unavailable"]},{"id":"unreadable","title":"Unreadable","fields":["record unavailable"]}"#
+                : #"{"id":"fixture","title":"Fixture","fields":[""# + field + #""]}"#
+            requests[0].1(#"{"swept":true,"ok":true,"complete":true,"changed":["# + changed + "]}")
             requests[0].2(0, "")
-            let unavailable = field == "record unavailable"
+            let unavailable = field == "record unavailable" || field == "mixed"
+            let records = field == "mixed" ? "2 moved session records" : "1 moved session record"
             precondition(item.symbol == (unavailable ? "exclamationmark.triangle" : "arrow.left.arrow.right"), field)
-            precondition(item.note == (unavailable ? "1 moved session record cannot be read. Check Details." : ""), field)
-            precondition(item.detailLines.map(\.1) == (unavailable ? ["Fixture | fixture | record unavailable"] : []), field)
+            precondition(item.note == (unavailable ? records + " cannot be read. Check Details." : ""), field)
+            precondition(item.detailLines.map(\.1) == (field == "mixed" ? ["Missing | missing | record unavailable\nUnreadable | unreadab | record unavailable"] : unavailable ? ["Fixture | fixture | record unavailable"] : []), field)
+            item.checkSweep()
+            requests[1].1(#"{"swept":true,"ok":true,"complete":true,"changed":[{"id":"renamed","title":"Renamed","fields":["title","isArchived","isStarred"]}]}"#)
+            requests[1].2(0, "")
+            precondition(item.symbol == "arrow.left.arrow.right" && item.note.isEmpty && item.detailLines.isEmpty)
         }
-        requests = []
-        let metadata = Model(demo: Demo.accounts)
-        metadata.checkSweep()
-        requests[0].1(#"{"swept":true,"ok":true,"complete":true,"changed":[{"id":"renamed","title":"Renamed","fields":["title","isArchived","isStarred"]},{"id":"missing","title":"Missing","fields":["record unavailable"]},{"id":"unreadable","title":"Unreadable","fields":["record unavailable"]}]}"#)
-        requests[0].2(0, "")
-        precondition(metadata.symbol == "exclamationmark.triangle" && metadata.note == "2 moved session records cannot be read. Check Details.")
-        precondition(metadata.detailLines.map(\.1) == ["Missing | missing | record unavailable\nUnreadable | unreadab | record unavailable"])
-        metadata.checkSweep()
-        requests[1].1(#"{"swept":true,"ok":true,"complete":true,"changed":[{"id":"renamed","title":"Renamed","fields":["title","isArchived","isStarred"]}]}"#)
-        requests[1].2(0, "")
-        precondition(metadata.symbol == "arrow.left.arrow.right" && metadata.note.isEmpty && metadata.detailLines.isEmpty)
-        for (event, expected) in [
-            (#"{"refused":["First | desktop record changed"]}"#, "Undo stopped: 1 moved session changed since the move. Nothing was changed."),
-            (#"{"refused":["First | desktop record changed","Second | transcript changed"]}"#, "Undo stopped: 2 moved sessions changed since the move. Nothing was changed."),
-            (#"{"refused":["First | changed"],"retained":true}"#, "Undo stopped. The move's records need checking."),
-            (#"{"refused":["First | missing"],"reason":"Undo refused, recovery artifacts are missing or blocked"}"#, "Undo stopped. The move's records need checking.")
+        for (event, expected, details) in [
+            (#"{"refused":["First | desktop record changed"]}"#, "Undo stopped: 1 moved session changed or is still open. Nothing was undone.", [("kept", "First | desktop record changed")]),
+            (#"{"refused":["First | desktop record changed","Second | transcript changed"]}"#, "Undo stopped: 2 moved sessions changed or are still open. Nothing was undone.", [("kept", "First | desktop record changed"), ("kept", "Second | transcript changed")]),
+            (#"{"refused":["First | running worker"]}"#, "Undo stopped: 1 moved session changed or is still open. Nothing was undone.", [("kept", "First | running worker")]),
+            (#"{"refused":["First | changed"],"retained":true}"#, "Undo stopped. The move's records need checking.", [("kept", "First | changed")]),
+            (#"{"refused":["First | missing"],"reason":"Undo refused, recovery artifacts are missing or blocked"}"#, "Undo stopped. The move's records need checking.", [("kept", "First | missing"), ("reason", "Undo refused, recovery artifacts are missing or blocked")])
         ] {
             let item = Model(demo: Demo.accounts)
             item.checkOperation(["undo", "--json"])
             item.handle(event)
             item.checkFinish(1)
-            let decoded = try! JSONDecoder().decode(Event.self, from: Data(event.utf8))
             precondition(item.note == expected && !item.restartAvailable)
-            precondition(item.detailLines.filter { $0.0 == "kept" }.map(\.1) == decoded.refused!)
-            if let reason = decoded.reason { precondition(item.detailLines.contains { $0 == ("reason", reason) }) }
+            precondition(item.detailLines.elementsEqual(details, by: ==))
         }
         func accountResponse(_ pending: Bool) -> String {
             String(data: try! JSONSerialization.data(withJSONObject: Demo.accounts.enumerated().map { index, account -> [String: Any] in
@@ -10463,11 +10473,15 @@ struct StateChecks {
             requests[1].2(0, "")
             return model
         }
+        let metadataChanges = ["[]"] + ["title", "isArchived", "isStarred"].map { #"[{"id":"fixture","fields":[""# + $0 + #""]}]"# }
         for typed in [false, true] {
-            let completed = failedFinishModel(typed)
-            precondition(completed.note == "Move stopped: the operation did not complete.")
-            sweepReply(completed, cleanSweep)
-            precondition(completed.note == "No remaining work" && completed.lines.isEmpty)
+            for changed in metadataChanges {
+                let completed = failedFinishModel(typed)
+                precondition(completed.note == "Move stopped: the operation did not complete.")
+                sweepReply(completed, repeatError)
+                sweepReply(completed, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","changed":"# + changed + "}")
+                precondition(completed.note == "No remaining work" && completed.lines.isEmpty)
+            }
             for event in [
                 #"{"swept":true,"ok":false,"receipt":"receipt-one"}"#,
                 #"{"swept":true,"ok":true,"complete":false,"receipt":"receipt-one"}"#,
@@ -10537,8 +10551,11 @@ struct StateChecks {
         precondition(refreshedRefusals.receiptSummaries.count == 1)
         precondition(refreshedRefusals.pendingPrompt == "233 moved. 10 sessions were not moved.")
         precondition(!refreshedRefusals.pendingReady)
-        sweepReply(refreshedRefusals, #"{"swept":true,"ok":true,"complete":true,"summary":"# + summary + "}")
-        precondition(refreshedRefusals.note == "233 moved. 10 sessions were not moved.")
+        for changed in metadataChanges {
+            sweepReply(refreshedRefusals, #"{"swept":true,"ok":true,"complete":true,"summary":"# + summary + #","changed":"# + changed + "}")
+            precondition(refreshedRefusals.note == "233 moved. 10 sessions were not moved.")
+            precondition(refreshedRefusals.lines.map(\.0) == ["history check", "waiting on parent", "task collision"])
+        }
         let recoveredCloud = failedFinishModel()
         sweepReply(recoveredCloud, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[],"notMoved":[{"id":"fixture","error":"task family missing"}]}"#)
         precondition(recoveredCloud.note == "No remaining work")
@@ -10559,16 +10576,16 @@ struct StateChecks {
             precondition(!limited.pendingReady && limited.primaryTitle == nil && limited.canKeepLocal && limited.screen == .blocked)
             if name == "48-parser-limit" { precondition(limited.detailLines.contains { $0.1.contains("CLOUD_PARSER_LIMIT") }) }
         }
-        for completedReceipt in ["synthetic-receipt", "another-receipt"] {
+        for (completedReceipt, changed) in metadataChanges.map({ ("synthetic-receipt", $0) }) + [("another-receipt", "[]")] {
             requests = []
             let resolved = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("17-uncertain").utf8)))
-            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":2,"receipt":"synthetic-receipt"}"#)
+            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":2,"receipt":"synthetic-receipt","changed":"# + changed + "}")
             let notice = resolved.note
             sweepReply(resolved, #"{"swept":true,"ok":false,"complete":false,"issues":1,"error":"Synthetic cloud failure","receipt":"synthetic-receipt"}"#)
             precondition(resolved.restartAvailable && resolved.symbol == "exclamationmark.triangle")
             refreshReply(resolved, wordingAccounts("01-done"))
             precondition(resolved.pendingAccounts.isEmpty)
-            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":true,"issues":0,"receipt":""# + completedReceipt + #""}"#)
+            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":true,"issues":0,"receipt":""# + completedReceipt + #"","changed":"# + changed + "}")
             if completedReceipt == "another-receipt" {
                 precondition(resolved.symbol == "exclamationmark.triangle")
                 precondition(resolved.detailLines.contains { $0.1.contains("Synthetic cloud failure") })
