@@ -3,14 +3,14 @@ import childProcess, { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import fsSync, { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import fs, { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import fs, { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, learnDesktopLogin, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -2766,6 +2766,85 @@ test('accounts labels a login held in a claude-acc account directory', async () 
   const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
 
   assert.equal(row.label, 'switched@example.com \u00b7 Switched Team')
+})
+
+test('accounts name a Desktop-only login and its organizations by what Claude reports and keep them after a switch', async (t) => {
+  const h = await home()
+  const io = { cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' }
+  const personal = id(930)
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    requests.push([new URL(url).pathname, options.headers.cookie])
+    return Response.json({ uuid: h.acct.Q.toUpperCase(), email_address: 'q@example.com', memberships: [
+      { organization: { uuid: h.org.Q, name: 'Quill Team', raven_type: 'team' } },
+      { organization: { uuid: personal, name: "q@example.com's Organization", raven_type: null, capabilities: ['chat', 'claude_pro'] } },
+      { organization: { uuid: 'not-a-uuid', name: 'Ignored' } }
+    ] })
+  })
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Q }))
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  await writeFile(h.paths.cookies, 'fixture')
+  assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.Q).label, `${h.acct.Q.slice(0, 8)} \u00b7 ${h.org.Q.slice(0, 8)}`)
+
+  assert.equal(await learnDesktopLogin(h.paths, io), 'q@example.com')
+  await utimes(h.paths.cookies, new Date(), new Date(Date.now() + 60_000))
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.P }))
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+
+  assert.deepEqual(requests, [['/api/account', 'sessionKey=fixture']])
+  assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.Q).label, 'q@example.com \u00b7 Quill Team')
+  assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'logins.json'), 'utf8')).orgs, { [h.org.Q]: 'Quill Team', [personal]: 'Personal' })
+})
+
+test('a known login that opens a new organization in Desktop gets the organization name', async (t) => {
+  const h = await home()
+  const io = { cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' }
+  const team = id(931)
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++
+    return Response.json({ uuid: h.acct.T, email_address: 'renamed@example.com', memberships: [{ organization: { uuid: team, name: 'New Team', raven_type: 'enterprise' } }] })
+  })
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.T }))
+  await writeFile(h.paths.cookies, 'fixture')
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  assert.equal(calls, 0)
+  await mkdir(path.join(h.paths.records, h.acct.T, team), { recursive: true })
+
+  assert.equal(await learnDesktopLogin(h.paths, io), 'renamed@example.com')
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  assert.equal(calls, 1)
+  assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.T && row.org === team).label, 't@example.com \u00b7 New Team')
+})
+
+test('a Desktop login lookup for another account or a failed one stores nothing and retries after Desktop rewrites its cookies', async (t) => {
+  const h = await home()
+  const io = { cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' }
+  const replies = [{ uuid: h.acct.T, email_address: 'other@example.com', memberships: [{ organization: { uuid: h.org.Q, name: 'Wrong', raven_type: 'team' } }] }, null, { uuid: h.acct.Q, email_address: 'q@example.com' }]
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => {
+    const reply = replies[calls++]
+    if (!reply) throw new Error('offline')
+    return Response.json(reply)
+  })
+  const rewrite = (minutes) => utimes(h.paths.cookies, new Date(), new Date(1_800_000_000_000 + minutes * 60_000))
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Q }))
+  await writeFile(h.paths.cookies, 'fixture')
+  await rewrite(0)
+
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  assert.equal(calls, 1)
+  await rewrite(1)
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  await rewrite(2)
+  assert.equal(await learnDesktopLogin(h.paths, io), 'q@example.com')
+  await rewrite(3)
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  assert.equal(calls, 4)
+  assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'logins.json'), 'utf8')), { emails: { [h.acct.Q]: 'q@example.com' }, orgs: {}, tried: { [h.acct.Q]: 1_800_000_000_000 + 3 * 60_000 } })
+  assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.T).email, 't@example.com')
 })
 
 test('menubar snapshot renders live accounts without installing', async () => {

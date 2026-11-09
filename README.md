@@ -218,7 +218,7 @@ Safety:
 - source cloud checks: sources whose cloud cleanup still waits, usually for another login
 - newer cloud sessions: created after Move, left for the next move
 
-Accounts are labeled from `~/.claude.json` and its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` and Desktop's agent-mode records. Personal-plan organizations show as Personal, and an account with no known email shows a uuid prefix.
+Accounts are labeled from `~/.claude.json` and its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` and Desktop's agent-mode records. An account or organization that only ever signed in to Desktop gets its email and organization names from claude.ai while Desktop is signed in to it, saved in `logins.json` next to the receipts. Personal-plan organizations show as Personal, and an account with no known email shows a uuid prefix.
 
 The active badge comes from Desktop's own `main.log`, with no Keychain read or network request, and shows unknown after a logout or an unfinished switch.
 

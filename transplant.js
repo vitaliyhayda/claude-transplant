@@ -946,7 +946,43 @@ async function logins(paths) {
       if (r.emailAddress) emails.set(account, r.emailAddress)
     }
   }
+  const learned = await learnedLogins(paths)
+  for (const [account, email] of Object.entries(learned.emails)) if (!emails.has(account)) emails.set(account, email)
+  for (const [org, name] of Object.entries(learned.orgs)) if (!orgs.has(org)) orgs.set(org, name)
   return { emails, orgs, pairs }
+}
+
+const loginFile = paths => path.join(paths.state, 'logins.json')
+const learnedLogins = async paths => {
+  const value = await readJson(loginFile(paths)).catch(() => null)
+  const valid = (object, check) => Object.fromEntries(Object.entries(object ?? {}).filter(([id, item]) => UUID.test(id) && check(item)))
+  return { emails: valid(value?.emails, item => typeof item === 'string' && item.includes('@')), orgs: valid(value?.orgs, item => typeof item === 'string' && item.length > 0), tried: valid(value?.tried, Number.isFinite) }
+}
+
+export async function learnDesktopLogin(paths, io = {}) {
+  const account = String((await readJson(paths.desktop).catch(() => ({}))).lastKnownAccountUuid ?? '').toLowerCase()
+  const store = await learnedLogins(paths), cookies = (await stat(paths.cookies).catch(() => null))?.mtimeMs
+  if (!UUID.test(account) || cookies === undefined || store.tried[account] === cookies) return null
+  const known = await logins(paths)
+  const unnamed = (await dirs(path.join(paths.records, account))).filter(org => !known.orgs.has(org))
+  if (known.emails.has(account) && !unnamed.length) return null
+  let email = null
+  try {
+    const { headers } = await desktopHeaders(paths, io)
+    const response = await fetch('https://claude.ai/api/account', { headers, redirect: 'error', signal: AbortSignal.timeout(10_000) })
+    const body = response.ok ? await response.json() : null
+    if (String(body?.uuid ?? '').toLowerCase() === account) {
+      if (/^[^\s@]+@[^\s@]+$/.test(body.email_address ?? '')) email = store.emails[account] = body.email_address
+      for (const { organization: org } of Array.isArray(body.memberships) ? body.memberships : []) {
+        if (!UUID.test(org?.uuid ?? '') || typeof org.name !== 'string' || !org.name) continue
+        store.orgs[org.uuid.toLowerCase()] = /team|enterprise/.test(org.raven_type ?? '') || org.capabilities?.includes?.('raven') ? org.name : 'Personal'
+      }
+    }
+  } catch {}
+  if ((email || known.emails.has(account)) && unnamed.every(org => store.orgs[org])) delete store.tried[account]
+  else store.tried[account] = cookies
+  await mkdir(paths.state, { recursive: true }).then(() => saveJson(loginFile(paths), store)).catch(() => {})
+  return email
 }
 
 function ago(ms) {
@@ -1102,24 +1138,29 @@ const remoteId = (id) => {
   try { return wireRemoteId(id) } catch { return null }
 }
 
+async function desktopHeaders(paths, io = {}) {
+  const cookies = io.cookies ?? desktopCookies(paths)
+  return {
+    cookies,
+    headers: {
+      accept: 'application/json',
+      cookie: [...cookies].map(([name, value]) => `${name}=${value}`).join('; '),
+      origin: 'https://claude.ai',
+      referer: 'https://claude.ai/',
+      'user-agent': io.userAgent ?? await desktopUserAgent(paths),
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20'
+    }
+  }
+}
+
 export async function cloudClient(paths, expected = null, io = {}) {
   const memory = io.memory ?? operationMemory()
   const current = io.active ?? await signedIn(paths)
   if (current.state === 'logged-out') throw new Error('Claude Desktop is signed out')
   if (expected && current.state === 'known' && !sameLogin(expected, current)) throw new Error(`sign Claude Desktop into ${loginLabel(expected)}`)
   const selected = expected ?? (current.state === 'known' ? current : null)
-  const cookies = io.cookies ?? desktopCookies(paths)
-  const cookie = [...cookies].map(([name, value]) => `${name}=${value}`).join('; ')
-  const userAgent = io.userAgent ?? await desktopUserAgent(paths)
-  const baseHeaders = {
-    accept: 'application/json',
-    cookie,
-    origin: 'https://claude.ai',
-    referer: 'https://claude.ai/',
-    'user-agent': userAgent,
-    'anthropic-version': '2023-06-01',
-    'anthropic-beta': 'oauth-2025-04-20'
-  }
+  const { cookies, headers: baseHeaders } = await desktopHeaders(paths, io)
   const raw = async (endpoint, options = {}, org = null) => {
     memory.check()
     const response = await fetch(`https://claude.ai${endpoint}`, {
@@ -5403,6 +5444,7 @@ async function main(argv) {
       ''
     ].filter((line) => line !== null).join('\n'))
   }
+  if (args.cmd === 'accounts') await learnDesktopLogin(paths)
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
     if (args.json) {
@@ -5421,7 +5463,7 @@ async function main(argv) {
       const identity = deferred ? await signedIn(paths, table) : null
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
-      const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? latest.receipt.to : null
+      const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? all.find(row => sameAccount(row, latest.receipt.toAccount ?? {}))?.label ?? latest.receipt.to : null
       return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
