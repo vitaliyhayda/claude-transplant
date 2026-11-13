@@ -253,6 +253,7 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 | Move a record while its Desktop worker runs | Desktop rewrites it from cache, rolling back the title and turn count |
 | Leave a matching `.json.tmp` beside a retired record | Desktop restores the source from it on restart, so both are quarantined and restored together |
 | Infer a restart-safe moment from activity logs | Cold records need no restart, held records get an explicit graceful shutdown |
+| Select the menu-only app through a window-based automation API | Codex app selection timed out on Nov 12, 2026 although the process was running | Use the CLI inside the installed app's `Contents/Resources` so the same engine and receipts drive the menu panel |
 | Repair changed records from old snapshots | Would overwrite real title, archive, and pin edits |
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, so it is only a fallback to the log |
