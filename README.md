@@ -96,6 +96,9 @@ To    ↑↓ move · enter confirm
 
 `finish`, `sweep`, `restart`, `keep-local`, `--move-only` and `--restart-approved` handle held work, cloud checks and restarts. `claude-transplant --help` describes each.
 
+CLI account selectors match whitespace-separated terms. Use the account UUID followed by the organization UUID for an
+exact destination. A display label's middle dot is not part of the searchable account identity.
+
 ## What each command touches
 
 Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant`: cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
