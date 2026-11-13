@@ -34,9 +34,10 @@ const productive = () => localActivity.getStore()?.progress()
 const readFile = async (...args) => { const data = await readBytes(...args); productive(); return data }
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 13
+const CACHE_VERSION = 14
 const ARTIFACT_BYTES = 512 * 1024 * 1024
 const ARTIFACT_LINE_BYTES = 16 * 1024 * 1024
+export const TORN_RECORD_LIMIT = Object.freeze({ pieces: 8192, bytes: 16 * 1024 * 1024 })
 const RESTART_LOG_BYTES = 1024 * 1024
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
@@ -1307,21 +1308,77 @@ const locate = (index, id, cwd = '') => {
   return paths.length === 1 ? paths[0] : paths.find((p) => path.basename(path.dirname(p)) === cwd.replace(/[^A-Za-z0-9]/g, '-')) ?? null
 }
 
+export function transcriptRecords(consume, reject = () => {}, check = () => {}) {
+  let lines = [], next = 0, bytes = 0
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+  const openString = (text, quoted = false) => {
+    let escaped = false
+    for (const character of text) {
+      if (escaped) escaped = false
+      else if (quoted && character === '\\') escaped = true
+      else if (character === '"') quoted = !quoted
+    }
+    return quoted && !escaped
+  }
+  const drain = (final = false) => {
+    let first = 0
+    const discard = () => { reject(lines[first].text, lines[first].end); next = ++first; bytes = 0 }
+    while (first < lines.length) {
+      const start = lines[first]
+      if (next === first) {
+        if (!start.trimmed || start.valid) {
+          if (start.valid) consume(start.value, start.end)
+          next = ++first
+          continue
+        }
+        if (!start.trimmed.startsWith('{') || start.bytes > TORN_RECORD_LIMIT.bytes || !openString(start.text)) { discard(); continue }
+        bytes = start.bytes
+        next++
+      }
+      if (next === lines.length) {
+        if (!final) break
+        discard()
+        continue
+      }
+      const piece = lines[next]
+      if (piece.boundary || next - first >= TORN_RECORD_LIMIT.pieces || bytes + 3 + piece.bytes > TORN_RECORD_LIMIT.bytes) { discard(); continue }
+      bytes += 3 + piece.bytes
+      next++
+      if (piece.trimmed.endsWith('}')) {
+        check(bytes)
+        let value
+        try { value = JSON.parse(lines.slice(first, next).map(line => line.text).join('\u2028')) } catch {}
+        if (object(value)) { consume(value, piece.end); first = next; bytes = 0; continue }
+      }
+      if (!openString(piece.text, true)) discard()
+    }
+    if (first) { lines = lines.slice(first); next -= first }
+  }
+  return {
+    write(text, end) {
+      text = text.replace(/\r$/, '')
+      const trimmed = text.trim()
+      let value, valid = false
+      if (trimmed) { try { value = JSON.parse(trimmed); valid = true } catch {} }
+      lines.push({ text, trimmed, value, valid, end, bytes: Buffer.byteLength(text), boundary: valid && object(value) && Object.keys(value).length > 0 })
+      drain()
+    },
+    end: () => drain(true)
+  }
+}
+
 export async function scan(file) {
   const raw = await readFile(file, 'utf8')
   const ids = []
   const forked = new Map()
   let invalid = 0
-  for (const line of raw.split('\n')) {
-    productive()
-    const text = line.trim()
-    if (!text) continue
-    let e
-    try { e = JSON.parse(text) } catch { invalid++; continue }
-    if (!message(e)) continue
+  const records = transcriptRecords(e => {
+    if (!message(e)) return
     ids.push(e.uuid)
     if (typeof e.forkedFrom?.messageUuid === 'string') forked.set(e.uuid, e.forkedFrom)
-  }
+  }, () => { invalid++ })
+  for (const line of raw.split('\n')) { productive(); records.write(line) }
+  records.end()
   return { file, sha: sha(raw), ids, forked, invalid }
 }
 
@@ -1329,15 +1386,11 @@ async function load(file) {
   const raw = await readFile(file, 'utf8')
   const entries = []
   let invalid = 0
-  for (const line of raw.split('\n')) {
-    productive()
-    const text = line.trim()
-    if (!text) continue
-    try {
-      const e = JSON.parse(text)
-      if (e && typeof e === 'object' && !Array.isArray(e)) entries.push(e)
-    } catch { invalid++ }
-  }
+  const records = transcriptRecords(e => {
+    if (e && typeof e === 'object' && !Array.isArray(e)) entries.push(e)
+  }, () => { invalid++ })
+  for (const line of raw.split('\n')) { productive(); records.write(line) }
+  records.end()
   return { sha: sha(raw), entries, invalid }
 }
 
@@ -1738,14 +1791,9 @@ async function artifactIndex(file, kind, budget) {
         const first = data.subarray(0, data.indexOf(10) < 0 ? data.length : data.indexOf(10)).toString('utf8')
         result.timestamp = milliseconds(first.match(/"timestamp"\s*:\s*"([^"]{1,64})"/)?.[1])
       } else {
-        let parts = [], length = 0, skip = false, classified = false
+        let parts = [], length = 0, skip = false, classified = false, irrelevant = false
         const relevant = kind === 'agent' ? ['user', 'assistant'] : ['user', 'assistant', 'attachment', 'queue-operation']
-        const consume = () => {
-          if (skip || !length) return
-          const text = Buffer.concat(parts, length).toString('utf8').trim()
-          if (!text) return
-          let row
-          try { row = JSON.parse(text) } catch { throw artifactError('artifact contains an unreadable relevant line') }
+        const records = transcriptRecords(row => {
           if (!row || !relevant.includes(row.type)) return
           if (['user', 'assistant'].includes(row.type) && row.message && typeof row.message === 'object' && !Array.isArray(row.message)) {
             const event = { ...eventDescriptor(row), sessionId: row.sessionId }
@@ -1761,6 +1809,13 @@ async function artifactIndex(file, kind, budget) {
               cancelled: row.operation === 'remove' && !consumed || ['cancel', 'dequeue'].includes(row.operation), hasContent: Object.hasOwn(row, 'content'),
               ...(typeof row.content === 'string' || Array.isArray(row.content) ? queuedContent(row.content) : { hash: null }) })
           } else if (['user', 'assistant'].includes(row.type)) throw artifactError('artifact message is unreadable')
+        }, text => {
+          const type = text.match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/)?.[1]
+          if (!type || relevant.includes(type)) throw artifactError('artifact contains an unreadable relevant line')
+        })
+        const consume = () => {
+          if (skip) records.end()
+          else records.write(Buffer.concat(parts, length).toString('utf8'))
         }
         for (let position = 0; position < Number(detail.size);) {
           const chunk = await read(Math.min(64 * 1024, Number(detail.size) - position), position)
@@ -1773,14 +1828,18 @@ async function artifactIndex(file, kind, budget) {
               length += part.length
               const type = classified ? null : Buffer.concat(parts, length).subarray(0, 4096).toString('utf8').match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/)?.[1]
               classified ||= Boolean(type) || length >= 4096
-              if (type && !relevant.includes(type)) { skip = true; parts = [] }
-              else if (length > ARTIFACT_LINE_BYTES) throw artifactError('a relevant line exceeds 16 MiB', 'CLOUD_ARTIFACT_LINE_LIMIT')
+              irrelevant ||= Boolean(type) && !relevant.includes(type)
+              if (length > ARTIFACT_LINE_BYTES) {
+                if (irrelevant) { skip = true; parts = [] }
+                else throw artifactError('a relevant line exceeds 16 MiB', 'CLOUD_ARTIFACT_LINE_LIMIT')
+              }
             }
-            if (newline >= 0) { consume(); parts = []; length = 0; skip = false; classified = false }
+            if (newline >= 0) { consume(); parts = []; length = 0; skip = false; classified = false; irrelevant = false }
             start = newline < 0 ? chunk.length : newline + 1
           }
         }
         consume()
+        records.end()
       }
       if ((await artifactStat(file)).signature !== signature) throw artifactError('artifact changed while reading')
       return result
@@ -2452,18 +2511,17 @@ async function bridgeRead(plan, handle, parse = true) {
   const hash = createHash('sha256'), prefix = createHash('sha256'), tail = []
   const buffer = Buffer.alloc(64 * 1024), limit = Buffer.byteLength(plan.bytes ?? '')
   let parts = [], length = 0, last = null, prefixLast = null, invalid = false, newline = false
+  const records = transcriptRecords((entry, end) => {
+    if (entry?.type === 'bridge-session' && entry.sessionId === plan.sessionId) {
+      last = entry
+      if (end <= plan.length) prefixLast = entry
+    }
+  }, () => { invalid = true }, bytes => memory.check(bytes * 4))
   const consume = end => {
     memory.check(length * 4)
-    const text = Buffer.concat(parts, length).toString('utf8').trim()
+    const text = Buffer.concat(parts, length).toString('utf8')
     parts = []; length = 0
-    if (!text) return
-    try {
-      const entry = JSON.parse(text)
-      if (entry?.type === 'bridge-session' && entry.sessionId === plan.sessionId) {
-        last = entry
-        if (end <= plan.length) prefixLast = entry
-      }
-    } catch { invalid = true }
+    records.write(text, end)
   }
   for (let at = 0; at < size;) {
     const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - at), at)
@@ -2488,6 +2546,7 @@ async function bridgeRead(plan, handle, parse = true) {
     at += bytesRead
   }
   if (length) consume(size)
+  records.end()
   await bridgeStable(plan, handle, signature)
   return { length: size, fingerprint: signature, sha: hash.copy().digest('hex'), hash,
     prefixHash: prefix.copy(), intendedSha: prefix.copy().update(plan.bytes ?? '').digest('hex'), prefixSha: prefix.digest('hex'), prefixLast, tail: Buffer.concat(tail), last, invalid, newline }

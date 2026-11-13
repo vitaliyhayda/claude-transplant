@@ -206,6 +206,7 @@ Safety:
 - without history: transcript no longer exists on disk
 - unreadable: Desktop record is not valid JSON, and retirement or undo can't touch its folder until it is fixed or removed
 - source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
+- unparseable lines: Desktop's fork can break a record at U+2028 or U+2029, which the mover rejoins. Only lines that stay unreadable block a fork.
 - compatible source versions: same history in several transcripts without a Desktop fork, blocked unless the target holds every version
 - overlapping versions: shared lineage kept separate, including Desktop forks
 - already there: a Desktop record in the target holds every message and sidecar file

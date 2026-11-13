@@ -11,6 +11,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, learnDesktopLogin, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { scan, TORN_RECORD_LIMIT, transcriptRecords } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -772,6 +773,106 @@ function fork(entries, sourceId, targetId, title) {
   moved.push({ type: 'custom-title', sessionId: targetId, customTitle: title, uuid: randomUUID(), timestamp: new Date().toISOString() })
   return moved
 }
+
+const parsedTranscript = text => {
+  const entries = [], ends = [], rejected = []
+  const records = transcriptRecords((entry, end) => { entries.push(entry); ends.push(end) }, text => rejected.push(text))
+  text.split('\n').forEach((line, index) => records.write(line, index))
+  records.end()
+  return { entries, ends, rejected, invalid: rejected.length }
+}
+
+test('transcriptRecords rejoins torn records at EOF with either separator and final newline', () => {
+  for (const separator of ['\u2028', '\u2029']) for (const ending of ['', '\n']) {
+    const entries = [
+      { type: 'user', text: ['first ', ' second ', ' third'].join(separator) },
+      { type: 'assistant', text: ['one', 'two', 'three', 'four', 'five'].join(separator) }
+    ]
+    const original = entries.map(row => JSON.stringify(row)).join('\n') + ending
+    assert.deepEqual(parsedTranscript(original).entries, entries)
+    const parsed = parsedTranscript(original.replaceAll(separator, '\n'))
+    assert.equal(parsed.invalid, 0)
+    assert.deepEqual(parsed.entries, entries.map(row => ({ ...row, text: row.text.replaceAll(separator, '\u2028') })))
+    assert.deepEqual(parsed.ends, [2, 7])
+    assert.deepEqual(parsedTranscript(parsed.entries.map(row => JSON.stringify(row)).join('\n')).entries, parsed.entries)
+  }
+})
+
+test('transcriptRecords preserves scalar, empty object, array, blank and escaped string fragments', () => {
+  const entry = { text: ['  first ', '42', 'true', 'null', '{}', '[]', '[1,2]', '', ' \t ', 'quotes " and slash \\', 'last  '].join('\u2028') }
+  const torn = JSON.stringify(entry).replaceAll('\u2028', '\n')
+  for (const text of [torn, torn.replaceAll('\n', '\r\n')]) {
+    const parsed = parsedTranscript(`\n \t\n${text}\n\n`)
+    assert.equal(parsed.invalid, 0)
+    assert.deepEqual(parsed.entries, [entry])
+  }
+  const values = [42, true, null, {}, [], [1, 2]]
+  assert.deepEqual(parsedTranscript(values.map(value => JSON.stringify(value)).join('\n')).entries, values)
+})
+
+test('transcriptRecords retries at the next physical line and stops at real records', () => {
+  const entry = { type: 'user', text: 'one\u2028two\u2028three' }
+  const torn = JSON.stringify(entry).replaceAll('\u2028', '\n'), broken = '{"type":"user","uuid":"broken'
+  for (const text of [`${broken}\n${torn}`, `${torn}\n${broken}`]) {
+    const parsed = parsedTranscript(text)
+    assert.equal(parsed.invalid, 1)
+    assert.deepEqual(parsed.entries, [entry])
+    assert.deepEqual(parsed.rejected, [broken])
+  }
+  const real = { type: 'assistant', text: 'real record' }
+  const parsed = parsedTranscript(`${broken}\n\n${JSON.stringify(real)}\ntail"}\n${torn}`)
+  assert.equal(parsed.invalid, 2)
+  assert.deepEqual(parsed.entries, [real, entry])
+  for (const text of ['', '\n \n', '{}', '42']) assert.equal(parsedTranscript(text).invalid, 0)
+  assert.equal(parsedTranscript('{broken}\n\nnot json\n{"unfinished":"\nfragment\n').invalid, 4)
+})
+
+test('transcriptRecords rejoins several MiB and thousands of pieces within its limits', () => {
+  const entry = { text: Array.from({ length: 5000 }, () => '🙂'.repeat(256)).join('\u2028') }
+  const text = JSON.stringify(entry)
+  assert.ok(Buffer.byteLength(text) > 4 * 1024 * 1024)
+  const parsed = parsedTranscript(text.replaceAll('\u2028', '\n'))
+  assert.equal(parsed.invalid, 0)
+  assert.deepEqual(parsed.entries, [entry])
+})
+
+test('transcriptRecords caps pieces and UTF-8 joined bytes and continues with later records', () => {
+  const later = { text: 'later\u2028torn\u2028record' }, tail = JSON.stringify(later).replaceAll('\u2028', '\n')
+  const atPieces = { text: Array(TORN_RECORD_LIMIT.pieces).fill('').join('\u2028') }
+  assert.deepEqual(parsedTranscript(JSON.stringify(atPieces).replaceAll('\u2028', '\n')).entries, [atPieces])
+  const overPieces = JSON.stringify({ text: atPieces.text + '\u2028' }).replaceAll('\u2028', '\n')
+  const pieces = parsedTranscript(`${overPieces}\n${tail}`)
+  assert.equal(pieces.invalid, 2)
+  assert.deepEqual(pieces.entries, [later])
+  const overhead = Buffer.byteLength(JSON.stringify({ text: '\u2028' }))
+  const atBytes = { text: 'é'.repeat(Math.floor((TORN_RECORD_LIMIT.bytes - overhead) / 2)) + 'x'.repeat((TORN_RECORD_LIMIT.bytes - overhead) % 2) + '\u2028' }
+  assert.equal(Buffer.byteLength(JSON.stringify(atBytes)), TORN_RECORD_LIMIT.bytes)
+  assert.deepEqual(parsedTranscript(JSON.stringify(atBytes).replaceAll('\u2028', '\n')).entries, [atBytes])
+  const overBytes = JSON.stringify({ text: atBytes.text + 'x' }).replaceAll('\u2028', '\n')
+  const bytes = parsedTranscript(`${overBytes}\n${tail}`)
+  assert.equal(bytes.invalid, 2)
+  assert.deepEqual(bytes.entries, [later])
+})
+
+test('transcriptRecords and scan bound parse attempts on 20,000 consecutive broken object lines', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-torn-cost-')), file = path.join(root, 'transcript.jsonl'), count = 20_000
+  for (const line of ['{broken}', '{"text":"broken}']) {
+    const raw = `${line}\n`.repeat(count)
+    await writeFile(file, raw)
+    const parse = JSON.parse
+    let attempts = 0
+    const mock = t.mock.method(JSON, 'parse', (...args) => { attempts++; return parse(...args) })
+    try {
+      const parsed = parsedTranscript(raw)
+      assert.equal(parsed.invalid, count)
+      assert.deepEqual(parsed.entries, [])
+      const scanned = await scan(file)
+      assert.equal(scanned.invalid, count)
+      assert.deepEqual(scanned.ids, [])
+      assert.ok(attempts <= count * 4, `${attempts} parse attempts for ${count} lines read twice`)
+    } finally { mock.mock.restore() }
+  }
+})
 
 test('normalize collapses replays and reports conflicts', () => {
   const a = entry('user', 1, null, id(0))
@@ -4940,7 +5041,7 @@ test('artifact legacy cache upgrades preserve warm history and manifest hits', a
   assert.ok(indexed.every(file => path.basename(file) === `${SOURCE}.jsonl` || path.basename(path.dirname(path.dirname(file))) === SOURCE))
   const saved = JSON.parse(await readFile(file))
   assert.deepEqual(saved.histories, cache.histories)
-  assert.equal(saved.version, 13)
+  assert.equal(saved.version, 14)
   assert.equal(saved.semanticVersion, 3)
   f.remote = f.main
   f.updated = '2026-09-02T00:00:00.000Z'
@@ -8115,6 +8216,30 @@ test('compatible Desktop parent and archived fork move separately and undo witho
   }
 })
 
+test('a torn Desktop fork moves with its parent retained and its original bytes preserved', async () => {
+  const h = await home(), child = id(777)
+  const base = [entry('user', 1, null, SOURCE, { message: { role: 'user', content: 'first\u2028second\u2028third' } }), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, base)
+  await h.write(child, fork(base, SOURCE, child, 'Torn fork'))
+  const transcript = path.join(h.project, `${child}.jsonl`)
+  await writeFile(transcript, (await readFile(transcript, 'utf8')).replaceAll('\u2028', '\n'))
+  const before = await readFile(transcript)
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Parent' }))
+  await h.record('P', child, rehomeRecord({ title: 'Torn fork', forkedFromSessionId: `local_${SOURCE}` }))
+  const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths, () => {}, { writeCache: true, processes: [] })
+  assert.equal(inv.blocked.length, 0)
+  assert.deepEqual(inv.move.map(row => row.id), [child])
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.deepEqual((await readdir(h.dir('T'))).sort(), [`local_${SOURCE}.json`, `local_${child}.json`].sort())
+  assert.deepEqual(await readFile(transcript), before)
+  assert.equal((await scan(transcript)).invalid, 0)
+  await undo(h.paths)
+  assert.deepEqual(await readFile(transcript), before)
+  assert.deepEqual(await readdir(h.dir('T')), [`local_${SOURCE}.json`])
+})
+
 test('a Desktop fork is preserved when its parent already covers its history in the destination', async () => {
   const h = await home(), child = id(777)
   const base = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
@@ -8758,7 +8883,7 @@ test('rehome retirement allows shared growth without duplicate records', async (
 })
 
 test('corrupt and legacy planning caches refresh replay analysis', async () => {
-  for (const state of ['corrupt', 'legacy']) {
+  for (const state of ['corrupt', 'legacy', 'before-torn-records']) {
     const h = await home()
     const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
     await mkdir(teamDir, { recursive: true })
@@ -8779,7 +8904,7 @@ test('corrupt and legacy planning caches refresh replay analysis', async () => {
     const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
     await inventory([from], to, h.paths, () => {}, { writeCache: true, processes: [] })
     const file = path.join(h.paths.state, 'cache.json'), stored = JSON.parse(await readFile(file))
-    stored.version = 10
+    stored.version = state === 'before-torn-records' ? 13 : 10
     for (const row of Object.values(stored.histories)) {
       row.value.result.conflicts = 10
       row.value.result.comparable = false
@@ -8791,7 +8916,7 @@ test('corrupt and legacy planning caches refresh replay analysis', async () => {
     assert.equal(inv.cacheStats.historyHits, 0)
     assert.ok(inv.cacheStats.historyMisses > 0)
     const refreshed = JSON.parse(await readFile(file))
-    assert.equal(refreshed.version, 13)
+    assert.equal(refreshed.version, 14)
     assert.equal(refreshed.semanticVersion, 3)
     assert.ok(Object.values(refreshed.histories).every(row => row.value.result.conflicts === 0 && row.value.result.comparable))
     const warm = await inventory([from], to, h.paths, () => {}, { processes: [] })
