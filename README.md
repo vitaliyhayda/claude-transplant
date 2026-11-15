@@ -281,6 +281,7 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.2.2 | 27.0.1 | 5.11492.5 | 2.1.325 | 2026-11-14 |
 | 4.2.0 | 27.0.1 | 4.4212.0 | 2.1.309 | 2026-10-30 |
 | 4.1.6 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-29 |
 | 4.1.5 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
