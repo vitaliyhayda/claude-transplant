@@ -33,6 +33,7 @@ struct Account: Decodable, Identifiable {
     var pendingPartial: Bool? = nil
     var pendingCancel: String? = nil
     var kept: Bool? = nil
+    var stray: Bool? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
@@ -150,6 +151,7 @@ struct Event: Decodable {
     let sessions: Int?
     let restored: Int?
     let refused: [String]?
+    let retained: Bool?
     let reason: String?
     let nothing: Bool?
     let code: String?
@@ -432,7 +434,7 @@ final class Model: ObservableObject {
         let folder = (node(config.node) as NSString).deletingLastPathComponent
         let process = Process()
         process.executableURL = URL(fileURLWithPath: folder + "/npx")
-        process.arguments = ["-y", "claude-transplant@" + version, "menubar"]
+        process.arguments = ["-y", "--prefer-online", "claude-transplant@" + version, "menubar"]
         process.environment = ProcessInfo.processInfo.environment.merging(["PATH": folder + ":" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")]) { $1 }
         updating = true
         note = "Updating to \(version)."
@@ -531,7 +533,7 @@ final class Model: ObservableObject {
     func sourceTag(_ account: Account) -> String? {
         if let event = sourceActivity, event.sourceId == account.id { return (event.activity ?? event.stage) == "cloud" ? "clearing" : "checking" }
         if account.kept == true { return "kept" }
-        guard account.pending != nil else { return nil }
+        guard account.pending != nil else { return account.stray == true ? "stray" : nil }
         if account.pendingState == "partial" { return "not moved" }
         if account.pendingAction == "blocked" { return "kept" }
         if account.pendingState == "login", account.signedIn == true { return "signing in" }
@@ -612,7 +614,7 @@ final class Model: ObservableObject {
     }
 
     func selectTarget(_ id: String) {
-        guard !running else { return }
+        guard !running, accounts.first(where: { $0.id == id })?.stray != true else { return }
         if from.isEmpty { excluded = [] }
         clearResult()
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
@@ -642,7 +644,7 @@ final class Model: ObservableObject {
     }
 
     private func settle() {
-        if let selected = to, !accounts.contains(where: { $0.id == selected }) {
+        if let selected = to, !accounts.contains(where: { $0.id == selected && $0.stray != true }) {
             to = nil
             targetChosen = false
         }
@@ -651,7 +653,7 @@ final class Model: ObservableObject {
         } else if !movable, let destination = pendingAccounts.compactMap(\.receiptDestination).first {
             to = destination
         } else if !targetChosen {
-            let recent = accounts.filter(listed).sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
+            let recent = accounts.filter { listed($0) && $0.stray != true }.sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
             to = accounts.first(where: { $0.active == true }).flatMap { current in recent.first { $0.id != current.id }?.id }
         }
         let ids = accounts.map(\.id)
@@ -850,7 +852,9 @@ final class Model: ObservableObject {
             pendingResult = false
             notify(cloudRestored > 0 ? quantity(cloudRestored, "cloud mirror restored", "cloud mirrors restored") : restored > 0 ? quantity(restored, "source entry restored", "source entries restored") : quantity(event.sessions ?? 0, "session undone", "sessions undone"), event.note ?? "")
         } else if let refused = event.refused {
-            note = operationArgs.first == "keep-local" ? "Remaining work could not be cancelled. Check Details." : "Undo stopped. The move's records need checking."
+            note = operationArgs.first == "keep-local" ? "Remaining work could not be cancelled. Check Details." :
+                event.reason == nil && event.retained != true ? "Undo stopped: \(quantity(refused.count, "moved session changed or is still open", "moved sessions changed or are still open")). Nothing was undone." :
+                "Undo stopped. The move's records need checking."
             restartAvailable = false
             lines = refused.map { ("kept", $0) }
             if let reason = event.reason { lines.append(("reason", reason)) }
@@ -1028,10 +1032,11 @@ final class Model: ObservableObject {
             if result?.code == "LOCK_BUSY" { return }
             let problem = result?.error.flatMap { $0.isEmpty ? nil : $0 } ?? (status != 0 || result?.ok != true ? (error.isEmpty ? "Background check did not complete" : error) : nil)
             let clean = problem == nil && result?.issues == 0
-            let resolvedRestartError = restartAvailable && clean && result?.complete == true && canMutate && pendingAccounts.isEmpty && (result?.changed ?? []).isEmpty &&
+            let unreadable = result?.changed?.filter { $0.fields.contains("record unavailable") } ?? []
+            let resolvedRestartError = restartAvailable && clean && result?.complete == true && canMutate && pendingAccounts.isEmpty && unreadable.isEmpty &&
                 result?.receipt != nil && result?.receipt == sweepFailureReceipt && failedFinish == nil && !preserveNotice
             if clean, result?.complete == true, !restartAvailable || resolvedRestartError { lines.removeAll { ["background", "previous check"].contains($0.0) } }
-            if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish && result?.complete == true && pendingAccounts.isEmpty && (result?.changed ?? []).isEmpty, let sweepNote, note == sweepNote {
+            if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish && result?.complete == true && pendingAccounts.isEmpty && unreadable.isEmpty, let sweepNote, note == sweepNote {
                 note = ""
                 symbol = "arrow.left.arrow.right"
                 self.sweepNote = nil
@@ -1050,23 +1055,18 @@ final class Model: ObservableObject {
                     operationArgs = ["finish", "--json"]
                     reopenFailure()
                 }
-            } else if let changed = result?.changed, !changed.isEmpty {
-                let unavailable = changed.filter { $0.fields.contains("record unavailable") }
-                if !unavailable.isEmpty { sweepFailureReceipt = nil }
-                let names = ["title": "title", "isArchived": "archive state", "isStarred": "starred state"]
-                let fields = Set(changed.flatMap(\.fields)).sorted().map { names[$0] ?? $0 }.joined(separator: ", ")
-                note = unavailable.isEmpty
-                    ? quantity(changed.count, "moved session changed", "moved sessions changed") + " " + fields + ". Snapshots are in the receipt."
-                    : quantity(unavailable.count, "moved session record cannot be read", "moved session records cannot be read") + ". Check Details."
-                symbol = unavailable.isEmpty ? "info.circle" : "exclamationmark.triangle"
-                lines.append(("metadata", changed.map { self.identity($0.title, $0.id) + " | " + $0.fields.map { names[$0] ?? $0 }.joined(separator: ", ") }.joined(separator: "\n")))
+            } else if !unreadable.isEmpty {
+                sweepFailureReceipt = nil
+                note = quantity(unreadable.count, "moved session record cannot be read", "moved session records cannot be read") + ". Check Details."
+                symbol = "exclamationmark.triangle"
+                lines.append(("metadata", unreadable.map { self.identity($0.title, $0.id) + " | " + $0.fields.joined(separator: ", ") }.joined(separator: "\n")))
             }
             if resolvedRestartError {
                 sweepFailureReceipt = nil
                 symbol = "info.circle"
                 note = restartNote ?? "The source checks finished. Restart Claude to refresh the sidebar."
             }
-            if problem == nil, result?.restart == true, result?.changed?.contains(where: { $0.fields.contains("record unavailable") }) != true {
+            if problem == nil, result?.restart == true, unreadable.isEmpty {
                 restartAvailable = true
                 if !running {
                     badge = ""
@@ -1077,7 +1077,7 @@ final class Model: ObservableObject {
                 if result?.complete == true && !running { selectionComplete = true; from = []; to = nil }
             }
             if clean, let failedFinish, result?.receipt == failedFinish, result?.complete == true,
-               (result?.changed ?? []).isEmpty, pendingAccounts.isEmpty, !restartAvailable {
+               unreadable.isEmpty, pendingAccounts.isEmpty, !restartAvailable {
                 clearResult()
                 pendingResult = false
                 selectionComplete = true
@@ -1085,7 +1085,7 @@ final class Model: ObservableObject {
                 symbol = "arrow.left.arrow.right"
                 settle()
             }
-            if result?.code != "REOPEN_FAILED", let summary = result?.summary, !summary.notMoved.isEmpty, (result?.changed ?? []).isEmpty {
+            if result?.code != "REOPEN_FAILED", let summary = result?.summary, !summary.notMoved.isEmpty, unreadable.isEmpty {
                 lines = summaryLines(summary) + lines.filter { ["background", "metadata"].contains($0.0) }
                 if !restartAvailable { note = pendingAccounts.isEmpty ? "\(summary.moved) moved. " + quantity(summary.notMoved.count, "session was not moved.", "sessions were not moved.") : pendingPrompt }
             }
@@ -1239,7 +1239,7 @@ struct Row: View {
     let muted: Bool
     var tag: String? = nil
     let action: () -> Void
-    var tagLabels: [String] { [account.active == true ? "active" : nil, radio ? nil : tag].compactMap { $0 } }
+    var tagLabels: [String] { [account.active == true ? "active" : nil, radio ? (account.stray == true ? "stray" : nil) : tag].compactMap { $0 } }
 
     var body: some View {
         Button(action: action) {
@@ -1251,7 +1251,10 @@ struct Row: View {
                     Text(account.name).font(.system(size: 13, weight: selected ? .semibold : .medium)).lineLimit(1).truncationMode(.middle)
                     HStack(spacing: 6) {
                         Text(account.plan).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                        ForEach(tagLabels, id: \.self) { text in Tag(text: text, color: text == "active" ? .green : .orange) }
+                        ForEach(tagLabels, id: \.self) { text in
+                            Tag(text: text, color: text == "active" ? .green : .orange)
+                                .help(text == "stray" ? "Claude Desktop left this folder during a sign-in switch and never shows its sessions. Move them to another account." : "")
+                        }
                     }
                 }
                 Spacer(minLength: 0)
@@ -1509,7 +1512,7 @@ struct Panel: View {
             Spacer(minLength: Panel.gap)
             column("To") {
                 ForEach(model.visibleAccounts) { account in
-                    Row(account: account, radio: true, selected: model.to == account.id, muted: false) { model.selectTarget(account.id) }
+                    Row(account: account, radio: true, selected: model.to == account.id, muted: account.stray == true) { model.selectTarget(account.id) }
                 }
             }
             .frame(width: width, alignment: .leading)

@@ -34,9 +34,10 @@ const productive = () => localActivity.getStore()?.progress()
 const readFile = async (...args) => { const data = await readBytes(...args); productive(); return data }
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 13
+const CACHE_VERSION = 14
 const ARTIFACT_BYTES = 512 * 1024 * 1024
 const ARTIFACT_LINE_BYTES = 16 * 1024 * 1024
+export const TORN_RECORD_LIMIT = Object.freeze({ pieces: 8192, bytes: 16 * 1024 * 1024 })
 const RESTART_LOG_BYTES = 1024 * 1024
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
@@ -924,11 +925,15 @@ async function logins(paths) {
   const emails = new Map()
   const orgs = new Map()
   const pairs = new Map()
+  const confirmed = new Set()
   const take = async (file) => {
     const a = (await readJson(file).catch(() => ({}))).oauthAccount
     if (a?.accountUuid && a.emailAddress) emails.set(a.accountUuid, a.emailAddress)
     if (a?.organizationUuid && a.organizationName) orgs.set(a.organizationUuid, a.organizationType && !/team|enterprise/.test(a.organizationType) ? 'Personal' : a.organizationName)
-    if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) pairs.set(`${a.accountUuid}/${a.organizationUuid}`, { account: a.accountUuid, org: a.organizationUuid })
+    if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) {
+      pairs.set(`${a.accountUuid}/${a.organizationUuid}`, { account: a.accountUuid, org: a.organizationUuid })
+      confirmed.add(`${a.accountUuid}/${a.organizationUuid}`.toLowerCase())
+    }
   }
   for (const e of await readdir(paths.home, { withFileTypes: true }).catch(() => [])) {
     if (e.name.startsWith('.claude')) await take(e.isDirectory() ? path.join(paths.home, e.name, '.claude.json') : path.join(paths.home, e.name))
@@ -946,7 +951,73 @@ async function logins(paths) {
       if (r.emailAddress) emails.set(account, r.emailAddress)
     }
   }
-  return { emails, orgs, pairs }
+  const learned = await learnedLogins(paths)
+  for (const [account, email] of Object.entries(learned.emails)) if (!emails.has(account)) emails.set(account, email)
+  for (const [org, name] of Object.entries(learned.orgs)) if (!orgs.has(org)) orgs.set(org, name)
+  const members = new Map(Object.entries(learned.members).map(([account, { orgs }]) => [account, new Set(orgs)]))
+  return { emails, orgs, pairs, confirmed, members }
+}
+
+// On an account switch Desktop opens the new organization a second or two before it changes the account, and that
+// moment leaves a folder for the old account inside the new organization. Desktop never shows sessions there.
+function strayFolders({ orgs, confirmed, members }, current) {
+  const owners = new Map()
+  const own = (account, org) => owners.set(org, new Set([...(owners.get(org) ?? []), account]))
+  for (const [account, list] of members) for (const org of list) own(account, org)
+  for (const pair of confirmed) own(...pair.split('/'))
+  return (account, org) => {
+    if (confirmed.has(`${account}/${org}`) || (current.state === 'known' && current.account === account && current.org === org)) return false
+    if (members.has(account)) return !members.get(account).has(org)
+    return orgs.get(org) === 'Personal' && [...(owners.get(org) ?? [])].some(other => other !== account)
+  }
+}
+
+const idleStray = row => row.stray && !row.sessions.length && !row.unreadable.length && !(row.taskSessions.registry?.scheduledTasks ?? []).length
+const STRAY_TARGET = 'is a folder Claude Desktop left behind during a sign-in switch, and Desktop never shows sessions there. Pick another destination'
+
+const loginFile = paths => path.join(paths.state, 'logins.json')
+const learnedLogins = async paths => {
+  const value = await readJson(loginFile(paths)).catch(() => null)
+  const valid = (object, check) => Object.fromEntries(Object.entries(object ?? {}).filter(([id, item]) => UUID.test(id) && check(item)))
+  return { emails: valid(value?.emails, item => typeof item === 'string' && item.includes('@')), orgs: valid(value?.orgs, item => typeof item === 'string' && item.length > 0), tried: valid(value?.tried, Number.isFinite),
+    members: valid(value?.members, item => Array.isArray(item?.orgs) && item.orgs.every(org => UUID.test(org)) && Number.isFinite(item.at)) }
+}
+
+export async function learnDesktopLogin(paths, io = {}) {
+  const account = String((await readJson(paths.desktop).catch(() => ({}))).lastKnownAccountUuid ?? '').toLowerCase()
+  const store = await learnedLogins(paths), cookies = (await stat(paths.cookies).catch(() => null))?.mtimeMs
+  if (!UUID.test(account) || cookies === undefined || store.tried[account] === cookies) return null
+  const known = await logins(paths)
+  const folders = await dirs(path.join(paths.records, account))
+  const unnamed = folders.filter(org => !known.orgs.has(org))
+  const learnedAt = store.members[account]?.at ?? 0, unconfirmed = []
+  for (const org of folders) {
+    if (known.confirmed.has(`${account}/${org}`) || store.members[account]?.orgs.includes(org)) continue
+    const folder = await stat(path.join(paths.records, account, org)).catch(() => null)
+    if (folder && (folder.birthtimeMs || folder.mtimeMs) > learnedAt) unconfirmed.push(org)
+  }
+  if (known.emails.has(account) && !unnamed.length && !unconfirmed.length) return null
+  let email = null, membership = false
+  try {
+    const { headers } = await desktopHeaders(paths, io)
+    const response = await fetch('https://claude.ai/api/account', { headers, redirect: 'error', signal: AbortSignal.timeout(10_000) })
+    const body = response.ok ? await response.json() : null
+    if (String(body?.uuid ?? '').toLowerCase() === account) {
+      if (/^[^\s@]+@[^\s@]+$/.test(body.email_address ?? '')) email = store.emails[account] = body.email_address
+      const orgs = []
+      for (const { organization: org } of Array.isArray(body.memberships) ? body.memberships : []) {
+        if (!UUID.test(org?.uuid ?? '')) continue
+        orgs.push(org.uuid.toLowerCase())
+        if (typeof org.name !== 'string' || !org.name) continue
+        store.orgs[org.uuid.toLowerCase()] = /team|enterprise/.test(org.raven_type ?? '') || org.capabilities?.includes?.('raven') ? org.name : 'Personal'
+      }
+      if (orgs.length) { store.members[account] = { orgs, at: Date.now() }; membership = true }
+    }
+  } catch {}
+  if ((email || known.emails.has(account)) && unnamed.every(org => store.orgs[org]) && (!unconfirmed.length || membership)) delete store.tried[account]
+  else store.tried[account] = cookies
+  await mkdir(paths.state, { recursive: true }).then(() => saveJson(loginFile(paths), store)).catch(() => {})
+  return email
 }
 
 function ago(ms) {
@@ -1102,24 +1173,29 @@ const remoteId = (id) => {
   try { return wireRemoteId(id) } catch { return null }
 }
 
+async function desktopHeaders(paths, io = {}) {
+  const cookies = io.cookies ?? desktopCookies(paths)
+  return {
+    cookies,
+    headers: {
+      accept: 'application/json',
+      cookie: [...cookies].map(([name, value]) => `${name}=${value}`).join('; '),
+      origin: 'https://claude.ai',
+      referer: 'https://claude.ai/',
+      'user-agent': io.userAgent ?? await desktopUserAgent(paths),
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20'
+    }
+  }
+}
+
 export async function cloudClient(paths, expected = null, io = {}) {
   const memory = io.memory ?? operationMemory()
   const current = io.active ?? await signedIn(paths)
   if (current.state === 'logged-out') throw new Error('Claude Desktop is signed out')
   if (expected && current.state === 'known' && !sameLogin(expected, current)) throw new Error(`sign Claude Desktop into ${loginLabel(expected)}`)
   const selected = expected ?? (current.state === 'known' ? current : null)
-  const cookies = io.cookies ?? desktopCookies(paths)
-  const cookie = [...cookies].map(([name, value]) => `${name}=${value}`).join('; ')
-  const userAgent = io.userAgent ?? await desktopUserAgent(paths)
-  const baseHeaders = {
-    accept: 'application/json',
-    cookie,
-    origin: 'https://claude.ai',
-    referer: 'https://claude.ai/',
-    'user-agent': userAgent,
-    'anthropic-version': '2023-06-01',
-    'anthropic-beta': 'oauth-2025-04-20'
-  }
+  const { cookies, headers: baseHeaders } = await desktopHeaders(paths, io)
   const raw = async (endpoint, options = {}, org = null) => {
     memory.check()
     const response = await fetch(`https://claude.ai${endpoint}`, {
@@ -1212,8 +1288,9 @@ const desktopSession = (file, record) => ({
 })
 
 export async function accounts(paths, processes = null) {
-  const { emails, orgs, pairs } = await logins(paths)
+  const identities = await logins(paths), { emails, orgs, pairs } = identities
   const cur = await signedIn(paths, processes)
+  const stray = strayFolders(identities, cur)
   const out = []
   const stored = await records(paths.records)
   const known = [...pairs.values()].filter((pair) => !stored.some((row) => sameAccount(row, pair))).map(({ account, org }) => ({ account, org, dir: path.join(paths.records, account, org), files: [] }))
@@ -1232,10 +1309,11 @@ export async function accounts(paths, processes = null) {
     let scheduled = new Set()
     let taskError = null
     try { scheduled = await taskSessions(taskFile) } catch (error) { taskError = error.message }
-    const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
+    const leftover = stray(account, org)
+    const label = `${email ?? short(account)} · ${orgName ?? short(org)}${leftover ? ' (stray)' : ''}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
+    out.push({ account, org, dir, email, orgName, sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state, stray: leftover })
   }
   const sessions = out.flatMap(account => account.sessions)
   const claims = Map.groupBy(sessions.flatMap(session => [...new Set([session.id, ...priorSessions(session.record)])]), id => id)
@@ -1266,21 +1344,77 @@ const locate = (index, id, cwd = '') => {
   return paths.length === 1 ? paths[0] : paths.find((p) => path.basename(path.dirname(p)) === cwd.replace(/[^A-Za-z0-9]/g, '-')) ?? null
 }
 
+export function transcriptRecords(consume, reject = () => {}, check = () => {}) {
+  let lines = [], next = 0, bytes = 0
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+  const openString = (text, quoted = false) => {
+    let escaped = false
+    for (const character of text) {
+      if (escaped) escaped = false
+      else if (quoted && character === '\\') escaped = true
+      else if (character === '"') quoted = !quoted
+    }
+    return quoted && !escaped
+  }
+  const drain = (final = false) => {
+    let first = 0
+    const discard = () => { reject(lines[first].text, lines[first].end); next = ++first; bytes = 0 }
+    while (first < lines.length) {
+      const start = lines[first]
+      if (next === first) {
+        if (!start.trimmed || start.valid) {
+          if (start.valid) consume(start.value, start.end)
+          next = ++first
+          continue
+        }
+        if (!start.trimmed.startsWith('{') || start.bytes > TORN_RECORD_LIMIT.bytes || !openString(start.text)) { discard(); continue }
+        bytes = start.bytes
+        next++
+      }
+      if (next === lines.length) {
+        if (!final) break
+        discard()
+        continue
+      }
+      const piece = lines[next]
+      if (piece.boundary || next - first >= TORN_RECORD_LIMIT.pieces || bytes + 3 + piece.bytes > TORN_RECORD_LIMIT.bytes) { discard(); continue }
+      bytes += 3 + piece.bytes
+      next++
+      if (piece.trimmed.endsWith('}')) {
+        check(bytes)
+        let value
+        try { value = JSON.parse(lines.slice(first, next).map(line => line.text).join('\u2028')) } catch {}
+        if (object(value)) { consume(value, piece.end); first = next; bytes = 0; continue }
+      }
+      if (!openString(piece.text, true)) discard()
+    }
+    if (first) { lines = lines.slice(first); next -= first }
+  }
+  return {
+    write(text, end) {
+      text = text.replace(/\r$/, '')
+      const trimmed = text.trim()
+      let value, valid = false
+      if (trimmed) { try { value = JSON.parse(trimmed); valid = true } catch {} }
+      lines.push({ text, trimmed, value, valid, end, bytes: Buffer.byteLength(text), boundary: valid && object(value) && Object.keys(value).length > 0 })
+      drain()
+    },
+    end: () => drain(true)
+  }
+}
+
 export async function scan(file) {
   const raw = await readFile(file, 'utf8')
   const ids = []
   const forked = new Map()
   let invalid = 0
-  for (const line of raw.split('\n')) {
-    productive()
-    const text = line.trim()
-    if (!text) continue
-    let e
-    try { e = JSON.parse(text) } catch { invalid++; continue }
-    if (!message(e)) continue
+  const records = transcriptRecords(e => {
+    if (!message(e)) return
     ids.push(e.uuid)
     if (typeof e.forkedFrom?.messageUuid === 'string') forked.set(e.uuid, e.forkedFrom)
-  }
+  }, () => { invalid++ })
+  for (const line of raw.split('\n')) { productive(); records.write(line) }
+  records.end()
   return { file, sha: sha(raw), ids, forked, invalid }
 }
 
@@ -1288,15 +1422,11 @@ async function load(file) {
   const raw = await readFile(file, 'utf8')
   const entries = []
   let invalid = 0
-  for (const line of raw.split('\n')) {
-    productive()
-    const text = line.trim()
-    if (!text) continue
-    try {
-      const e = JSON.parse(text)
-      if (e && typeof e === 'object' && !Array.isArray(e)) entries.push(e)
-    } catch { invalid++ }
-  }
+  const records = transcriptRecords(e => {
+    if (e && typeof e === 'object' && !Array.isArray(e)) entries.push(e)
+  }, () => { invalid++ })
+  for (const line of raw.split('\n')) { productive(); records.write(line) }
+  records.end()
   return { sha: sha(raw), entries, invalid }
 }
 
@@ -1697,14 +1827,9 @@ async function artifactIndex(file, kind, budget) {
         const first = data.subarray(0, data.indexOf(10) < 0 ? data.length : data.indexOf(10)).toString('utf8')
         result.timestamp = milliseconds(first.match(/"timestamp"\s*:\s*"([^"]{1,64})"/)?.[1])
       } else {
-        let parts = [], length = 0, skip = false, classified = false
+        let parts = [], length = 0, skip = false, classified = false, irrelevant = false
         const relevant = kind === 'agent' ? ['user', 'assistant'] : ['user', 'assistant', 'attachment', 'queue-operation']
-        const consume = () => {
-          if (skip || !length) return
-          const text = Buffer.concat(parts, length).toString('utf8').trim()
-          if (!text) return
-          let row
-          try { row = JSON.parse(text) } catch { throw artifactError('artifact contains an unreadable relevant line') }
+        const records = transcriptRecords(row => {
           if (!row || !relevant.includes(row.type)) return
           if (['user', 'assistant'].includes(row.type) && row.message && typeof row.message === 'object' && !Array.isArray(row.message)) {
             const event = { ...eventDescriptor(row), sessionId: row.sessionId }
@@ -1720,6 +1845,13 @@ async function artifactIndex(file, kind, budget) {
               cancelled: row.operation === 'remove' && !consumed || ['cancel', 'dequeue'].includes(row.operation), hasContent: Object.hasOwn(row, 'content'),
               ...(typeof row.content === 'string' || Array.isArray(row.content) ? queuedContent(row.content) : { hash: null }) })
           } else if (['user', 'assistant'].includes(row.type)) throw artifactError('artifact message is unreadable')
+        }, text => {
+          const type = text.match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/)?.[1]
+          if (!type || relevant.includes(type)) throw artifactError('artifact contains an unreadable relevant line')
+        })
+        const consume = () => {
+          if (skip) records.end()
+          else records.write(Buffer.concat(parts, length).toString('utf8'))
         }
         for (let position = 0; position < Number(detail.size);) {
           const chunk = await read(Math.min(64 * 1024, Number(detail.size) - position), position)
@@ -1732,14 +1864,18 @@ async function artifactIndex(file, kind, budget) {
               length += part.length
               const type = classified ? null : Buffer.concat(parts, length).subarray(0, 4096).toString('utf8').match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/)?.[1]
               classified ||= Boolean(type) || length >= 4096
-              if (type && !relevant.includes(type)) { skip = true; parts = [] }
-              else if (length > ARTIFACT_LINE_BYTES) throw artifactError('a relevant line exceeds 16 MiB', 'CLOUD_ARTIFACT_LINE_LIMIT')
+              irrelevant ||= Boolean(type) && !relevant.includes(type)
+              if (length > ARTIFACT_LINE_BYTES) {
+                if (irrelevant) { skip = true; parts = [] }
+                else throw artifactError('a relevant line exceeds 16 MiB', 'CLOUD_ARTIFACT_LINE_LIMIT')
+              }
             }
-            if (newline >= 0) { consume(); parts = []; length = 0; skip = false; classified = false }
+            if (newline >= 0) { consume(); parts = []; length = 0; skip = false; classified = false; irrelevant = false }
             start = newline < 0 ? chunk.length : newline + 1
           }
         }
         consume()
+        records.end()
       }
       if ((await artifactStat(file)).signature !== signature) throw artifactError('artifact changed while reading')
       return result
@@ -2411,18 +2547,17 @@ async function bridgeRead(plan, handle, parse = true) {
   const hash = createHash('sha256'), prefix = createHash('sha256'), tail = []
   const buffer = Buffer.alloc(64 * 1024), limit = Buffer.byteLength(plan.bytes ?? '')
   let parts = [], length = 0, last = null, prefixLast = null, invalid = false, newline = false
+  const records = transcriptRecords((entry, end) => {
+    if (entry?.type === 'bridge-session' && entry.sessionId === plan.sessionId) {
+      last = entry
+      if (end <= plan.length) prefixLast = entry
+    }
+  }, () => { invalid = true }, bytes => memory.check(bytes * 4))
   const consume = end => {
     memory.check(length * 4)
-    const text = Buffer.concat(parts, length).toString('utf8').trim()
+    const text = Buffer.concat(parts, length).toString('utf8')
     parts = []; length = 0
-    if (!text) return
-    try {
-      const entry = JSON.parse(text)
-      if (entry?.type === 'bridge-session' && entry.sessionId === plan.sessionId) {
-        last = entry
-        if (end <= plan.length) prefixLast = entry
-      }
-    } catch { invalid = true }
+    records.write(text, end)
   }
   for (let at = 0; at < size;) {
     const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - at), at)
@@ -2447,6 +2582,7 @@ async function bridgeRead(plan, handle, parse = true) {
     at += bytesRead
   }
   if (length) consume(size)
+  records.end()
   await bridgeStable(plan, handle, signature)
   return { length: size, fingerprint: signature, sha: hash.copy().digest('hex'), hash,
     prefixHash: prefix.copy(), intendedSha: prefix.copy().update(plan.bytes ?? '').digest('hex'), prefixSha: prefix.digest('hex'), prefixLast, tail: Buffer.concat(tail), last, invalid, newline }
@@ -4675,8 +4811,8 @@ export function executeMove(from, to, paths, options = {}) {
     if (options.resume && (deferred?.mode !== 'local' || deferred.file !== options.resumeFile)) return { ok: false, reason: 'The pending move changed. No stale continuation was run.' }
     let existing = options.resume ? deferred : null
     if (from && deferred && !existing) return { deferred, ok: false, complete: false, pendingCloud: deferred.mode === 'cloud' ? deferred.sources.length : 0 }
-    const drift = await inspectPlaced(paths)
-    if (drift.changed.length) report('changed', `${quantity(drift.changed.length, 'moved session')} now has different metadata. Evidence saved with the receipt.`)
+    const unreadable = (await inspectPlaced(paths)).changed.filter(row => row.fields.includes('record unavailable'))
+    if (unreadable.length) report('changed', `${quantity(unreadable.length, 'moved session record cannot be read', 'moved session records cannot be read')}. Evidence saved with the receipt.`)
     if (options.finish && deferred?.file !== options.receiptFile) return { ok: false, reason: 'The pending move changed before its restart' }
     let chosen = saved?.selection ?? selection
     const sessionFiles = new Set(receiptSummary(existing?.receipt ?? {}).notMoved.map(row => row.file).filter(Boolean))
@@ -4981,11 +5117,13 @@ function describe(list) {
   return emails.size === 1 ? `${[...emails][0]} · ${list.map((a) => a.orgName ?? short(a.org)).join(' + ')}` : list.map((a) => a.label).join(', ')
 }
 
-function find(all, sel) {
+function find(all, sel, target = false) {
   const hay = (a) => `${a.email ?? ''} ${a.account} ${a.orgName ?? ''} ${a.org}`.toLowerCase()
   const hits = all.filter((a) => sel.toLowerCase().split(/\s+/).every((t) => hay(a).includes(t)))
-  if (hits.length === 1) return hits[0]
-  throw new Error(hits.length ? `"${sel}" matches ${hits.map((a) => a.label).join(', ')}` : `"${sel}" matches no account`)
+  const usable = target ? hits.filter((a) => !a.stray) : hits
+  if (usable.length === 1) return usable[0]
+  if (hits.length && !usable.length) throw new Error(`${hits[0].label} ${STRAY_TARGET}`)
+  throw new Error(usable.length ? `"${sel}" matches ${usable.map((a) => a.label).join(', ')}` : `"${sel}" matches no account`)
 }
 
 export function step(state, key) {
@@ -5261,7 +5399,7 @@ async function main(argv) {
     if (!file) return
     out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
   }
-  if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
+  if (args.cmd === 'menubar') return out.on('error', () => {}).write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
   if (args.cmd === 'sweep') {
     const result = await sweep(paths, { report: args.json ? reporter(true) : undefined })
     const failed = result.result?.failed ?? result.result?.receipt?.failed ?? result.verification?.failed ?? []
@@ -5403,6 +5541,7 @@ async function main(argv) {
       ''
     ].filter((line) => line !== null).join('\n'))
   }
+  if (args.cmd === 'accounts') await learnDesktopLogin(paths)
   const all = await accounts(paths)
   if (args.cmd === 'accounts') {
     if (args.json) {
@@ -5421,8 +5560,9 @@ async function main(argv) {
       const identity = deferred ? await signedIn(paths, table) : null
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
-      const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? latest.receipt.to : null
-      return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
+      const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? all.find(row => sameAccount(row, latest.receipt.toAccount ?? {}))?.label ?? latest.receipt.to : null
+      const involved = row => [...(deferred?.sources ?? []), deferred?.receipt.toAccount].some(other => other && sameAccount(other, row))
+      return emit(all.filter(row => !idleStray(row) || involved(row)).map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt, stray }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
           ? waitingSessions({ held: deferred.receipt.held?.filter(held => held.sources.some(member => sameAccount(member, source))), cloudChecks: deferred.receipt.cloudChecks.filter(check => sameAccount(check, source)) })
@@ -5441,6 +5581,7 @@ async function main(argv) {
           active,
           signedIn,
           identityState,
+          stray,
           sessions: sessions.length,
           unreadable: unreadable.length,
           activeAt,
@@ -5459,20 +5600,21 @@ async function main(argv) {
         }
       }))
     }
-    if (!all.length) return out.write('no accounts found\n')
-    const width = Math.max(...all.map((a) => a.label.length))
-    return out.write(`${all.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
+    const shown = all.filter((a) => !idleStray(a))
+    if (!shown.length) return out.write('no accounts found\n')
+    const width = Math.max(...shown.map((a) => a.label.length))
+    return out.write(`${shown.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
   }
   if (args.cmd) throw new Error(`unknown command ${args.cmd}`)
   let from
   let to
   if (args.to) {
     from = args.from.map((sel) => find(all, sel))
-    to = find(all, args.to)
+    to = find(all, args.to, true)
   } else {
     if (!process.stdin.isTTY) throw new Error('no terminal, pass --from and --to')
-    from = await pick('From', all, true)
-    to = (await pick('To', all.filter((a) => !from.includes(a)), false))[0]
+    from = await pick('From', all.filter((a) => !idleStray(a)), true)
+    to = (await pick('To', all.filter((a) => !from.includes(a) && !a.stray), false))[0]
   }
   if (new Set(from.map((account) => `${account.account}/${account.org}`)).size !== from.length) throw new Error('from accounts must be unique')
   if (from.includes(to)) throw new Error('to must differ from from')

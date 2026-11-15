@@ -96,6 +96,9 @@ To    ↑↓ move · enter confirm
 
 `finish`, `sweep`, `restart`, `keep-local`, `--move-only` and `--restart-approved` handle held work, cloud checks and restarts. `claude-transplant --help` describes each.
 
+CLI account selectors match whitespace-separated terms. Use the account UUID followed by the organization UUID for an
+exact destination. A display label's middle dot is not part of the searchable account identity.
+
 ## What each command touches
 
 Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant`: cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
@@ -109,7 +112,7 @@ Every command may write the tool's own folder, `~/Library/Application Support/cl
 | a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control copies archived or restored there |
 | `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
 | Move in the menubar | the same as a move with `--cloud` |
-| Update in the menubar | a version request to `registry.npmjs.org` at launch and every 6 hours, and on click the same as `npx claude-transplant@X menubar` |
+| Update in the menubar | a version request to `registry.npmjs.org` at launch and every 6 hours, and on click the same as `npx --prefer-online claude-transplant@X menubar` |
 | `menubar --snapshot <png>` | that image file |
 
 Command and flag names are stable. Renames get a deprecation release first.
@@ -196,7 +199,7 @@ Safety:
 - Recovery unwinds only unfinished units and saves after every step. A crash during retirement restores the sources and unwinds their placed copies, so every session keeps exactly one live record. Interrupted undo resumes from the receipt, Undo restores the whole move, and a corrupt newest receipt stops undo. Unresolved ownership or history blocks further writes and keeps the recovery journal.
 - A move interrupted under a version before 4.1.6 is left alone, and the CLI and panel say to finish it with `npx claude-transplant@4.1.6 finish`.
 - Routine families keep reminders, run history, prompts and unrelated settings. A disabled twin in the destination is replaced only when it matches and nothing depends on it, and the receipt keeps it for undo.
-- Later moves and sweeps report title, archive and starred changes under `drift/<receipt>`. Missing or unreadable records keep a warning.
+- Later moves and sweeps save title, archive and starred changes under `drift/<receipt>`. Missing or unreadable records keep a warning.
 - Sidecar symbolic links are accepted only as leaves inside real session folders, and only their target text and identity are read. Session folder links and special files are refused.
 - Fork lineage follows `forkedFrom` pointers to their roots. A repeated message id counts as a replay only when one existing copy holds every filled tool-result value and producer marker, ignoring runtime metadata and token usage. Different filled values and complementary partial copies are refused.
 - A disposable planning cache lives in `cache.json` in the tool's folder. Every write decision reads live files, so it can be deleted any time.
@@ -206,6 +209,7 @@ Safety:
 - without history: transcript no longer exists on disk
 - unreadable: Desktop record is not valid JSON, and retirement or undo can't touch its folder until it is fixed or removed
 - source rejected / target rejected: invalid identity or unsafe transcript history, left untouched
+- unparseable lines: Desktop's fork can break a record at U+2028 or U+2029, which the mover rejoins. Only lines that stay unreadable block a fork.
 - compatible source versions: same history in several transcripts without a Desktop fork, blocked unless the target holds every version
 - overlapping versions: shared lineage kept separate, including Desktop forks
 - already there: a Desktop record in the target holds every message and sidecar file
@@ -218,7 +222,9 @@ Safety:
 - source cloud checks: sources whose cloud cleanup still waits, usually for another login
 - newer cloud sessions: created after Move, left for the next move
 
-Accounts are labeled from `~/.claude.json` and its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` and Desktop's agent-mode records. Personal-plan organizations show as Personal, and an account with no known email shows a uuid prefix.
+Accounts are labeled from `~/.claude.json` and its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` and Desktop's agent-mode records. An account or organization that only ever signed in to Desktop gets its email and organization names from claude.ai while Desktop is signed in to it, saved in `logins.json` next to the receipts. Personal-plan organizations show as Personal, and an account with no known email shows a uuid prefix.
+
+When you switch accounts, Desktop opens the new organization a second before it switches the account, and that moment leaves an empty folder for the old account inside the new organization. Desktop never shows sessions there. An organization outside the account's claude.ai memberships, or a Personal organization another login owns, is such a stray. The panel hides an empty stray, tags one that holds sessions so you can move them out, and never offers a stray as the destination.
 
 The active badge comes from Desktop's own `main.log`, with no Keychain read or network request, and shows unknown after a logout or an unfinished switch.
 
@@ -275,6 +281,7 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.2.2 | 27.0.1 | 5.11492.5 | 2.1.325 | 2026-11-14 |
 | 4.2.0 | 27.0.1 | 4.4212.0 | 2.1.309 | 2026-10-30 |
 | 4.1.6 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-29 |
 | 4.1.5 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
