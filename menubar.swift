@@ -33,6 +33,7 @@ struct Account: Decodable, Identifiable {
     var pendingPartial: Bool? = nil
     var pendingCancel: String? = nil
     var kept: Bool? = nil
+    var stray: Bool? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
@@ -532,7 +533,7 @@ final class Model: ObservableObject {
     func sourceTag(_ account: Account) -> String? {
         if let event = sourceActivity, event.sourceId == account.id { return (event.activity ?? event.stage) == "cloud" ? "clearing" : "checking" }
         if account.kept == true { return "kept" }
-        guard account.pending != nil else { return nil }
+        guard account.pending != nil else { return account.stray == true ? "stray" : nil }
         if account.pendingState == "partial" { return "not moved" }
         if account.pendingAction == "blocked" { return "kept" }
         if account.pendingState == "login", account.signedIn == true { return "signing in" }
@@ -613,7 +614,7 @@ final class Model: ObservableObject {
     }
 
     func selectTarget(_ id: String) {
-        guard !running else { return }
+        guard !running, accounts.first(where: { $0.id == id })?.stray != true else { return }
         if from.isEmpty { excluded = [] }
         clearResult()
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
@@ -643,7 +644,7 @@ final class Model: ObservableObject {
     }
 
     private func settle() {
-        if let selected = to, !accounts.contains(where: { $0.id == selected }) {
+        if let selected = to, !accounts.contains(where: { $0.id == selected && $0.stray != true }) {
             to = nil
             targetChosen = false
         }
@@ -652,7 +653,7 @@ final class Model: ObservableObject {
         } else if !movable, let destination = pendingAccounts.compactMap(\.receiptDestination).first {
             to = destination
         } else if !targetChosen {
-            let recent = accounts.filter(listed).sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
+            let recent = accounts.filter { listed($0) && $0.stray != true }.sorted { ($0.activeAt ?? 0) > ($1.activeAt ?? 0) }
             to = accounts.first(where: { $0.active == true }).flatMap { current in recent.first { $0.id != current.id }?.id }
         }
         let ids = accounts.map(\.id)
@@ -1238,7 +1239,7 @@ struct Row: View {
     let muted: Bool
     var tag: String? = nil
     let action: () -> Void
-    var tagLabels: [String] { [account.active == true ? "active" : nil, radio ? nil : tag].compactMap { $0 } }
+    var tagLabels: [String] { [account.active == true ? "active" : nil, radio ? (account.stray == true ? "stray" : nil) : tag].compactMap { $0 } }
 
     var body: some View {
         Button(action: action) {
@@ -1250,7 +1251,10 @@ struct Row: View {
                     Text(account.name).font(.system(size: 13, weight: selected ? .semibold : .medium)).lineLimit(1).truncationMode(.middle)
                     HStack(spacing: 6) {
                         Text(account.plan).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                        ForEach(tagLabels, id: \.self) { text in Tag(text: text, color: text == "active" ? .green : .orange) }
+                        ForEach(tagLabels, id: \.self) { text in
+                            Tag(text: text, color: text == "active" ? .green : .orange)
+                                .help(text == "stray" ? "Claude Desktop left this folder during a sign-in switch and never shows its sessions. Move them to another account." : "")
+                        }
                     }
                 }
                 Spacer(minLength: 0)
@@ -1508,7 +1512,7 @@ struct Panel: View {
             Spacer(minLength: Panel.gap)
             column("To") {
                 ForEach(model.visibleAccounts) { account in
-                    Row(account: account, radio: true, selected: model.to == account.id, muted: false) { model.selectTarget(account.id) }
+                    Row(account: account, radio: true, selected: model.to == account.id, muted: account.stray == true) { model.selectTarget(account.id) }
                 }
             }
             .frame(width: width, alignment: .leading)

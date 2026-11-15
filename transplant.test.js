@@ -2944,8 +2944,67 @@ test('a Desktop login lookup for another account or a failed one stores nothing 
   await rewrite(3)
   assert.equal(await learnDesktopLogin(h.paths, io), null)
   assert.equal(calls, 4)
-  assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'logins.json'), 'utf8')), { emails: { [h.acct.Q]: 'q@example.com' }, orgs: {}, tried: { [h.acct.Q]: 1_800_000_000_000 + 3 * 60_000 } })
+  assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'logins.json'), 'utf8')), { emails: { [h.acct.Q]: 'q@example.com' }, orgs: {}, tried: { [h.acct.Q]: 1_800_000_000_000 + 3 * 60_000 }, members: {} })
   assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.T).email, 't@example.com')
+})
+
+test('a Desktop login asks claude.ai for its organizations again only for a folder created after the last answer', async (t) => {
+  const h = await home()
+  const io = { cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' }
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++
+    return Response.json({ uuid: h.acct.Q, email_address: 'q@example.com', memberships: [{ organization: { uuid: h.org.Q, name: "q@example.com's Organization", raven_type: null } }] })
+  })
+  const rewrite = (minutes) => utimes(h.paths.cookies, new Date(), new Date(1_800_000_000_000 + minutes * 60_000))
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Q }))
+  await writeFile(h.paths.cookies, 'fixture')
+  await rewrite(0)
+  assert.equal(await learnDesktopLogin(h.paths, io), 'q@example.com')
+  await rewrite(1)
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  assert.equal(calls, 1)
+
+  await new Promise(resolve => setTimeout(resolve, 5))
+  await mkdir(path.join(h.paths.records, h.acct.Q, h.org.Z), { recursive: true })
+  await rewrite(2)
+  assert.equal(await learnDesktopLogin(h.paths, io), 'q@example.com')
+  await rewrite(3)
+  assert.equal(await learnDesktopLogin(h.paths, io), null)
+  assert.equal(calls, 2)
+  assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'logins.json'), 'utf8')).members[h.acct.Q].orgs, [h.org.Q])
+  const row = (await accounts(h.paths)).find(candidate => candidate.account === h.acct.Q && candidate.org === h.org.Z)
+  assert.equal(row.stray, true)
+  assert.equal(row.label, 'q@example.com · Personal (stray)')
+})
+
+test('a folder Desktop leaves for the old account during a sign-in switch is hidden when empty, tagged with sessions and never a destination', async () => {
+  const h = await home()
+  const sid = id(941)
+  await mkdir(path.join(h.paths.records, h.acct.P, h.org.Z), { recursive: true })
+  await mkdir(path.join(h.paths.records, h.acct.Q, h.org.T), { recursive: true })
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, 'logins.json'), JSON.stringify({ emails: { [h.acct.Q]: 'q@example.com' }, orgs: { [h.org.Q]: 'Personal' },
+    members: { [h.acct.Q]: { orgs: [h.org.Q], at: 1 }, [h.acct.T]: { orgs: [id(940)], at: 1 } } }))
+  await writeFile(path.join(h.paths.records, h.acct.Q, h.org.T, `local_${sid}.json`), JSON.stringify({ sessionId: `local_${sid}`, cliSessionId: sid, cwd: '/tmp/fixture', title: 'Left behind', isArchived: false }))
+  const rows = await accounts(h.paths)
+  const row = (account, org) => rows.find(candidate => candidate.account === account && candidate.org === org)
+
+  assert.equal(row(h.acct.P, h.org.Z).stray, true, 'another login owns this personal organization')
+  assert.equal(row(h.acct.Q, h.org.T).stray, true, 'claude.ai lists only the personal organization')
+  assert.equal(row(h.acct.Q, h.org.T).label, 'q@example.com · Team T (stray)')
+  assert.equal(row(h.acct.T, h.org.T).stray, false, 'a CLI login confirms the pair')
+  assert.equal(row(h.acct.Q, h.org.Q).stray, false)
+  assert.equal(row(h.acct.Z, h.org.Z).stray, false)
+
+  const listed = JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout)
+  assert.equal(listed.some(candidate => candidate.account === h.acct.P && candidate.org === h.org.Z), false)
+  assert.equal(listed.find(candidate => candidate.account === h.acct.Q && candidate.org === h.org.T).stray, true)
+  assert.doesNotMatch((await cli(h.root, ['accounts'])).stdout, /\(stray\)\s+0 \| -/)
+  const refused = await cli(h.root, ['--from', h.acct.Z, '--to', `${h.acct.Q} ${h.org.T}`, '--json'])
+  assert.notEqual(refused.code, 0)
+  assert.match(JSON.parse(refused.stdout).reason, /Team T \(stray\) is a folder Claude Desktop left behind during a sign-in switch/)
+  assert.deepEqual(await readdir(path.join(h.paths.records, h.acct.Q, h.org.T)), [`local_${sid}.json`])
 })
 
 test('menubar snapshot renders live accounts without installing', async () => {

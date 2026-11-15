@@ -224,6 +224,8 @@ Safety:
 
 Accounts are labeled from `~/.claude.json` and its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` and Desktop's agent-mode records. An account or organization that only ever signed in to Desktop gets its email and organization names from claude.ai while Desktop is signed in to it, saved in `logins.json` next to the receipts. Personal-plan organizations show as Personal, and an account with no known email shows a uuid prefix.
 
+When you switch accounts, Desktop opens the new organization a second before it switches the account, and that moment leaves an empty folder for the old account inside the new organization. Desktop never shows sessions there. An organization outside the account's claude.ai memberships, or a Personal organization another login owns, is such a stray. The panel hides an empty stray, tags one that holds sessions so you can move them out, and never offers a stray as the destination.
+
 The active badge comes from Desktop's own `main.log`, with no Keychain read or network request, and shows unknown after a logout or an unfinished switch.
 
 <details>

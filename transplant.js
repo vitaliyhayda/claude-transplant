@@ -925,11 +925,15 @@ async function logins(paths) {
   const emails = new Map()
   const orgs = new Map()
   const pairs = new Map()
+  const confirmed = new Set()
   const take = async (file) => {
     const a = (await readJson(file).catch(() => ({}))).oauthAccount
     if (a?.accountUuid && a.emailAddress) emails.set(a.accountUuid, a.emailAddress)
     if (a?.organizationUuid && a.organizationName) orgs.set(a.organizationUuid, a.organizationType && !/team|enterprise/.test(a.organizationType) ? 'Personal' : a.organizationName)
-    if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) pairs.set(`${a.accountUuid}/${a.organizationUuid}`, { account: a.accountUuid, org: a.organizationUuid })
+    if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) {
+      pairs.set(`${a.accountUuid}/${a.organizationUuid}`, { account: a.accountUuid, org: a.organizationUuid })
+      confirmed.add(`${a.accountUuid}/${a.organizationUuid}`.toLowerCase())
+    }
   }
   for (const e of await readdir(paths.home, { withFileTypes: true }).catch(() => [])) {
     if (e.name.startsWith('.claude')) await take(e.isDirectory() ? path.join(paths.home, e.name, '.claude.json') : path.join(paths.home, e.name))
@@ -950,14 +954,33 @@ async function logins(paths) {
   const learned = await learnedLogins(paths)
   for (const [account, email] of Object.entries(learned.emails)) if (!emails.has(account)) emails.set(account, email)
   for (const [org, name] of Object.entries(learned.orgs)) if (!orgs.has(org)) orgs.set(org, name)
-  return { emails, orgs, pairs }
+  const members = new Map(Object.entries(learned.members).map(([account, { orgs }]) => [account, new Set(orgs)]))
+  return { emails, orgs, pairs, confirmed, members }
 }
+
+// On an account switch Desktop opens the new organization a second or two before it changes the account, and that
+// moment leaves a folder for the old account inside the new organization. Desktop never shows sessions there.
+function strayFolders({ orgs, confirmed, members }, current) {
+  const owners = new Map()
+  const own = (account, org) => owners.set(org, new Set([...(owners.get(org) ?? []), account]))
+  for (const [account, list] of members) for (const org of list) own(account, org)
+  for (const pair of confirmed) own(...pair.split('/'))
+  return (account, org) => {
+    if (confirmed.has(`${account}/${org}`) || (current.state === 'known' && current.account === account && current.org === org)) return false
+    if (members.has(account)) return !members.get(account).has(org)
+    return orgs.get(org) === 'Personal' && [...(owners.get(org) ?? [])].some(other => other !== account)
+  }
+}
+
+const idleStray = row => row.stray && !row.sessions.length && !row.unreadable.length && !(row.taskSessions.registry?.scheduledTasks ?? []).length
+const STRAY_TARGET = 'is a folder Claude Desktop left behind during a sign-in switch, and Desktop never shows sessions there. Pick another destination'
 
 const loginFile = paths => path.join(paths.state, 'logins.json')
 const learnedLogins = async paths => {
   const value = await readJson(loginFile(paths)).catch(() => null)
   const valid = (object, check) => Object.fromEntries(Object.entries(object ?? {}).filter(([id, item]) => UUID.test(id) && check(item)))
-  return { emails: valid(value?.emails, item => typeof item === 'string' && item.includes('@')), orgs: valid(value?.orgs, item => typeof item === 'string' && item.length > 0), tried: valid(value?.tried, Number.isFinite) }
+  return { emails: valid(value?.emails, item => typeof item === 'string' && item.includes('@')), orgs: valid(value?.orgs, item => typeof item === 'string' && item.length > 0), tried: valid(value?.tried, Number.isFinite),
+    members: valid(value?.members, item => Array.isArray(item?.orgs) && item.orgs.every(org => UUID.test(org)) && Number.isFinite(item.at)) }
 }
 
 export async function learnDesktopLogin(paths, io = {}) {
@@ -965,22 +988,33 @@ export async function learnDesktopLogin(paths, io = {}) {
   const store = await learnedLogins(paths), cookies = (await stat(paths.cookies).catch(() => null))?.mtimeMs
   if (!UUID.test(account) || cookies === undefined || store.tried[account] === cookies) return null
   const known = await logins(paths)
-  const unnamed = (await dirs(path.join(paths.records, account))).filter(org => !known.orgs.has(org))
-  if (known.emails.has(account) && !unnamed.length) return null
-  let email = null
+  const folders = await dirs(path.join(paths.records, account))
+  const unnamed = folders.filter(org => !known.orgs.has(org))
+  const learnedAt = store.members[account]?.at ?? 0, unconfirmed = []
+  for (const org of folders) {
+    if (known.confirmed.has(`${account}/${org}`) || store.members[account]?.orgs.includes(org)) continue
+    const folder = await stat(path.join(paths.records, account, org)).catch(() => null)
+    if (folder && (folder.birthtimeMs || folder.mtimeMs) > learnedAt) unconfirmed.push(org)
+  }
+  if (known.emails.has(account) && !unnamed.length && !unconfirmed.length) return null
+  let email = null, membership = false
   try {
     const { headers } = await desktopHeaders(paths, io)
     const response = await fetch('https://claude.ai/api/account', { headers, redirect: 'error', signal: AbortSignal.timeout(10_000) })
     const body = response.ok ? await response.json() : null
     if (String(body?.uuid ?? '').toLowerCase() === account) {
       if (/^[^\s@]+@[^\s@]+$/.test(body.email_address ?? '')) email = store.emails[account] = body.email_address
+      const orgs = []
       for (const { organization: org } of Array.isArray(body.memberships) ? body.memberships : []) {
-        if (!UUID.test(org?.uuid ?? '') || typeof org.name !== 'string' || !org.name) continue
+        if (!UUID.test(org?.uuid ?? '')) continue
+        orgs.push(org.uuid.toLowerCase())
+        if (typeof org.name !== 'string' || !org.name) continue
         store.orgs[org.uuid.toLowerCase()] = /team|enterprise/.test(org.raven_type ?? '') || org.capabilities?.includes?.('raven') ? org.name : 'Personal'
       }
+      if (orgs.length) { store.members[account] = { orgs, at: Date.now() }; membership = true }
     }
   } catch {}
-  if ((email || known.emails.has(account)) && unnamed.every(org => store.orgs[org])) delete store.tried[account]
+  if ((email || known.emails.has(account)) && unnamed.every(org => store.orgs[org]) && (!unconfirmed.length || membership)) delete store.tried[account]
   else store.tried[account] = cookies
   await mkdir(paths.state, { recursive: true }).then(() => saveJson(loginFile(paths), store)).catch(() => {})
   return email
@@ -1254,8 +1288,9 @@ const desktopSession = (file, record) => ({
 })
 
 export async function accounts(paths, processes = null) {
-  const { emails, orgs, pairs } = await logins(paths)
+  const identities = await logins(paths), { emails, orgs, pairs } = identities
   const cur = await signedIn(paths, processes)
+  const stray = strayFolders(identities, cur)
   const out = []
   const stored = await records(paths.records)
   const known = [...pairs.values()].filter((pair) => !stored.some((row) => sameAccount(row, pair))).map(({ account, org }) => ({ account, org, dir: path.join(paths.records, account, org), files: [] }))
@@ -1274,10 +1309,11 @@ export async function accounts(paths, processes = null) {
     let scheduled = new Set()
     let taskError = null
     try { scheduled = await taskSessions(taskFile) } catch (error) { taskError = error.message }
-    const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
+    const leftover = stray(account, org)
+    const label = `${email ?? short(account)} · ${orgName ?? short(org)}${leftover ? ' (stray)' : ''}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
+    out.push({ account, org, dir, email, orgName, sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state, stray: leftover })
   }
   const sessions = out.flatMap(account => account.sessions)
   const claims = Map.groupBy(sessions.flatMap(session => [...new Set([session.id, ...priorSessions(session.record)])]), id => id)
@@ -5081,11 +5117,13 @@ function describe(list) {
   return emails.size === 1 ? `${[...emails][0]} · ${list.map((a) => a.orgName ?? short(a.org)).join(' + ')}` : list.map((a) => a.label).join(', ')
 }
 
-function find(all, sel) {
+function find(all, sel, target = false) {
   const hay = (a) => `${a.email ?? ''} ${a.account} ${a.orgName ?? ''} ${a.org}`.toLowerCase()
   const hits = all.filter((a) => sel.toLowerCase().split(/\s+/).every((t) => hay(a).includes(t)))
-  if (hits.length === 1) return hits[0]
-  throw new Error(hits.length ? `"${sel}" matches ${hits.map((a) => a.label).join(', ')}` : `"${sel}" matches no account`)
+  const usable = target ? hits.filter((a) => !a.stray) : hits
+  if (usable.length === 1) return usable[0]
+  if (hits.length && !usable.length) throw new Error(`${hits[0].label} ${STRAY_TARGET}`)
+  throw new Error(usable.length ? `"${sel}" matches ${usable.map((a) => a.label).join(', ')}` : `"${sel}" matches no account`)
 }
 
 export function step(state, key) {
@@ -5523,7 +5561,8 @@ async function main(argv) {
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
       const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? all.find(row => sameAccount(row, latest.receipt.toAccount ?? {}))?.label ?? latest.receipt.to : null
-      return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
+      const involved = row => [...(deferred?.sources ?? []), deferred?.receipt.toAccount].some(other => other && sameAccount(other, row))
+      return emit(all.filter(row => !idleStray(row) || involved(row)).map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt, stray }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
           ? waitingSessions({ held: deferred.receipt.held?.filter(held => held.sources.some(member => sameAccount(member, source))), cloudChecks: deferred.receipt.cloudChecks.filter(check => sameAccount(check, source)) })
@@ -5542,6 +5581,7 @@ async function main(argv) {
           active,
           signedIn,
           identityState,
+          stray,
           sessions: sessions.length,
           unreadable: unreadable.length,
           activeAt,
@@ -5560,20 +5600,21 @@ async function main(argv) {
         }
       }))
     }
-    if (!all.length) return out.write('no accounts found\n')
-    const width = Math.max(...all.map((a) => a.label.length))
-    return out.write(`${all.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
+    const shown = all.filter((a) => !idleStray(a))
+    if (!shown.length) return out.write('no accounts found\n')
+    const width = Math.max(...shown.map((a) => a.label.length))
+    return out.write(`${shown.map((a) => `  ${a.label.padEnd(width)}  ${a.stats}`).join('\n')}\n`)
   }
   if (args.cmd) throw new Error(`unknown command ${args.cmd}`)
   let from
   let to
   if (args.to) {
     from = args.from.map((sel) => find(all, sel))
-    to = find(all, args.to)
+    to = find(all, args.to, true)
   } else {
     if (!process.stdin.isTTY) throw new Error('no terminal, pass --from and --to')
-    from = await pick('From', all, true)
-    to = (await pick('To', all.filter((a) => !from.includes(a)), false))[0]
+    from = await pick('From', all.filter((a) => !idleStray(a)), true)
+    to = (await pick('To', all.filter((a) => !from.includes(a) && !a.stray), false))[0]
   }
   if (new Set(from.map((account) => `${account.account}/${account.org}`)).size !== from.length) throw new Error('from accounts must be unique')
   if (from.includes(to)) throw new Error('to must differ from from')
